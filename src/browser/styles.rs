@@ -5,6 +5,11 @@
 //! decides what to ask and what to show. Values are CSS only, never input values or text.
 
 use super::edits::StyleEdit;
+use super::protocol::{AppToHost, BrowserId, StyleRow};
+use super::HostLink;
+use gpui::{Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Window, div, prelude::*, px, rgb};
+use gpui_base::input::{Input, InputEvent, InputState};
+use std::sync::Arc;
 
 /// The v1 catalogue, in panel order.
 pub const PROPS: [&str; 10] = ["font-size", "font-weight", "color", "background-color", "border-radius", "padding", "margin", "gap", "width", "height"];
@@ -28,6 +33,8 @@ pub struct Row {
     pub inline: Option<String>,
     /// The user's edit: Some(Some(v)) set, Some(None) removed, None untouched.
     pub edit: Option<Option<String>>,
+    /// The value when the panel opened (inline first, else computed): the "from" of the edits line.
+    pub opened: String,
 }
 
 impl Row {
@@ -67,7 +74,7 @@ pub struct StylePanel {
 impl StylePanel {
     /// Opens on the host's answer: `(prop, computed, inline)` for the requested props.
     pub fn open(node: &str, original_style: Option<String>, values: Vec<(String, String, Option<String>)>) -> Self {
-        let mut rows: Vec<Row> = values.into_iter().map(|(prop, computed, inline)| Row { prop, computed, inline, edit: None }).collect();
+        let mut rows: Vec<Row> = values.into_iter().map(|(prop, computed, inline)| Row { opened: inline.clone().unwrap_or_else(|| computed.clone()), prop, computed, inline, edit: None }).collect();
         rows.sort_by_key(|r| PROPS.iter().position(|p| *p == r.prop).unwrap_or(PROPS.len()));
         StylePanel { node: node.to_owned(), original_style, rows }
     }
@@ -82,7 +89,7 @@ impl StylePanel {
             return None;
         }
         // Back to where it started: the edit is gone.
-        row.edit = if new.as_deref() == Some(row.computed.as_str()) && row.edit.is_some() { None } else { Some(new.clone()) };
+        row.edit = if new.as_deref() == Some(row.opened.as_str()) && row.edit.is_some() { None } else { Some(new.clone()) };
         Some(Request::Set { prop: prop.to_owned(), value: new })
     }
 
@@ -111,9 +118,140 @@ impl StylePanel {
             .iter()
             .filter_map(|r| {
                 let to = r.edit.clone()?;
-                Some(StyleEdit { prop: r.prop.clone(), from: Some(r.inline.clone().unwrap_or_else(|| r.computed.clone())), to })
+                Some(StyleEdit { prop: r.prop.clone(), from: Some(r.opened.clone()), to })
             })
             .collect()
+    }
+}
+
+/// What the panel shows while it waits or when the element is gone.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Status {
+    Loading,
+    /// The host had no such element (navigated, removed, or refused).
+    Missing,
+    Ready,
+}
+
+/// The style panel for one picked element: asks the host for its rows, edits one property per
+/// Enter, reverts everything. The view places it beside the page and routes `StylesResult` here.
+pub struct StylePanelView {
+    id: BrowserId,
+    link: Arc<dyn HostLink>,
+    pub node: String,
+    pub status: Status,
+    pub panel: StylePanel,
+    inputs: Vec<(String, Entity<InputState>)>,
+    next_req: u64,
+    /// The request that opened the panel; later answers are edits.
+    open_req: u64,
+    _subs: Vec<gpui::Subscription>,
+}
+
+impl StylePanelView {
+    /// Opens for `node` and asks the host for the v1 rows.
+    pub fn new(id: BrowserId, link: Arc<dyn HostLink>, node: &str) -> Self {
+        let mut v = StylePanelView { id, link, node: node.to_owned(), status: Status::Loading, panel: StylePanel::default(), inputs: Vec::new(), next_req: 1, open_req: 0, _subs: Vec::new() };
+        v.open_req = v.req();
+        v.link.send(AppToHost::Styles { id: v.id.clone(), req: v.open_req, node: v.node.clone(), props: PROPS.iter().map(|p| p.to_string()).collect() });
+        v
+    }
+
+    fn req(&mut self) -> u64 {
+        // Panel requests live in their own range so they never collide with the view's.
+        let r = (1 << 40) + self.next_req;
+        self.next_req += 1;
+        r
+    }
+
+    /// Whether `req` is one of this panel's (the view routes by it).
+    pub fn owns(&self, req: u64) -> bool {
+        req >= 1 << 40 && req < (1 << 40) + self.next_req
+    }
+
+    /// `HostToApp::StylesResult` for this panel.
+    pub fn on_result(&mut self, req: u64, ok: bool, rows: Vec<StyleRow>, window: &mut Window, cx: &mut Context<Self>) {
+        if !ok {
+            self.status = Status::Missing;
+            cx.notify();
+            return;
+        }
+        if req == self.open_req {
+            self.panel = StylePanel::open(&self.node, None, rows.into_iter().map(|r| (r.prop, r.computed, r.inline)).collect());
+            self.status = Status::Ready;
+            self.inputs.clear();
+            self._subs.clear();
+            for row in self.panel.rows.clone() {
+                let input = cx.new(|cx| InputState::new(window, cx));
+                input.update(cx, |i, cx| i.set_value(row.shown().to_owned(), window, cx));
+                let prop = row.prop.clone();
+                self._subs.push(cx.subscribe_in(&input, window, move |v, input, ev: &InputEvent, _, cx| {
+                    if let InputEvent::PressEnter { .. } = ev {
+                        let value = input.read(cx).value().to_string();
+                        v.set(&prop, &value, cx);
+                    }
+                }));
+                self.inputs.push((row.prop, input));
+            }
+        } else {
+            for r in rows {
+                self.panel.refresh(&r.prop, &r.computed);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Sends one edit (what Enter in a row does).
+    pub fn set(&mut self, prop: &str, value: &str, cx: &mut Context<Self>) {
+        if let Some(Request::Set { prop, value }) = self.panel.set(prop, value) {
+            let req = self.req();
+            self.link.send(AppToHost::SetStyle { id: self.id.clone(), req, node: self.node.clone(), prop, value });
+            cx.notify();
+        }
+    }
+
+    pub fn revert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.panel.revert();
+        let req = self.req();
+        self.link.send(AppToHost::RevertStyle { id: self.id.clone(), req, node: self.node.clone() });
+        for (prop, input) in &self.inputs {
+            let shown = self.panel.rows.iter().find(|r| &r.prop == prop).map(|r| r.opened.clone()).unwrap_or_default();
+            input.update(cx, |i, cx| i.set_value(shown, window, cx));
+        }
+        cx.notify();
+    }
+}
+
+impl Render for StylePanelView {
+    fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let head = div().flex().justify_between().px_2().py_1().child(SharedString::from(format!("Styles · {}", self.node))).when(self.panel.is_edited(), |d| {
+            d.child(div().id("styles-revert").px_1().cursor_pointer().child("Revert").on_click(cx.listener(|v, _, w, cx| v.revert(w, cx))))
+        });
+        let body = match self.status {
+            Status::Loading => div().px_2().child("Reading styles…").into_any_element(),
+            Status::Missing => div().px_2().child("This element is no longer on the page.").into_any_element(),
+            Status::Ready => div()
+                .flex()
+                .flex_col()
+                .children(self.inputs.iter().map(|(prop, input)| {
+                    let badge = self.panel.rows.iter().find(|r| &r.prop == prop).map_or(Badge::Computed, Row::badge);
+                    let (label, color) = match badge {
+                        Badge::Edited => ("edited", 0xff3b30),
+                        Badge::Inline => ("inline", 0x4c9aff),
+                        Badge::Computed => ("computed", 0x8a8a8a),
+                    };
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .child(div().w(px(120.)).child(SharedString::from(prop.clone())))
+                        .child(div().flex_1().child(Input::new(input)))
+                        .child(div().w(px(64.)).text_color(rgb(color)).child(label))
+                }))
+                .into_any_element(),
+        };
+        div().flex().flex_col().w(px(360.)).bg(rgb(0x1e1e1e)).text_color(rgb(0xe6e6e6)).child(head).child(body)
     }
 }
 
@@ -121,6 +259,64 @@ impl StylePanel {
 mod tests {
     use super::*;
     use crate::browser::edits::css_edits_line;
+    use gpui::TestAppContext;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<AppToHost>>);
+    impl HostLink for Recording {
+        fn send(&self, msg: AppToHost) {
+            self.0.lock().unwrap().push(msg);
+        }
+    }
+
+    fn row(prop: &str, computed: &str, inline: Option<&str>) -> StyleRow {
+        StyleRow { prop: prop.into(), computed: computed.into(), inline: inline.map(Into::into), matched: None }
+    }
+
+    /// The panel against a host that answers like the protocol says: asks for the ten rows,
+    /// shows them, sends SetStyle on Enter, refreshes the computed value, reverts.
+    #[gpui::test]
+    fn the_panel_reads_edits_and_reverts_through_the_host(cx: &mut TestAppContext) {
+        cx.update(gpui_base::init);
+        let rec = Arc::new(Recording::default());
+        let link: Arc<dyn HostLink> = rec.clone();
+        let (view, cx) = cx.add_window_view(|_, _| StylePanelView::new("b1".into(), link, "#cta"));
+        let sent = rec.0.lock().unwrap().drain(..).collect::<Vec<_>>();
+        let AppToHost::Styles { req, node, props, .. } = &sent[0] else { panic!("{sent:?}") };
+        assert_eq!((node.as_str(), props.len()), ("#cta", 10));
+        let open = *req;
+        cx.update(|w, cx| view.update(cx, |v, cx| v.on_result(open, true, vec![row("padding", "8px", None), row("color", "rgb(255, 0, 0)", Some("red"))], w, cx)));
+        assert_eq!(view.read_with(cx, |v, _| (v.status.clone(), v.inputs.len())), (Status::Ready, 2));
+        // Enter in the padding row: SetStyle goes to the host; its answer refreshes computed.
+        let input = view.read_with(cx, |v, _| v.inputs.iter().find(|(p, _)| p == "padding").unwrap().1.clone());
+        cx.update(|w, cx| {
+            input.update(cx, |i, cx| i.set_value("16px", w, cx));
+            view.update(cx, |v, cx| v.set("padding", "16px", cx));
+        });
+        let sent = rec.0.lock().unwrap().drain(..).collect::<Vec<_>>();
+        let AppToHost::SetStyle { req, node, prop, value, .. } = &sent[0] else { panic!("{sent:?}") };
+        assert_eq!((node.as_str(), prop.as_str(), value.as_deref()), ("#cta", "padding", Some("16px")));
+        let set_req = *req;
+        assert!(view.read_with(cx, |v, _| v.owns(set_req) && v.owns(open) && !v.owns(5)));
+        cx.update(|w, cx| view.update(cx, |v, cx| v.on_result(set_req, true, vec![row("padding", "16px", Some("16px"))], w, cx)));
+        assert_eq!(view.read_with(cx, |v, _| css_edits_line(&v.panel.edits())), Some("CSS edits — padding: 8px → 16px".into()));
+        cx.update(|w, cx| view.update(cx, |v, cx| v.revert(w, cx)));
+        let sent = rec.0.lock().unwrap().drain(..).collect::<Vec<_>>();
+        assert!(matches!(&sent[..], [AppToHost::RevertStyle { node, .. }] if node == "#cta"), "{sent:?}");
+        assert!(!view.read_with(cx, |v, _| v.panel.is_edited()));
+        assert_eq!(cx.update(|_, cx| input.read(cx).value().to_string()), "8px", "the row shows its value from before the edit");
+    }
+
+    /// The stub host answers ok:false (no host side yet): the panel says the element is gone.
+    #[gpui::test]
+    fn a_refused_or_missing_element_shows_missing(cx: &mut TestAppContext) {
+        cx.update(gpui_base::init);
+        let link: Arc<dyn HostLink> = Arc::new(Recording::default());
+        let (view, cx) = cx.add_window_view(|_, _| StylePanelView::new("b1".into(), link, "#gone"));
+        cx.update(|w, cx| view.update(cx, |v, cx| v.on_result(1 << 40 | 1, false, vec![], w, cx)));
+        assert_eq!(view.read_with(cx, |v, _| v.status.clone()), Status::Missing);
+    }
 
     fn panel() -> StylePanel {
         StylePanel::open(
