@@ -85,6 +85,7 @@ impl<A: SurfaceAlloc> StubHost<A> {
                 let url = url.unwrap_or_else(|| "about:blank".into());
                 let b = Browser { px: pixels(size, scale), scale, seq: 0, in_flight: None, pending: false, history: vec![url.clone()], pos: 0 };
                 self.browsers.insert(id.clone(), b);
+                out.push(HostToApp::CdpTarget { id: id.clone(), target_id: format!("stub-{id}") });
                 self.loaded(&id, &mut out);
                 self.frame(&id, &mut out);
             }
@@ -154,6 +155,7 @@ impl<A: SurfaceAlloc> StubHost<A> {
             }
             M::Focus { focused, .. } => out.push(echo(&id, format!("focus {focused}"))),
             M::Input { event, .. } => out.push(echo(&id, encode(&event))),
+            M::Edit { command, .. } => out.push(echo(&id, format!("edit {}", encode(&command).trim_matches('"')))),
             M::Eval { req, expr, .. } => {
                 out.push(HostToApp::EvalResult { id, req, ok: true, value: serde_json::json!({ "stub": true, "expr": expr }) })
             }
@@ -208,7 +210,7 @@ fn browser_id(m: &AppToHost) -> &str {
     use AppToHost as M;
     match m {
         M::Create { id, .. } | M::Close { id } | M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. }
-        | M::Stop { id } | M::Resize { id, .. } | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Input { id, .. }
+        | M::Stop { id } | M::Resize { id, .. } | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Input { id, .. } | M::Edit { id, .. }
         | M::FrameAck { id, .. } | M::Find { id, .. } | M::StopFind { id, .. } | M::DevTools { id, .. } | M::Eval { id, .. }
         | M::Screenshot { id, .. } | M::FileChooserResult { id, .. } | M::DialogResult { id, .. } => id,
         M::Hello { .. } | M::Shutdown => "",

@@ -1,9 +1,10 @@
 //! Browser host: serves the browser protocol on a Unix socket. See docs/browser-block-contract.md.
 //! OWNER: part 2 (host).
 //!
-//! Today only the stub backend exists (`--stub`): no CEF, deterministic frames whose pixels encode
-//! the browser id, size and seq (see `stub_pixel`), input echoed back as `Console` messages. The CEF
-//! backend (stage C) plugs in behind the same server loop.
+//! Two backends serve the same protocol: `--stub` (no CEF; deterministic frames whose pixels encode
+//! the browser id, size and seq, see `stub_pixel`; input echoed back as `Console` messages) and,
+//! with the `cef` feature, the real CEF off-screen host in `cef`, which must run from its .app
+//! bundle (scripts/fork-host-bundle.sh).
 
 use herdr_browser_protocol::{PixelSize, SurfaceRef};
 use std::io;
@@ -11,6 +12,8 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 
 mod stub;
+#[cfg(all(feature = "cef", target_os = "macos"))]
+pub mod cef;
 
 pub use stub::{id_byte, stub_pixel};
 
