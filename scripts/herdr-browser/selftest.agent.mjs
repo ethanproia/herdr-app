@@ -59,6 +59,11 @@ try {
   T = o.tab ?? T;
   check(o.ok && o.url === site, `open starts the daemon and loads the page (${o.url})`);
   check((await json("tabs")).tabs?.some((t) => t.tab === T && t.controllable && t.agentOpened), "tabs lists the agent tab as controllable");
+  // SEC2b: the page has password and card fields, so reading or picturing it needs the person's capture grant.
+  check(/needs the person's capture grant/.test(await cli("eval", T, "expression=1")) && /needs the person's capture grant/.test(await cli("screenshot", T)), "X3 eval and screenshot refused on a sensitive page without a grant");
+  grant(T, { capture: true });
+  check((await json("eval", T, "expression=document.getElementById('pw').value + '|' + document.getElementById('card_number').value")).value === "<hidden>|<hidden>", "X3 eval results never carry secret field values");
+  check((await json("console", T)).untrusted?.includes("messages"), "SEC2c page console output is labelled untrusted");
   const snap = (await cli("snapshot", T));
   const ref = (re) => snap.split("\n").find((l) => re.test(l))?.match(/ref=(e\d+)/)?.[1];
   const box = ref(/textbox "Your name"/), btn = ref(/button "Greet"/);
@@ -156,6 +161,7 @@ try {
   await Promise.race([answered, new Promise((r) => setTimeout(r, 60000))]);
   m.kill();
   const rs = buf.trim().split("\n").map((l) => JSON.parse(l));
+  check(/^UNTRUSTED PAGE CONTENT in text/.test(rs[2]?.result?.content?.[0]?.text ?? ""), "SEC2c MCP results label page content as untrusted");
   check(rs[1]?.result?.tools?.some((t) => t.name === "browser_take_screenshot") && rs[1].result.tools.length >= 25 && rs[2]?.result?.content?.[0]?.text.includes("Hello Bob"), `MCP lists ${rs[1]?.result?.tools?.length} tools and a call returns page text`);
 
   check((await json("close", T)).ok && !(await json("tabs")).tabs.some((t) => t.tab === T), "close removes the agent tab");

@@ -13,6 +13,15 @@ const KEYS = { Enter: 13, Backspace: 8, Tab: 9, Escape: 27, Delete: 46, ArrowLef
 const MODS = { Alt: 1, Control: 2, Meta: 4, Shift: 8 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// One rule for "this field holds a secret", used by snapshots, redaction and the capture check.
+const SECRET_FIELD = `((c) => c.tagName === "INPUT" && (c.type === "password" || /cc-|password|one-time-code/i.test(c.autocomplete || "")
+  || /pass|secret|token|otp|cvv|cvc|ssn|card/i.test((c.name || "") + " " + (c.id || ""))))`;
+// The values of the page's secret fields (for redaction) and how many there are (the page is sensitive when any exist).
+const SECRETS = `[...document.querySelectorAll("input")].filter(${SECRET_FIELD}).map((c) => c.value)`;
+// Result fields that carry page content: untrusted data from the web page, never instructions to the agent.
+const PAGE_FIELDS = ["text", "snapshot", "value", "messages", "errors", "title", "url", "result", "selected"];
+const CAPTURES = new Set(["eval", "screenshot", "take_screenshot", "cdp"]);
+
 // Walks the DOM, tags visible interactive or text elements with data-hb-ref, returns one indented line each.
 const SNAPSHOT = (o) => `(() => {
   const O = ${JSON.stringify(o)}; let n = 0; const out = [];
@@ -28,7 +37,7 @@ const SNAPSHOT = (o) => `(() => {
         const ref = "e" + (++n); c.setAttribute("data-hb-ref", ref);
         const name = (c.getAttribute("aria-label") || c.alt || c.placeholder || (r ? c.innerText : own) || "").replace(/\\s+/g, " ").trim().slice(0, 80);
         // Never hand an agent a secret: passwords, card numbers, one-time codes and anything named like a credential.
-        const secret = c.type === "password" || /cc-|password|one-time-code/i.test(c.autocomplete || "") || /pass|secret|token|otp|cvv|cvc|ssn|card/i.test((c.name || "") + " " + (c.id || ""));
+        const secret = ${SECRET_FIELD}(c);
         const val = c.value !== undefined && c.tagName !== "BUTTON" && c.value !== "" ? (secret ? " value=<hidden>" : " value=" + JSON.stringify(String(c.value).slice(0, 80))) : "";
         out.push("  ".repeat(d) + "- " + (r || "text") + (name ? " " + JSON.stringify(name) : "") + val + (c.href ? " href=" + c.getAttribute("href") : "") + " [ref=" + ref + "]");
         walk(c, d + 1);
@@ -45,6 +54,15 @@ const SNAPSHOT = (o) => `(() => {
 // Raw CDP an agent may send once the person grants "cdp": page inspection and rendering only; nothing that reaches
 // other tabs, the profile (cookies, storage), downloads, the browser process or the file system.
 export const CDP_ALLOWED = /^(DOM|CSS|Accessibility|Overlay|DOMSnapshot|Animation|Performance|Log|Debugger)\.|^(Runtime\.(evaluate|callFunctionOn|getProperties|releaseObject)|Page\.(captureScreenshot|getLayoutMetrics|getFrameTree|reload)|Emulation\.(setDeviceMetricsOverride|clearDeviceMetricsOverride|setEmulatedMedia)|Target\.getTargetInfo|Input\.dispatch(Mouse|Key|Touch)Event)$/;
+
+// Replaces every secret field value anywhere in a result (eval, console, text...) with <hidden>.
+const redact = (v, secrets) => {
+  if (!secrets.length) return v;
+  if (typeof v === "string") return secrets.reduce((t, x) => t.split(String(x)).join("<hidden>"), v);
+  if (Array.isArray(v)) return v.map((x) => redact(x, secrets));
+  if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redact(x, secrets)]));
+  return v;
+};
 
 export default function register({ sessions, onEvent, onOpen, route, dir, openTab, closeTab, targets }) {
   const opened = new Set(); // tab ids an agent opened
@@ -220,7 +238,14 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
     if (!s) throw new Error(`no tab ${tab}; list them with cmd tabs`);
     if (!controllable(s)) throw new Error(`tab ${tab} is not agent-controllable; open your own tab or ask the person to allow agents in that block`);
     if (await devtoolsOpen(s)) throw new Error(`DevTools is open for tab ${tab}; close it before driving the page`);
-    const r = await acts[cmd](s, args);
+    // SEC2b: on a page with secret fields, anything that can read or picture them needs the person's capture grant.
+    const secrets = (await evaluate(s, SECRETS).catch(() => [])).filter((v) => String(v).length >= 4);
+    const sensitive = await evaluate(s, `${SECRETS}.length`).catch(() => 0) > 0;
+    if (sensitive && (CAPTURES.has(cmd) || take_screenshot_afterwards) && !granted(s.id, "capture"))
+      throw new Error(`tab ${s.id} has password or payment fields: ${cmd} needs the person's capture grant`);
+    const r = redact(await acts[cmd](s, args), secrets);
+    const untrusted = PAGE_FIELDS.filter((k) => k in r);
+    if (untrusted.length) r.untrusted = untrusted;
     if (take_screenshot_afterwards && cmd !== "close") r.screenshot = (await acts.screenshot(s, {})).path;
     if (cmd === "close") { opened.delete(s.id); await closeTab(s.id); }
     return r;
