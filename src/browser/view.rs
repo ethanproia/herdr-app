@@ -405,6 +405,7 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
         | H::Title { id, .. }
         | H::ContextMenu { id, .. }
         | H::StylesResult { id, .. }
+        | H::PickInfoResult { id, .. }
         | H::Url { id, .. }
         | H::Loading { id, .. }
         | H::Cursor { id, .. }

@@ -171,6 +171,7 @@ impl<A: SurfaceAlloc> StubHost<A> {
             M::Input { event, .. } => out.push(echo(&id, encode(&event))),
             // The stub knows no page: an overlay query answers with no rects, echoing req and epoch.
             M::Overlay { req, epoch, .. } => out.push(HostToApp::OverlayRects { id: id.clone(), req, epoch, rects: vec![], frames: vec![] }),
+            M::PickInfo { req, .. } => out.push(HostToApp::PickInfoResult { id: id.clone(), req, ok: false, selector: String::new(), label: String::new(), rect: herdr_browser_protocol::CssRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } }),
             // The stub knows no page: style requests answer "no such element".
             M::Styles { req, .. } | M::SetStyle { req, .. } | M::RevertStyle { req, .. } => out.push(HostToApp::StylesResult { id: id.clone(), req, ok: false, rows: vec![] }),
             // The stub paints nothing real; visibility changes are only echoed.
@@ -230,7 +231,7 @@ fn browser_id(m: &AppToHost) -> &str {
     use AppToHost as M;
     match m {
         M::Create { id, .. } | M::Close { id } | M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. }
-        | M::Stop { id } | M::Resize { id, .. } | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Overlay { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } | M::MenuResult { id, .. } | M::Input { id, .. } | M::Edit { id, .. }
+        | M::Stop { id } | M::Resize { id, .. } | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } | M::MenuResult { id, .. } | M::Input { id, .. } | M::Edit { id, .. }
         | M::FrameAck { id, .. } | M::Find { id, .. } | M::StopFind { id, .. } | M::DevTools { id, .. } | M::Eval { id, .. }
         | M::Screenshot { id, .. } | M::FileChooserResult { id, .. } | M::DialogResult { id, .. } => id,
         M::Hello { .. } | M::SetColorScheme { .. } | M::Shutdown => "",
