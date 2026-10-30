@@ -34,3 +34,7 @@ Transitions (`BrowserInput::enter`): Browse to Pick or Markup; Pick or Markup to
 ## Limits
 - Copy, paste and select-all inside the comment field are passed to the overlay (`Edit`) for the comment slice to implement; only undo and redo are handled here.
 - The pointer in Comment goes to the comment overlay; clicking the page to leave the field is the comment slice's call (it can `escape`).
+
+## Known limits (input)
+- Key repeat: the app sends `repeat: true` and the host sets `EVENTFLAG_IS_REPEAT`, but CEF off-screen on macOS drops it: held keys still repeat characters, only pages that read `KeyboardEvent.repeat` see `false`. `tests/browser_input.rs` prints `KNOWN-LIMIT I8`; confirm by hand in the visible session.
+- Native key codes are derived from the key name for a US layout (GPUI does not expose them).

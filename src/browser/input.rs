@@ -145,6 +145,16 @@ impl BrowserInput {
         protocol::Modifiers { shift: m.shift, control: m.control, alt: m.alt, platform: m.platform, caps_lock: self.caps_lock }
     }
 
+    /// The page's top-left in window coordinates (as of the last paint).
+    pub fn origin(&self) -> Point<Pixels> {
+        self.origin
+    }
+
+    /// The page caret from `ImeCaret`, in window coordinates: where the candidate window goes.
+    pub fn caret(&self) -> Option<Bounds<Pixels>> {
+        self.caret.map(|c| Bounds::new(self.origin + c.origin, c.size))
+    }
+
     pub fn owner(&self) -> Owner {
         *self.owners.last().unwrap_or(&Owner::Browse)
     }

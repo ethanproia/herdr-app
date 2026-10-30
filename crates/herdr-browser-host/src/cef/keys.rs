@@ -49,3 +49,30 @@ pub fn windows_key_code(code: &str, key: &str) -> i32 {
         _ => key.chars().next().filter(|c| c.is_ascii_alphanumeric()).map_or(0, |c| c.to_ascii_uppercase() as i32),
     }
 }
+
+/// HERDR: the character macOS puts on a named key's NSEvent (delete is 0x7F, arrows are
+/// function-key private-use chars). CEF builds the native key event from it; with 0 a key-up
+/// reaches the page as a second key-down (Backspace deleted twice).
+pub fn mac_character(code: &str) -> u16 {
+    if let Some(n) = code.strip_prefix('F').and_then(|n| n.parse::<u16>().ok()).filter(|n| (1..=24).contains(n)) {
+        return 0xF703 + n; // F1 = NSF1FunctionKey
+    }
+    match code {
+        "Backspace" => 0x7F,
+        "Tab" => 0x09,
+        "Enter" | "NumpadEnter" => 0x0D,
+        "Escape" => 0x1B,
+        "Space" => 0x20,
+        "ArrowUp" => 0xF700,
+        "ArrowDown" => 0xF701,
+        "ArrowLeft" => 0xF702,
+        "ArrowRight" => 0xF703,
+        "Insert" => 0xF727,
+        "Delete" => 0xF728,
+        "Home" => 0xF729,
+        "End" => 0xF72B,
+        "PageUp" => 0xF72C,
+        "PageDown" => 0xF72D,
+        _ => 0,
+    }
+}
