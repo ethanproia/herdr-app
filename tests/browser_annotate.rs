@@ -115,4 +115,41 @@ fn main() {
     }
     assert_eq!(owner(&mut p), Owner::Browse);
     println!("annotate passed: comment-on-pick field, Enter saves pin 1 (red), page untouched, badge counts across pages, Send hands 2 to the window; region drag draws a band and keeps an anchored region");
+    drop(p);
+    cef();
+}
+
+/// The same flows on the real CEF host, whose PickInfo answers for real.
+fn cef() {
+    let server = fixtures::Server::start();
+    let Some(mut p) = Page::open(Host::Cef, &server.url("select.html")) else { return };
+    p.focus();
+    let v = p.view.clone();
+    p.cx.update(|cx| v.update(cx, |v, cx| v.set_comment_on_pick(true, cx)));
+    let r = p.eval("(()=>{const r=document.getElementById('drop').getBoundingClientRect();return [r.x,r.y,r.width,r.height]})()").unwrap();
+    let rr: Vec<f32> = r.as_array().unwrap().iter().map(|n| n.as_f64().unwrap() as f32).collect();
+    p.cx.update(|cx| v.update(cx, |v, cx| v.toggle_mode(Owner::Pick, cx)));
+    p.click(rr[0] + rr[2] / 2.0, rr[1] + rr[3] / 2.0);
+    assert!(p.wait(Duration::from_secs(10), |p| p.cx.update(|cx| p.view.read(cx).comment_target().is_some())), "PickInfo answered and the field opened");
+    let t = p.cx.update(|cx| v.read(cx).comment_target().cloned()).unwrap();
+    assert_eq!(t.selector, "#drop", "the picked element's selector");
+    let near = |a: f32, b: f32| (a - b).abs() < 1.0;
+    assert!(near(t.rect.0, rr[0]) && near(t.rect.1, rr[1]) && near(t.rect.2, rr[2]) && near(t.rect.3, rr[3]), "target rect {:?} = page rect {rr:?}", t.rect);
+    p.text("bigger drop zone");
+    p.key("enter");
+    let a = p.cx.update(|cx| v.read(cx).annotations().pending().cloned().collect::<Vec<_>>());
+    assert_eq!((a.len(), a[0].comment.as_str()), (1, "bigger drop zone"));
+    let pin = p.page_pixel(rr[0] - 6.0, rr[1]);
+    assert!(pin[0] > 220 && pin[1] < 90 && pin[2] < 90, "pin at the element's corner: {pin:?}");
+    // A region drawn over the paragraph anchors to it.
+    p.cx.update(|cx| v.update(cx, |v, cx| v.set_comment_on_pick(false, cx)));
+    let pr = p.eval("(()=>{const r=document.getElementById('p').getBoundingClientRect();return [r.x,r.y,r.width,r.height]})()").unwrap();
+    let pr: Vec<f32> = pr.as_array().unwrap().iter().map(|n| n.as_f64().unwrap() as f32).collect();
+    p.cx.update(|cx| v.update(cx, |v, cx| v.toggle_mode(Owner::Pick, cx)));
+    p.drag((pr[0] + 10.0, pr[1] + 4.0), (pr[0] + 210.0, pr[1] + 40.0), 6);
+    assert!(p.wait(Duration::from_secs(10), |p| !p.cx.update(|cx| p.view.read(cx).regions.is_empty())));
+    let reg = p.cx.update(|cx| v.read(cx).regions[0].clone());
+    assert_eq!(reg.anchor.as_deref(), Some("#p"), "anchored to the paragraph");
+    assert!(near(reg.offset.0, 10.0) && near(reg.offset.1, 4.0) && near(reg.size.0, 200.0) && near(reg.size.1, 36.0), "{reg:?}");
+    println!("annotate passed (CEF): picked #drop (rect matches), pin at its corner, region anchored to #p at {:?}", reg.offset);
 }
