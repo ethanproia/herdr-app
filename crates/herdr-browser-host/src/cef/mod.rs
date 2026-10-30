@@ -34,6 +34,11 @@ pub(crate) struct Entry {
     last: Option<Surface>,
     /// Keeps the DevTools observer that reports the CDP target id alive.
     _devtools: Option<Registration>,
+    /// Input waits here until the page can take it: Chromium drops events sent between the first
+    /// load finishing and the first frame painted after it. See `input_ready`.
+    queued: Vec<InputEvent>,
+    loaded: bool,
+    input_ready: bool,
 }
 
 pub(crate) struct Host {
@@ -51,6 +56,21 @@ thread_local! {
     static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
     /// Browsers CEF has created and not yet finished closing (`on_before_close`).
     pub(crate) static OPEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Set by the cookie store's flush callback.
+    pub(crate) static FLUSHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How long `cef::shutdown` may take before the host exits on its own (Chromium's watchdog is longer).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+unsafe extern "C" {
+    fn _exit(code: i32) -> !;
+}
+
+fn debug(args: std::fmt::Arguments) {
+    if std::env::var_os("HERDR_BROWSER_HOST_DEBUG").is_some() {
+        eprintln!("herdr-browser-host: {args}");
+    }
 }
 
 /// Borrow host state briefly. Never call CEF inside `f`.
@@ -110,10 +130,31 @@ pub(crate) fn on_frame(id: &str, src: *mut std::ffi::c_void, w: u32, h: u32) {
         Some(Ok(frame.map(|(seq, s)| (seq, s, entry.scale))))
     })
     .flatten();
+    let woke = with_host(|h| h.browsers.get_mut(id).filter(|e| e.loaded && !e.input_ready).map(|e| {
+        e.input_ready = true;
+        std::mem::take(&mut e.queued)
+    })).flatten();
+    if let Some(events) = woke {
+        replay(id, events);
+    }
     match ready {
         Some(Ok(Some((seq, s, scale)))) => send_frame(id, seq, s, scale),
         Some(Err(e)) => send(HostToApp::Error { id: Some(id.into()), message: format!("frame: {e}") }),
         _ => {}
+    }
+}
+
+/// The page finished (or started) loading. Input becomes deliverable on the next frame.
+pub(crate) fn on_loading(id: &str, loading: bool) {
+    if !loading {
+        with_host(|h| h.browsers.get_mut(id).map(|e| e.loaded = true));
+    }
+}
+
+fn replay(id: &str, events: Vec<InputEvent>) {
+    let Some(host) = browser(id).and_then(|b| b.host()) else { return };
+    for ev in events {
+        input(&host, ev);
     }
 }
 
@@ -284,11 +325,16 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
         do_message_loop_work();
         std::thread::sleep(Duration::from_millis(5));
     }
-    // Write cookies to disk before teardown: Chromium's shutdown watchdog can kill a slow
-    // teardown (seen under heavy CPU load), and logins must survive that.
-    if let Some(cm) = cookie_manager_get_global_manager(None) {
-        cm.flush_store(None);
+    // Write cookies to disk and wait (bounded) for CEF to confirm, so logins never depend on
+    // how teardown goes.
+    FLUSHED.set(false);
+    let flushing = cookie_manager_get_global_manager(None).is_some_and(|cm| cm.flush_store(Some(&mut handlers::flush_done())) == 1);
+    let end = std::time::Instant::now() + Duration::from_secs(3);
+    while flushing && !FLUSHED.get() && std::time::Instant::now() < end {
+        do_message_loop_work();
+        std::thread::sleep(Duration::from_millis(5));
     }
+    // Let CEF finish the close and flush tasks it queued; `shutdown` hangs if they are pending.
     for _ in 0..40 {
         do_message_loop_work();
         std::thread::sleep(Duration::from_millis(5));
@@ -299,16 +345,20 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
             h.choosers.clear();
         }
     });
-    if std::env::var_os("HERDR_BROWSER_HOST_DEBUG").is_some() {
-        eprintln!("herdr-browser-host: shutting down CEF, {} browsers still open, at {:?}", OPEN.get(), std::time::SystemTime::now());
-    }
+    let _ = std::fs::remove_file(socket);
+    // Chromium's own teardown watchdog can kill a slow `shutdown` (exit 2) when the machine is
+    // loaded. Everything that matters is closed and flushed by now, so bound the teardown
+    // ourselves: if CEF has not returned within SHUTDOWN_GRACE, exit 0 from a side thread
+    // before Chromium's watchdog fires. Helpers exit when the browser process goes away.
+    std::thread::spawn(|| {
+        std::thread::sleep(SHUTDOWN_GRACE);
+        debug(format_args!("CEF shutdown exceeded {SHUTDOWN_GRACE:?}; exiting"));
+        unsafe { _exit(0) };
+    });
     let t = std::time::Instant::now();
     cef::shutdown();
-    if std::env::var_os("HERDR_BROWSER_HOST_DEBUG").is_some() {
-        eprintln!("herdr-browser-host: CEF shut down in {:?}", t.elapsed());
-    }
+    debug(format_args!("CEF shut down in {:?} (cookies flushed: {})", t.elapsed(), FLUSHED.get()));
     HOST.with_borrow_mut(|h| *h = None);
-    let _ = std::fs::remove_file(socket);
     Ok(())
 }
 
@@ -331,7 +381,7 @@ fn handle(m: AppToHost) {
                 send(HostToApp::Error { id: Some(id.clone()), message: format!("browser {id} exists") });
                 return;
             }
-            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, _devtools: None }));
+            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false }));
             let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
             let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
             let mut client = handlers::client(&id);
@@ -448,7 +498,15 @@ fn browser_msg(m: AppToHost) {
         }
         M::Focus { focused, .. } => host.set_focus(focused as i32),
         M::SetZoom { level, .. } => host.set_zoom_level(level),
-        M::Input { event, .. } => input(&host, event),
+        M::Input { event, .. } => {
+            let queued = with_host(|h| {
+                h.browsers.get_mut(&id).filter(|e| !e.input_ready).map(|e| e.queued.push(event.clone())).is_some()
+            })
+            .unwrap_or(false);
+            if !queued {
+                input(&host, event);
+            }
+        }
         M::Edit { command, .. } => {
             // OSR on macOS ignores cmd-c/x/v/a/z sent as keys; run the frame's own commands.
             let Some(f) = b.focused_frame().or_else(|| b.main_frame()) else { return };
