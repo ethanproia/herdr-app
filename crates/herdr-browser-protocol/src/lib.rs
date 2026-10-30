@@ -156,7 +156,8 @@ pub enum AppToHost {
     Input { id: BrowserId, event: InputEvent },
     /// Run an editing command (copy, paste, ...) in the focused frame.
     Edit { id: BrowserId, command: EditCommand },
-    /// Frame `seq` was presented in a visible window: send the next (one in flight). Paces
+    /// Frame `seq` (and every older one) was presented in a visible window: the host may send more
+    /// (at most two unacked). Paces
     /// delivery only; a surface is reused only once its IOSurface use count is released.
     FrameAck { id: BrowserId, seq: u64 },
     /// The block's window is occluded or minimized, or its tab is not shown (`false`), or shown
