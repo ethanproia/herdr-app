@@ -24,6 +24,28 @@ use gpui::{
     Pixels, Point, ScrollDelta, ScrollWheelEvent, StatefulInteractiveElement, UTF16Selection, Window, point, px,
 };
 use std::ops::Range;
+
+// Mode chords (S14-min): toggle element pick and markup while a browser block is focused.
+gpui::actions!(browser_mode, [TogglePick, ToggleMarkup]);
+
+/// The shipped chords, bound in the `Browser` key context (cmd on macOS; cmd-shift-c is Chrome's
+/// inspect-element chord). keys.json can rebind them with the `browser.pick` / `browser.markup` actions.
+pub fn default_chords() -> [(&'static str, Owner); 2] {
+    if cfg!(target_os = "macos") {
+        [("cmd-shift-c", Owner::Pick), ("cmd-shift-m", Owner::Markup)]
+    } else {
+        [("ctrl-alt-c", Owner::Pick), ("ctrl-alt-m", Owner::Markup)]
+    }
+}
+
+/// A keys.json action string to the mode it toggles (`browser.pick`, `browser.markup`).
+pub fn mode_action(id: &str) -> Option<Owner> {
+    match id {
+        "browser.pick" => Some(Owner::Pick),
+        "browser.markup" => Some(Owner::Markup),
+        _ => None,
+    }
+}
 use std::sync::Arc;
 
 /// Who receives the user's input for this block. The owners form a stack: Esc pops one layer,
@@ -195,6 +217,20 @@ impl BrowserInput {
             self.overlay.push(OverlayEvent::Owner(owner));
         }
         ok
+    }
+
+    /// A mode chord: opens Pick or Markup, swaps between them, or closes the mode when it is
+    /// already on top. Refused (with the cue) under a lease; ignored while a comment is open.
+    pub fn toggle(&mut self, mode: Owner) -> bool {
+        match (self.owner(), mode) {
+            (top, m) if top == m => self.escape(),
+            (Owner::Agent, _) => {
+                self.overlay.push(OverlayEvent::Refused);
+                false
+            }
+            (Owner::Comment, _) => false,
+            _ => self.enter(mode),
+        }
     }
 
     /// Esc: the top layer closes (a comment back to pick, pick back to browse). In browse the page
@@ -783,6 +819,8 @@ mod tests {
             div().size_full().child(
                 listen(div().id("browser").key_context("Browser").track_focus(&self.focus).absolute().left(px(40.)).top(px(30.)).w(px(300.)).h(px(200.)), &self.input)
                     .on_action(cx.listener(|this, _: &HerdrBinding, _, _| this.bound += 1))
+                    .on_action(cx.listener(|this, _: &TogglePick, _, cx| { this.input.update(cx, |i, _| i.toggle(Owner::Pick)); }))
+                    .on_action(cx.listener(|this, _: &ToggleMarkup, _, cx| { this.input.update(cx, |i, _| i.toggle(Owner::Markup)); }))
                     .child(gpui::canvas(|_, _, _| (), move |bounds, _, window, cx| paint(&input, &focus, bounds, window, cx)).size_full()),
             )
         }
@@ -934,6 +972,46 @@ mod tests {
     fn with<R>(cx: &mut gpui::VisualTestContext, block: &Entity<Block>, f: impl FnOnce(&mut BrowserInput) -> R) -> R {
         let input = block.read_with(cx, |b, _| b.input.clone());
         cx.update(|_, cx| input.update(cx, |i, _| f(i)))
+    }
+
+    #[test]
+    fn mode_chords_toggle_swap_and_respect_comment_and_lease() {
+        use Owner::*;
+        let mut i = BrowserInput::new("b1".into(), Arc::new(Recording::default()));
+        assert!(i.toggle(Pick));
+        assert_eq!(i.owner(), Pick);
+        assert!(i.toggle(Markup));
+        assert_eq!(i.owner(), Markup, "pick to markup swaps");
+        assert!(i.toggle(Markup));
+        assert_eq!(i.owner(), Browse, "the same chord again closes the mode");
+        assert!(i.toggle(Pick) && i.enter(Comment));
+        assert!(!i.toggle(Markup) && !i.toggle(Pick));
+        assert_eq!(i.owner(), Comment, "a chord never closes an open comment (Esc does)");
+        i.escape();
+        i.escape();
+        i.grant_lease("claude");
+        i.take_overlay();
+        assert!(!i.toggle(Pick));
+        assert_eq!((i.owner(), i.take_overlay()), (Agent, vec![OverlayEvent::Refused]));
+        assert_eq!(mode_action("browser.pick"), Some(Pick));
+        assert_eq!(mode_action("browser.markup"), Some(Markup));
+        assert_eq!(mode_action("browser.back"), None);
+    }
+
+    /// The chord as the view will wire it: bound in the `Browser` context, handled by `toggle`,
+    /// and never seen by the page.
+    #[gpui::test]
+    fn the_pick_chord_reaches_the_mode_not_the_page(cx: &mut TestAppContext) {
+        let (rec, block, cx) = setup(cx);
+        let [(pick, _), (markup, _)] = default_chords();
+        cx.update(|_, cx| cx.bind_keys([gpui::KeyBinding::new(pick, TogglePick, Some("Browser")), gpui::KeyBinding::new(markup, ToggleMarkup, Some("Browser"))]));
+        cx.simulate_keystrokes(pick);
+        assert_eq!(with(cx, &block, |i| i.owner()), Owner::Pick);
+        cx.simulate_keystrokes(markup);
+        assert_eq!(with(cx, &block, |i| i.owner()), Owner::Markup);
+        cx.simulate_keystrokes(markup);
+        assert_eq!(with(cx, &block, |i| i.owner()), Owner::Browse);
+        assert!(rec.inputs().is_empty(), "the page saw none of the chords");
     }
 
     #[test]
