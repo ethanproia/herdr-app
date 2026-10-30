@@ -108,6 +108,7 @@ async function closeTab(id) {
 
 register({
   sessions, dir, openTab, closeTab, targets,
+  lease: async (id, on) => { if (!standin) { const r = await app("browser.lock", { id, on, agent: process.env.HERDR_BROWSER_AGENT || "an agent" }); if (r.error) throw new Error(`browser.lock: ${r.error}`); } },
   onEvent: (method, fn) => events.set(method, [...(events.get(method) ?? []), fn]),
   onOpen: (fn) => openHooks.push(fn),
   route: (method, path, fn) => routes.set(`${method} ${path}`, fn),

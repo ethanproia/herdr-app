@@ -64,7 +64,7 @@ const redact = (v, secrets) => {
   return v;
 };
 
-export default function register({ sessions, onEvent, onOpen, route, dir, openTab, closeTab, targets }) {
+export default function register({ sessions, onEvent, onOpen, route, dir, openTab, closeTab, targets, lease = async () => {} }) {
   const opened = new Set(); // tab ids an agent opened
   const grants = () => { try { return JSON.parse(readFileSync(join(dir, "grants.json"), "utf8")); } catch { return {}; } };
   const granted = (id, cap) => grants()[id]?.[cap] === true;
@@ -170,7 +170,8 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
     get_bounding_box: async (s, { ref }) => box(s, ref, false),
     highlight: async (s, { ref, durationMs = 2000 }) => { await onEl(s, ref, `const o = e.style.outline; e.style.outline = "3px solid #f0a";
       setTimeout(() => { e.style.outline = o; }, ${Number(durationMs) | 0}); return {};`); return {}; },
-    lock: (s, { action = "lock" }) => { s.state.agentLock = action === "lock"; return { locked: s.state.agentLock }; },
+    // Cursor's lock: on the app, the block's input lease (the person sees who is driving and can take control back).
+    lock: async (s, { action = "lock" }) => { s.state.agentLock = action === "lock"; await lease(s.id, s.state.agentLock); return { locked: s.state.agentLock }; },
     cdp: async (s, { method, params }) => {
       if (!granted(s.id, "cdp")) throw new Error(`raw CDP on tab ${s.id} needs the person's cdp grant`);
       if (!CDP_ALLOWED.test(String(method))) throw new Error(`CDP method ${method} is not allowed for agents`);

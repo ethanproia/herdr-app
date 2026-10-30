@@ -24,11 +24,18 @@ pub struct Focus<'a> {
     pub block_of_pane: &'a dyn Fn(&str) -> Option<BrowserId>,
 }
 
+/// The profile (CEF cache) agent-opened browsers use unless the command names another.
+pub const AGENT_PROFILE: &str = "agent";
+
 pub enum Step {
     /// The reply was sent or parked.
     Done,
     /// `browser.open`: the window makes a browser block (at `place`, default a new tab) and answers with its id.
-    Open { url: Option<String>, place: Option<String>, reply: Reply },
+    /// `profile` defaults to "agent": a browser an agent opens never shares the person's cookies or logins.
+    Open { url: Option<String>, place: Option<String>, profile: String, reply: Reply },
+    /// `browser.lock`: the window grants `agent` the block's input lease (the person's input is refused with a
+    /// visible cue), or ends it (`agent` None).
+    Lease { id: BrowserId, agent: Option<String>, reply: Reply },
     /// `browser.close`: the window closes block `id` (and calls `Agent::closed`) and answers.
     Close { id: BrowserId, reply: Reply },
 }
@@ -86,7 +93,8 @@ impl Agent {
 
     pub fn run(&mut self, name: &str, a: &Value, reg: &dyn BrowserRegistry, focus: &Focus, reply: Reply) -> Step {
         if name == "browser.open" {
-            return Step::Open { url: arg(a, "url").map(Into::into), place: arg(a, "place").map(Into::into), reply };
+            let profile = arg(a, "profile").unwrap_or(AGENT_PROFILE).to_string();
+            return Step::Open { url: arg(a, "url").map(Into::into), place: arg(a, "place").map(Into::into), profile, reply };
         }
         let id = match Self::target(a, reg, focus) {
             Ok(id) => id,
@@ -97,6 +105,10 @@ impl Agent {
         };
         if name == "browser.close" {
             return Step::Close { id, reply };
+        }
+        if name == "browser.lock" {
+            let agent = flag(a, "on", true).then(|| arg(a, "agent").unwrap_or("an agent").to_string());
+            return Step::Lease { id, agent, reply };
         }
         let link = reg.link();
         let sent = |reply: Reply, msg: AppToHost| {
@@ -561,7 +573,11 @@ mod tests {
         let pane = |_: &str| None;
         let (_got, reply) = catch();
         let step = a.run("browser.open", &json!({ "url": "https://x.test", "place": "right" }), &reg, &Focus { focused: None, block_of_pane: &pane }, reply);
-        assert!(matches!(step, Step::Open { url: Some(u), place: Some(p), .. } if u == "https://x.test" && p == "right"));
+        assert!(matches!(step, Step::Open { url: Some(u), place: Some(p), profile, .. } if u == "https://x.test" && p == "right" && profile == "agent"),
+            "an agent's browser gets its own profile by default");
+        let (_got, reply) = catch();
+        let step = a.run("browser.open", &json!({ "profile": "default" }), &reg, &Focus { focused: None, block_of_pane: &pane }, reply);
+        assert!(matches!(step, Step::Open { profile, .. } if profile == "default"));
     }
 
     #[test]
@@ -610,6 +626,20 @@ mod tests {
         a.on_host(&HostToApp::EvalResult { id: "b1".into(), req: 99, ok: true, value: json!("stale") });
         assert!(a.pending.contains_key(&99));
         let _ = req;
+    }
+
+    #[test]
+    fn lock_goes_to_the_window_as_a_lease() {
+        let (_d, mut a) = agent();
+        let reg = reg();
+        let pane = |_: &str| None;
+        let focus = Focus { focused: Some("b1".into()), block_of_pane: &pane };
+        let (_g, reply) = catch();
+        assert!(matches!(a.run("browser.lock", &json!({ "agent": "claude" }), &reg, &focus, reply),
+            Step::Lease { id, agent: Some(who), .. } if id == "b1" && who == "claude"));
+        let (_g, reply) = catch();
+        assert!(matches!(a.run("browser.lock", &json!({ "on": false }), &reg, &focus, reply), Step::Lease { agent: None, .. }));
+        assert!(sent(&reg).is_empty());
     }
 
     #[test]
