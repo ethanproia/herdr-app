@@ -581,7 +581,7 @@ mod tests {
     fn mismatched_or_stale_replies_are_dropped() {
         let (_d, mut a) = agent();
         let reg = reg();
-        a.on_host(&HostToApp::Ready { version: 1, cef_version: "x".into(), cdp_port: None });
+        a.on_host(&HostToApp::Ready { version: 1, cef_version: "x".into(), cdp_port: None, cdp_pipe: false });
         assert_eq!(run(&mut a, &reg, "browser.eval", json!({ "expr": "1" })), None);
         let [AppToHost::Eval { req, .. }] = &sent(&reg)[..] else { panic!() };
         let req = *req;
@@ -601,7 +601,7 @@ mod tests {
         let (got, reply) = catch();
         a.run("browser.eval", &json!({ "expr": "3" }), &reg, &Focus { focused: Some("b1".into()), block_of_pane: &pane }, reply);
         let [AppToHost::Eval { req: req3, .. }] = &sent(&reg)[..] else { panic!() };
-        a.on_host(&HostToApp::Ready { version: 1, cef_version: "x".into(), cdp_port: None });
+        a.on_host(&HostToApp::Ready { version: 1, cef_version: "x".into(), cdp_port: None, cdp_pipe: false });
         assert_eq!(got.lock().unwrap().take(), Some(Err("the browser host restarted".into())));
         a.on_host(&HostToApp::EvalResult { id: "b1".into(), req: *req3, ok: true, value: json!("late") });
         assert!(a.pending.is_empty());
@@ -639,7 +639,7 @@ mod tests {
         let (d, mut a) = agent();
         let path = d.path().join("browser/cdp.json");
         let read = || serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        a.on_host(&HostToApp::Ready { version: 1, cef_version: "x".into(), cdp_port: Some(9333) });
+        a.on_host(&HostToApp::Ready { version: 1, cef_version: "x".into(), cdp_port: Some(9333), cdp_pipe: false });
         assert_eq!(read(), json!({ "port": 9333, "targets": {} }));
         #[cfg(unix)]
         {
@@ -651,7 +651,7 @@ mod tests {
         assert_eq!(read(), json!({ "port": 9333, "targets": { "b1": "T1", "b2": "T2" } }));
         a.closed(&"b1".into());
         assert_eq!(read(), json!({ "port": 9333, "targets": { "b2": "T2" } }));
-        a.on_host(&HostToApp::Ready { version: 1, cef_version: "x".into(), cdp_port: None });
+        a.on_host(&HostToApp::Ready { version: 1, cef_version: "x".into(), cdp_port: None, cdp_pipe: false });
         assert!(!path.exists(), "no port, no file");
     }
 }
