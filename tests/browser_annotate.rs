@@ -82,8 +82,15 @@ fn main() {
         BrowserEvent::Annotations(b) => Some(b),
         _ => None,
     });
+    // Send waits for the host's screenshot (the stub refuses one: the batch goes without a picture).
+    assert!(p.wait(Duration::from_secs(5), |p| p.events().iter().any(|e| matches!(e, BrowserEvent::Annotations(_)))), "batch sent");
+    let sent = p.events().into_iter().find_map(|e| match e {
+        BrowserEvent::Annotations(b) => Some(b),
+        _ => None,
+    });
     let sent = sent.expect("Annotations event");
-    assert_eq!(sent.iter().map(|a| a.comment.as_str()).collect::<Vec<_>>(), ["make it blue", "and this"]);
+    assert_eq!(sent.annotations.iter().map(|a| a.comment.as_str()).collect::<Vec<_>>(), ["make it blue", "and this"]);
+    assert_eq!((sent.version, sent.picture.is_none()), (1, true), "stub: no screenshot, no picture");
     assert_eq!(p.cx.update(|cx| v.read(cx).annotations().count()), 0);
     // S6: a drag in pick draws a rubber band and leaves an anchored region.
     p.cx.update(|cx| v.update(cx, |v, cx| v.set_comment_on_pick(false, cx)));

@@ -15,6 +15,44 @@ use super::zoom;
 use super::styles::StylePanelView;
 use super::{annotate, region};
 
+/// What Send hands the agent side (fork-agent's S8): one batch, one picture.
+///
+/// Coordinates: `annotations[].target.rect` and `region.rect` are page DIPs in the *viewport*
+/// (from the page area's top-left, as the element sat when it was picked or the region was
+/// drawn; the region is moved by the scroll since); `scroll` is the document's scroll at Send in
+/// page DIPs; `picture` is the viewport at Send at `scale` pixels per DIP (cropped to `region`
+/// when there is one, markup burned in). Fields named in `untrusted` come from the page.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AnnotationBatch {
+    pub version: u32,
+    pub id: u64,
+    pub sent_at_ms: u64,
+    pub block: BrowserId,
+    pub url: String,
+    pub title: String,
+    pub scroll: (f32, f32),
+    pub annotations: Vec<annotate::Annotation>,
+    /// The style panel's edits line ("CSS edits — padding: 8px → 16px"), the person's own.
+    pub css_edits: Option<String>,
+    /// A PNG under `<app home>/browser/attach/`; agent.rs keeps the last 20.
+    pub picture: Option<std::path::PathBuf>,
+    pub region: Option<RegionInfo>,
+    pub scale: f32,
+    pub untrusted: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RegionInfo {
+    pub anchor: Option<String>,
+    pub rect: (f32, f32, f32, f32),
+    /// Off the page now: `rect` is meaningless and the picture is the whole viewport.
+    pub detached: bool,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
 /// Request ids the view uses for its own `PickInfo` questions (agents count from 1; style
 /// panels from 1 << 40).
 pub const VIEW_REQ_BASE: u64 = 1 << 41;
@@ -485,8 +523,8 @@ pub enum BrowserEvent {
     PageInfo,
     /// S6: a region was drawn (page DIPs); `BrowserView::regions` keeps it anchored.
     Region(region::Rect),
-    /// S7 Send: the annotation batch for the agent (S8 formats it).
-    Annotations(Vec<annotate::Annotation>),
+    /// S7 Send: the annotation batch, with its picture, for the agent (S8, `Browsers::annotations`).
+    Annotations(AnnotationBatch),
     /// Show a toast (a download finished or failed): `{"title","body","level"}`.
     Notice(serde_json::Value),
 }
@@ -550,6 +588,10 @@ pub struct BrowserView {
     next_ask: u64,
     /// S10: the style panel on the picked element (beside the page); its answers wait for render.
     styles_on_pick: bool,
+    /// Regions anchored to the document (for the attach picture), with the anchor selector if any.
+    region_docs: Vec<(region::Region, Option<String>)>,
+    /// Sends waiting for their screenshot: the batch and the page picture's path.
+    attaching: HashMap<u64, (AnnotationBatch, std::path::PathBuf)>,
     style_panel: Option<Entity<StylePanelView>>,
     style_results: Vec<(u64, bool, Vec<herdr_browser_protocol::StyleRow>)>,
     /// JS dialogs, the file chooser and download notices (dialogs.rs, fork-host's).
@@ -764,6 +806,8 @@ impl BrowserView {
             asks: HashMap::new(),
             next_ask: 0,
             styles_on_pick: false,
+            region_docs: Vec::new(),
+            attaching: HashMap::new(),
             style_panel: None,
             style_results: Vec::new(),
             dialogs,
@@ -950,6 +994,7 @@ impl BrowserView {
                     self.style_results.push((req, ok, rows));
                 }
             }
+            H::ScreenshotDone { req, ok, .. } if self.attaching.contains_key(&req) => self.finish_attach(req, ok, cx),
             H::PickInfoResult { req, ok, selector, label, rect, .. } if req >= VIEW_REQ_BASE => {
                 if let Some(ask) = self.asks.remove(&req) {
                     self.on_target(ask, ok.then_some((selector, label, rect)), cx);
@@ -1214,6 +1259,8 @@ impl BrowserView {
             PageAsk::RegionAnchor(r) => {
                 let anchor = target.map(|t| (t.selector, region::Rect { x: t.rect.0, y: t.rect.1, w: t.rect.2, h: t.rect.3 }));
                 let scroll = geo.viewport_to_page(Pt { x: self.scroll.0, y: self.scroll.1 });
+                // The document-anchored copy places the region at Send (scroll since then applied).
+                self.region_docs.push((region::Region::new(r, None, (scroll.x, scroll.y)), anchor.as_ref().map(|(s, _)| s.clone())));
                 self.regions.push(region::Region::new(r, anchor, (scroll.x, scroll.y)));
             }
             PageAsk::StyleTarget => {
@@ -1302,11 +1349,71 @@ impl BrowserView {
     }
 
     /// Send: the pending batch goes to the agent (S8 formats it) and the pins clear.
+    /// Send (S7, attach flow): takes a host screenshot of the page; when it is in, burns the markup
+    /// into it, crops it to the newest region, and emits the batch with the picture. A failed
+    /// screenshot still sends the batch, without a picture.
     pub fn send_annotations(&mut self, cx: &mut Context<Self>) {
-        let batch = self.annotations.send();
-        if !batch.is_empty() {
-            cx.emit(BrowserEvent::Annotations(batch));
+        let annotations = self.annotations.send();
+        if annotations.is_empty() {
+            cx.notify();
+            return;
         }
+        let dir = self.link.config().dir.join("attach");
+        let _ = std::fs::create_dir_all(&dir);
+        let at = now_ms();
+        self.next_ask += 1;
+        let req = VIEW_REQ_BASE + self.next_ask;
+        let page = dir.join(format!("{}-{at}.page.png", self.id));
+        let css_edits = self.style_panel.as_ref().and_then(|p| super::edits::css_edits_line(&p.read(cx).panel.edits()));
+        let scroll = self.geometry().viewport_to_page(Pt { x: self.scroll.0, y: self.scroll.1 });
+        let region = self.region_docs.last().map(|(r, anchor)| {
+            let now = r.resolve(None, (scroll.x, scroll.y));
+            (anchor.clone(), now)
+        });
+        let batch = AnnotationBatch {
+            version: 1,
+            id: at,
+            sent_at_ms: at,
+            block: self.id.clone(),
+            url: self.state.url.clone(),
+            title: self.state.title.clone(),
+            scroll: (scroll.x, scroll.y),
+            annotations,
+            css_edits,
+            picture: None,
+            region: region.as_ref().map(|(anchor, r)| RegionInfo { anchor: anchor.clone(), rect: r.map(|r| (r.x, r.y, r.w, r.h)).unwrap_or_default(), detached: r.is_none() }),
+            scale: 1.0,
+            untrusted: ["url", "title", "annotations.target.label", "annotations.target.selector", "annotations.target.rect", "region.anchor"].iter().map(|s| s.to_string()).collect(),
+        };
+        self.attaching.insert(req, (batch, page.clone()));
+        self.link.send(AppToHost::Screenshot { id: self.id.clone(), req, path: page.to_string_lossy().into_owned() });
+        cx.notify();
+    }
+
+    /// The host wrote the page screenshot for a Send: finish the picture and emit the batch.
+    fn finish_attach(&mut self, req: u64, ok: bool, cx: &mut Context<Self>) {
+        let Some((mut batch, page)) = self.attaching.remove(&req) else { return };
+        let width = self.geometry().size.x.max(1.0);
+        let made = ok
+            .then(|| image::open(&page).ok())
+            .flatten()
+            .map(|img| {
+                let img = img.to_rgba8();
+                let scale = img.width() as f32 / width;
+                let burned = self.markup.read(cx).burn(&img, scale);
+                let rect = batch.region.as_ref().filter(|r| !r.detached).map(|r| region::Rect { x: r.rect.0, y: r.rect.1, w: r.rect.2, h: r.rect.3 });
+                let pic = rect.and_then(|r| region::crop(&burned, r, scale)).unwrap_or(burned);
+                (pic, scale)
+            });
+        let _ = std::fs::remove_file(&page);
+        if let Some((pic, scale)) = made {
+            let out = page.with_file_name(format!("{}-{}.png", self.id, batch.id));
+            if std::fs::write(&out, markup::png(&pic)).is_ok() {
+                batch.picture = Some(out);
+                batch.scale = scale;
+            }
+        }
+        cx.emit(BrowserEvent::Annotations(batch));
         cx.notify();
     }
 
@@ -1991,6 +2098,8 @@ pub struct Browsers {
     agent: Option<Arc<Mutex<Agent>>>,
     /// The browser that last took the keyboard: agent commands' default target.
     pub focused: Option<BrowserId>,
+    /// Sent annotation batches, newest last (at most 20).
+    pub batches: Arc<Mutex<std::collections::VecDeque<AnnotationBatch>>>,
     /// Zoom per host, `$HERDR_APP_HOME/browser/zoom.json`, loaded with the first block.
     zoom: Option<Arc<Mutex<zoom::ZoomPrefs>>>,
     /// Every download this run, shared by all blocks (`browser.downloads` reads it).
@@ -2038,6 +2147,16 @@ impl Browsers {
     }
 
     // HERDR: browser block (part 5). The person picked an element: the agent captures it for `browser.pick`.
+    /// Send's batch (S7 attach flow) for the agent side (fork-agent's S8 takes it from here);
+    /// the newest 20 are kept for `browser.annotations`.
+    pub fn annotations(&mut self, batch: AnnotationBatch) {
+        let mut q = self.batches.lock().unwrap();
+        q.push_back(batch);
+        while q.len() > 20 {
+            q.pop_front();
+        }
+    }
+
     pub fn picked(&mut self, id: &str, x: f32, y: f32) {
         let link = self.link_arc();
         if let Some(agent) = &self.agent {
