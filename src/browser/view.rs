@@ -65,6 +65,7 @@ impl HostConfig {
 #[derive(Clone, Debug, PartialEq)]
 struct Open {
     url: Option<String>,
+    profile: Option<String>,
     size: Dips,
     scale: f32,
 }
@@ -151,8 +152,8 @@ impl HostLink for HostClient {
         {
             let mut s = self.shared.lock().unwrap();
             match &msg {
-                AppToHost::Create { id, url, size, scale, .. } => {
-                    s.open.insert(id.clone(), Open { url: url.clone(), size: *size, scale: *scale });
+                AppToHost::Create { id, url, size, scale, profile } => {
+                    s.open.insert(id.clone(), Open { url: url.clone(), profile: profile.clone(), size: *size, scale: *scale });
                 }
                 AppToHost::Resize { id, size, scale } => {
                     if let Some(o) = s.open.get_mut(id) {
@@ -218,7 +219,7 @@ impl Writer {
                         open.sort_by(|a, b| a.0.cmp(&b.0));
                         self.replayed = open.iter().map(|(id, _)| id.clone()).collect();
                         for (id, o) in open {
-                            self.write(&AppToHost::Create { id, url: o.url, size: o.size, scale: o.scale, profile: None });
+                            self.write(&AppToHost::Create { id, url: o.url, size: o.size, scale: o.scale, profile: o.profile });
                         }
                     }
                     Err(e) => {
@@ -673,7 +674,9 @@ impl BrowserView {
         match self.sized {
             None => {
                 let url = Some(self.block.url.clone()).filter(|u| !u.is_empty());
-                self.link.send(AppToHost::Create { id: self.id.clone(), url, size, scale, profile: None });
+                // The shared profile is the host's default; another one names its own cache.
+                let profile = Some(self.block.profile.clone()).filter(|p| p != "default");
+                self.link.send(AppToHost::Create { id: self.id.clone(), url, size, scale, profile });
             }
             Some((s, k)) if (s.w - size.w).abs() < 0.5 && (s.h - size.h).abs() < 0.5 && k == scale => return,
             Some(_) => {

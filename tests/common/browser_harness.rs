@@ -46,3 +46,11 @@ mod mods {
         std::env::temp_dir()
     }
 }
+
+/// The app's control.rs: tests draw their windows themselves, so never "headless" here.
+#[allow(dead_code)]
+mod control {
+    pub fn headless() -> bool {
+        false
+    }
+}

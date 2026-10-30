@@ -114,9 +114,15 @@ impl Page {
         Self::open_sized(host, url, 1024.0, 768.0)
     }
 
+    /// A missing CEF host FAILS the test unless `HERDR_PARITY_STUB_ONLY=1` says this run is
+    /// stub-only (then CEF pages return None). A missing stub host is always a skip.
     pub fn open_sized(host: Host, url: &str, w: f32, h: f32) -> Option<Page> {
         let Some(program) = host.program() else {
-            println!("SKIP {host:?} host not configured (HERDR_BROWSER_CEF_HOST / HERDR_BROWSER_HOST)");
+            let stub_only = std::env::var("HERDR_PARITY_STUB_ONLY").is_ok_and(|v| v == "1");
+            if host == Host::Cef && !stub_only {
+                panic!("HERDR_BROWSER_CEF_HOST is not set: parity numbers need the real host (set HERDR_PARITY_STUB_ONLY=1 for a stub-only run)");
+            }
+            println!("SKIP {host:?} host not configured");
             return None;
         };
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -433,6 +439,16 @@ impl Page {
         out
     }
 
+    /// Pump until a painted frame has exactly `w` x `h` pixels (after a resize); its record.
+    pub fn wait_frame_size(&mut self, w: u32, h: u32, timeout: Duration) -> Option<FrameRec> {
+        let mut out = None;
+        self.wait(timeout, |p| {
+            out = p.frames().into_iter().find(|f| f.size.w == w && f.size.h == h && f.painted.is_some());
+            out.is_some()
+        });
+        out
+    }
+
     /// Stats of the frames that arrived since `since`.
     pub fn frame_stats(&self, since: Instant) -> FrameStats {
         let f: Vec<FrameRec> = self.frames().into_iter().filter(|f| f.arrived >= since).collect();
@@ -450,6 +466,14 @@ impl Page {
         let img = self.shot();
         let scale = img.width() as f32 / self.size.0;
         img.get_pixel((x * scale) as u32, ((y + CHROME_HEIGHT) * scale) as u32).0
+    }
+
+    /// The page area (page DIPs `x, y, w, h`) cut from a window shot.
+    pub fn page_region(&mut self, x: f32, y: f32, w: f32, h: f32) -> RgbaImage {
+        let img = self.shot();
+        let scale = img.width() as f32 / self.size.0;
+        let (x, y) = ((x * scale) as u32, ((y + CHROME_HEIGHT) * scale) as u32);
+        image::imageops::crop_imm(&img, x, y, ((w * scale) as u32).min(img.width() - x), ((h * scale) as u32).min(img.height() - y)).to_image()
     }
 
     // ---- cost --------------------------------------------------------------------------
@@ -548,4 +572,22 @@ fn cpu_seconds(dir: &std::path::Path) -> f64 {
             days * 86400.0 + parts.iter().fold(0.0, |acc, p| acc * 60.0 + p)
         })
         .sum()
+}
+
+/// Distinct colours in `img` (sampled on an 8 px grid).
+pub fn colours(img: &RgbaImage) -> usize {
+    let mut set = std::collections::HashSet::new();
+    for y in (0..img.height()).step_by(8) {
+        for x in (0..img.width()).step_by(8) {
+            set.insert(img.get_pixel(x, y).0);
+        }
+    }
+    set.len()
+}
+
+/// Validity rule: a picture check needs a patterned page, never a solid colour (a blank or
+/// stale frame must not pass). Panics when `img` has fewer than `min` colours.
+pub fn assert_patterned(img: &RgbaImage, min: usize, what: &str) {
+    let n = colours(img);
+    assert!(n >= min, "{what}: {n} colours, a patterned page needs >= {min} (blank or solid frame?)");
 }

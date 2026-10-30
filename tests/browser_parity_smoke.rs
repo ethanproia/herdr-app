@@ -16,9 +16,11 @@ fn main() {
         // The app's side of a double-click and a drag, as the host receives them.
         p.double_click(50.0, 50.0);
         p.drag((10.0, 10.0), (60.0, 10.0), 2);
-        let c = p.console();
-        assert!(c.iter().any(|l| l.contains(r#""kind":"down""#) && l.contains(r#""clicks":2"#)), "double-click sends clicks 2: {c:?}");
-        assert!(c.iter().any(|l| l.contains(r#""kind":"move""#) && l.contains(r#""button":"left""#)), "drag moves carry the button: {c:?}");
+        // The stub echoes asynchronously: wait for each line, don't read once.
+        let dbl = p.wait(Duration::from_secs(5), |p| p.console().iter().any(|l| l.contains(r#""kind":"down""#) && l.contains(r#""clicks":2"#)));
+        assert!(dbl, "double-click sends clicks 2: {:?}", p.console());
+        let held = p.wait(Duration::from_secs(5), |p| p.console().iter().any(|l| l.contains(r#""kind":"move""#) && l.contains(r#""button":"left""#)));
+        assert!(held, "drag moves carry the button: {:?}", p.console());
         println!("smoke stub: frames {}, input echoed", p.frames().len());
     }
     let Some(mut p) = Page::open(Host::Cef, &server.url("form.html")) else { return };
@@ -71,15 +73,19 @@ fn main() {
     metric("SMOKE-dblclick-word-chars", word.as_str().map_or(0, str::len) as f64, "chars", "> 0 (I3)");
     metric("SMOKE-drag-select-chars", span.as_str().map_or(0, str::len) as f64, "chars", "> 10 (I4)");
     // Resize the block, then cost.
+    p.navigate(&server.url("scroll.html")).unwrap();
     let t = Instant::now();
     p.resize_block(Some((600.0, 400.0)));
-    // The page area is the block minus the bar: 600 x 372 DIPs, at 2x.
-    let ok = p.wait(Duration::from_secs(5), |p| p.frames().iter().any(|f| f.size.w == 1200 && f.size.h == 744 && f.painted.is_some()));
-    assert!(ok, "a frame at the new size: {:?}", p.frames().last().map(|f| f.size));
+    // Exact: the page area is the block minus the bar, 600 x 372 DIPs, at 2x.
+    let f = p.wait_frame_size(1200, 744, Duration::from_secs(5));
+    assert!(f.is_some(), "a frame at exactly 1200x744: last {:?}", p.frames().last().map(|f| f.size));
     println!("smoke cef: frame at the new size 1200x744 after {} ms", t.elapsed().as_millis());
     let u = p.usage_over(Duration::from_secs(2));
     metric("SMOKE-idle-cpu", u.cpu, "%", "<= 2 per tab (R6 measures properly)");
     metric("SMOKE-rss", u.rss_mb, "MB", "report");
+    // The scroll page is patterned (coloured rows and text): a blank frame fails here.
+    let region = p.page_region(0.0, 0.0, 600.0, 372.0);
+    harness::assert_patterned(&region, 8, "page after resize");
     let img = p.shot();
     let out = std::env::var_os("HERDR_PARITY_OUT").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
     img.save(out.join("parity-smoke.png")).unwrap();
