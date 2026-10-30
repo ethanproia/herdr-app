@@ -3867,7 +3867,10 @@ impl AppWindow {
                     return;
                 }
                 // Pick results go to the agent tools (part 5) through the view; nothing for the layout.
-                crate::browser::view::BrowserEvent::Picked { .. } => return,
+                crate::browser::view::BrowserEvent::Picked { .. }
+                | crate::browser::view::BrowserEvent::Region(_)
+                // S8 (fork-agent) formats sent annotations for the agent; nothing for the layout.
+                | crate::browser::view::BrowserEvent::Annotations(_) => return,
                 // The page's title or favicon changed: tab strips and panes lists follow.
                 crate::browser::view::BrowserEvent::PageInfo => {
                     this.publish(cx);

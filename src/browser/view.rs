@@ -12,6 +12,29 @@ use super::input::{self, BrowserInput, OverlayEvent, Owner};
 use super::dialogs::{DialogsEvent, Downloads, PageDialogs};
 use super::markup::{self, Markup, Tool};
 use super::zoom;
+use super::{annotate, region};
+
+/// Eval request ids the view uses for its own page questions (agents count from 1; style
+/// panels from 1 << 40).
+pub const VIEW_REQ_BASE: u64 = 1 << 41;
+
+/// What a view-owned page question was for.
+#[derive(Clone, Copy, Debug)]
+enum PageAsk {
+    /// The element under a pick click, for the comment field (S7).
+    CommentTarget,
+    /// The element under a region's corner, to anchor it (S6).
+    RegionAnchor(region::Rect),
+}
+
+/// The element at (__X__, __Y__) viewport CSS px: a selector that finds exactly it (id, else a
+/// tag:nth-of-type chain), a short label and its rect.
+const TARGET_JS: &str = r#"(()=>{const e=document.elementFromPoint(__X__,__Y__);if(!e)return null;
+const sel=el=>{const p=[];while(el&&el.nodeType===1&&el!==document.documentElement){if(el.id){p.unshift('#'+CSS.escape(el.id));break}
+let s=el.localName;const sib=el.parentElement?[...el.parentElement.children].filter(c=>c.localName===el.localName):[];
+if(sib.length>1)s+=`:nth-of-type(${sib.indexOf(el)+1})`;p.unshift(s);el=el.parentElement}return p.join(' > ')};
+const r=e.getBoundingClientRect();const t=(e.innerText||e.textContent||'').trim().replace(/\s+/g,' ').slice(0,30);
+return {selector:sel(e),label:(e.localName+(e.id?'#'+e.id:'')+(t?' '+t:'')),rect:[r.x,r.y,r.width,r.height]}})()"#;
 use super::{BrowserRegistry, BrowserState, FrameSink, FrameView, HostLink};
 use crate::layout::BrowserBlock;
 use gpui::prelude::FluentBuilder as _;
@@ -464,6 +487,10 @@ pub enum BrowserEvent {
     Picked { x: f32, y: f32 },
     /// The page's title or favicon changed (`state` has them): the window republishes its tabs.
     PageInfo,
+    /// S6: a region was drawn (page DIPs); `BrowserView::regions` keeps it anchored.
+    Region(region::Rect),
+    /// S7 Send: the annotation batch for the agent (S8 formats it).
+    Annotations(Vec<annotate::Annotation>),
     /// Show a toast (a download finished or failed): `{"title","body","level"}`.
     Notice(serde_json::Value),
 }
@@ -514,6 +541,19 @@ pub struct BrowserView {
     refused_at: Option<std::time::Instant>,
     /// Whether the mode strip (markup tools, the agent lease) was drawn last render.
     strip_shown: bool,
+    /// S6: pick click or region drag; the rubber band while dragging (page DIPs); kept regions.
+    region_drag: region::RegionDrag,
+    rubber: Option<region::Rect>,
+    pub regions: Vec<region::Region>,
+    /// S7: the annotation queue; comment-on-pick; the target the comment field is open on.
+    annotations: annotate::Annotations,
+    comment_on_pick: bool,
+    comment_target: Option<annotate::Target>,
+    /// The comment field's text when it opened (it isn't cleared between comments yet).
+    comment_base: String,
+    /// Page questions in flight (view-owned eval reqs >= VIEW_REQ_BASE).
+    asks: HashMap<u64, PageAsk>,
+    next_ask: u64,
     /// JS dialogs, the file chooser and download notices (dialogs.rs, fork-host's).
     dialogs: Entity<PageDialogs>,
     /// The app's downloads (shared by every block); the bar's ⬇ opens the list.
@@ -717,6 +757,15 @@ impl BrowserView {
             markup: cx.new(|_| Markup::default()),
             refused_at: None,
             strip_shown: false,
+            region_drag: Default::default(),
+            rubber: None,
+            regions: Vec::new(),
+            annotations: Default::default(),
+            comment_on_pick: false,
+            comment_target: None,
+            comment_base: String::new(),
+            asks: HashMap::new(),
+            next_ask: 0,
             dialogs,
             downloads,
             downloads_open: false,
@@ -780,6 +829,7 @@ impl BrowserView {
         }
         match msg {
             H::Url { url, .. } => {
+                self.annotations.set_page(&url);
                 if url != self.state.url {
                     self.overlay.changed(Change::Navigate);
                     // A new page names its own icon (or none).
@@ -893,6 +943,11 @@ impl BrowserView {
             H::ImeCaret { x, y, w, h, .. } => {
                 self.input.update(cx, |i, _| i.on_caret(x, y, w, h));
                 return;
+            }
+            H::EvalResult { req, ok, value, .. } if req >= VIEW_REQ_BASE => {
+                if let Some(ask) = self.asks.remove(&req) {
+                    self.on_target(ask, ok.then_some(value), cx);
+                }
             }
             H::Error { message, .. } => tracing::warn!("browser {}: {message}", self.id),
             _ => return,
@@ -1070,20 +1125,46 @@ impl BrowserView {
         }
         for ev in &events {
             match ev {
-                OverlayEvent::Pointer { owner: Owner::Pick, kind, x, y, .. } => match kind {
-                    MouseKind::Move => self.hover_overlay(Pt { x: *x, y: *y }),
-                    MouseKind::Down => self.hover_overlay(Pt { x: *x, y: *y }),
-                    // The click's release picks what is highlighted and ends pick (after the
-                    // release, so the page never gets a stray button-up).
-                    MouseKind::Up => {
-                        self.hover_overlay(Pt { x: *x, y: *y });
+                OverlayEvent::Pointer { owner: Owner::Pick, kind, x, y, .. } => match self.region_drag.on_event(ev) {
+                    // A drag draws a rubber band; its release is a region (S6).
+                    region::Outcome::Dragging(r) => self.rubber = Some(r),
+                    region::Outcome::Region(r) => {
+                        self.rubber = None;
+                        self.ask_target(PageAsk::RegionAnchor(r), r.x, r.y);
                         self.input.update(cx, |i, _| {
                             i.escape();
                         });
-                        cx.emit(BrowserEvent::Picked { x: *x, y: *y });
+                        cx.emit(BrowserEvent::Region(r));
                     }
-                    _ => {}
+                    // A click's release picks what is highlighted (after the release, so the page
+                    // never gets a stray button-up). Comment-on-pick keeps pick open for the field.
+                    region::Outcome::Click(cx_, cy) => {
+                        self.hover_overlay(Pt { x: cx_, y: cy });
+                        if self.comment_on_pick {
+                            self.ask_target(PageAsk::CommentTarget, cx_, cy);
+                        } else {
+                            self.input.update(cx, |i, _| {
+                                i.escape();
+                            });
+                        }
+                        cx.emit(BrowserEvent::Picked { x: cx_, y: cy });
+                    }
+                    region::Outcome::None => {
+                        if matches!(kind, MouseKind::Move | MouseKind::Down) {
+                            self.hover_overlay(Pt { x: *x, y: *y });
+                        }
+                    }
                 },
+                OverlayEvent::Owner(o) => {
+                    self.region_drag.on_event(ev);
+                    if *o != Owner::Pick {
+                        self.rubber = None;
+                    }
+                    // The comment field closed (Esc, a lease): its target goes with it.
+                    if *o != Owner::Comment {
+                        self.comment_target = None;
+                    }
+                }
                 OverlayEvent::Pointer { owner: Owner::Markup, .. } | OverlayEvent::Edit { owner: Owner::Markup, .. } => {
                     self.markup.update(cx, |m, _| m.on_event(ev));
                 }
@@ -1099,6 +1180,142 @@ impl BrowserView {
             }
         }
         cx.notify();
+    }
+
+    /// Ask the page what element is at (x, y) page DIPs: selector, label and rect (CSS px).
+    fn ask_target(&mut self, ask: PageAsk, x: f32, y: f32) {
+        let css = self.geometry().page_to_viewport(Pt { x, y });
+        self.next_ask += 1;
+        let req = VIEW_REQ_BASE + self.next_ask;
+        self.asks.insert(req, ask);
+        let expr = TARGET_JS.replace("__X__", &css.x.to_string()).replace("__Y__", &css.y.to_string());
+        self.link.send(AppToHost::Eval { id: self.id.clone(), req, expr });
+    }
+
+    /// The page answered `ask_target`.
+    fn on_target(&mut self, ask: PageAsk, value: Option<serde_json::Value>, cx: &mut Context<Self>) {
+        let geo = self.geometry();
+        let target = value.filter(|v| v.is_object()).map(|v| {
+            let n = |i: usize| v["rect"][i].as_f64().unwrap_or(0.0) as f32;
+            let (a, b) = (geo.viewport_to_page(Pt { x: n(0), y: n(1) }), geo.viewport_to_page(Pt { x: n(0) + n(2), y: n(1) + n(3) }));
+            annotate::Target { selector: v["selector"].as_str().unwrap_or_default().to_owned(), label: v["label"].as_str().unwrap_or_default().to_owned(), rect: (a.x, a.y, b.x - a.x, b.y - a.y) }
+        });
+        match ask {
+            PageAsk::RegionAnchor(r) => {
+                let anchor = target.map(|t| (t.selector, region::Rect { x: t.rect.0, y: t.rect.1, w: t.rect.2, h: t.rect.3 }));
+                let scroll = geo.viewport_to_page(Pt { x: self.scroll.0, y: self.scroll.1 });
+                self.regions.push(region::Region::new(r, anchor, (scroll.x, scroll.y)));
+            }
+            PageAsk::CommentTarget => match target {
+                Some(t) => {
+                    let entered = self.input.update(cx, |i, _| i.enter(Owner::Comment));
+                    if entered {
+                        self.comment_base = self.input.read(cx).comment().text.clone();
+                        self.comment_target = Some(t);
+                    }
+                }
+                // Nothing pickable there: pick ends as a plain pick would.
+                None => self.input.update(cx, |i, _| {
+                    i.escape();
+                }),
+            },
+        }
+        self.drain_overlay(cx);
+        cx.notify();
+    }
+
+    /// Save the open comment as an annotation (S7) and close the field and pick.
+    pub fn save_comment(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.comment_target.take() else { return };
+        let text = self.input.read(cx).comment().text.clone();
+        let text = text.strip_prefix(&self.comment_base).unwrap_or(&text).to_owned();
+        self.annotations.add(target, &text);
+        self.input.update(cx, |i, _| {
+            i.escape(); // Comment -> Pick
+            i.escape(); // Pick -> Browse
+        });
+        self.drain_overlay(cx);
+        cx.notify();
+    }
+
+    /// Comment-on-pick: a picked element opens a comment field (S7).
+    pub fn set_comment_on_pick(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.comment_on_pick = on;
+        cx.notify();
+    }
+
+    pub fn annotations(&self) -> &annotate::Annotations {
+        &self.annotations
+    }
+
+    /// The field's target while a comment is open.
+    pub fn comment_target(&self) -> Option<&annotate::Target> {
+        self.comment_target.as_ref()
+    }
+
+    /// Send: the pending batch goes to the agent (S8 formats it) and the pins clear.
+    pub fn send_annotations(&mut self, cx: &mut Context<Self>) {
+        let batch = self.annotations.send();
+        if !batch.is_empty() {
+            cx.emit(BrowserEvent::Annotations(batch));
+        }
+        cx.notify();
+    }
+
+    fn annotation_layer(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out: Vec<AnyElement> = self
+            .annotations
+            .visible()
+            .map(|a| {
+                let (x, y, _, _) = a.target.rect;
+                div()
+                    .absolute()
+                    .left(px(x - 9.))
+                    .top(px(y - 9.))
+                    .size(px(18.))
+                    .rounded_full()
+                    .bg(rgb(0xff3b30))
+                    .text_color(rgb(0xffffff))
+                    .text_xs()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(a.n.to_string())
+                    .into_any_element()
+            })
+            .collect();
+        if let Some(r) = self.rubber {
+            out.push(div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_1().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.12)).into_any_element());
+        }
+        if let Some(t) = &self.comment_target {
+            let input = self.input.read(cx);
+            let full = input.comment().text.clone();
+            let typed = full.strip_prefix(&self.comment_base).unwrap_or(&full).to_owned() + input.comment().marked.as_deref().unwrap_or("");
+            let (x, y, _, h) = t.rect;
+            out.push(
+                div()
+                    .id("comment-field")
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y + h + 6.))
+                    .w(px(260.))
+                    .p_2()
+                    .rounded_md()
+                    .shadow_lg()
+                    .bg(rgb(0xffffff))
+                    .text_color(rgb(0x1a1a1a))
+                    .text_sm()
+                    .occlude()
+                    .child(div().text_xs().opacity(0.6).child(t.label.clone()))
+                    .child(div().min_h(px(20.)).child(if typed.is_empty() { "Add a comment…".to_string() } else { typed }))
+                    .child(div().id("comment-save").mt_1().px_2().rounded_sm().bg(rgb(0x2563eb)).text_color(rgb(0xffffff)).cursor_pointer().child("Save").on_mouse_down(MouseButton::Left, cx.listener(|v, _, _, cx| {
+                        cx.stop_propagation();
+                        v.save_comment(cx);
+                    })))
+                    .into_any_element(),
+            );
+        }
+        out
     }
 
     /// The input owner on top (Browse, Pick, Comment, Markup, Agent).
@@ -1464,6 +1681,14 @@ impl BrowserView {
             // Modes (part 4's owners): pick an element, mark up the page.
             .child(button("⌖", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx))))
             .child(button("✎", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Markup, cx))))
+            .child(button("💬", true).when(self.comment_on_pick, |d| d.bg(hsla(0., 0., 0.5, 0.3))).on_click(cx.listener(|v, _, _, cx| {
+                let on = !v.comment_on_pick;
+                v.set_comment_on_pick(on, cx);
+            })))
+            // The annotation badge (every page's pending pins); a click sends them.
+            .when(self.annotations.count() > 0, |d| {
+                d.child(div().id("annotations-badge").px_1().rounded_full().bg(rgb(0xff3b30)).text_color(rgb(0xffffff)).cursor_pointer().child(format!("{} · Send", self.annotations.count())).on_click(cx.listener(|v, _, _, cx| v.send_annotations(cx))))
+            })
             // The zoom label shows only off 100 %; a click resets it.
             .when(self.zoom_level.abs() > 1e-6, |d| {
                 d.child(div().id("zoom-label").px_1().rounded_sm().cursor_pointer().bg(hsla(0., 0., 0.5, 0.15)).child(zoom::percent(self.zoom_level)).on_click(cx.listener(|v, _, _, cx| v.set_zoom(0.0, cx))))
@@ -1582,6 +1807,9 @@ impl Render for BrowserView {
         let page = page.children(self.overlay.shown().iter().map(|r| {
             div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_2().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.15))
         }));
+        // S6/S7: pins, the rubber band and the comment field over the frame.
+        let layer = self.annotation_layer(cx);
+        let page = page.children(layer);
         // Markup above the frame and the highlights, while marking up or when shapes exist.
         let marking = self.owner(cx) == Owner::Markup || !self.markup.read(cx).shapes().is_empty();
         let page = page.when(marking, |p| p.child(markup::element(self.markup.clone())));
@@ -1622,6 +1850,12 @@ impl Render for BrowserView {
             .key_context("Browser")
             // Escape closes an open context menu, else an open find bar, before the page sees it.
             .capture_key_down(cx.listener(|v, ev: &KeyDownEvent, window, cx| {
+                // Enter in the comment field saves it (shift-Enter is typed as a new line by the field).
+                if ev.keystroke.key == "enter" && !ev.keystroke.modifiers.shift && v.comment_target.is_some() && v.owner(cx) == Owner::Comment {
+                    cx.stop_propagation();
+                    v.save_comment(cx);
+                    return;
+                }
                 if ev.keystroke.key != "escape" {
                     return;
                 }
