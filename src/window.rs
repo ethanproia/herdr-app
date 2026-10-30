@@ -1540,7 +1540,21 @@ impl AppWindow {
                 // The branch of the terminal the space shows first.
                 let first = p.active_tab().and_then(|c| c.focused_pane()).and_then(|pane| m.address_of(&pane));
                 let branch = first.and_then(|a| m.folder_info.get(&a)).and_then(|f| f.branch.clone());
-                model::space_json(m, p, i, branch.as_deref(), &home)
+                let mut sj = model::space_json(m, p, i, branch.as_deref(), &home);
+                // HERDR: browser block (I17). A tab showing a page: unnamed, it takes the page's
+                // title; its favicon goes with it for tab strips that draw icons.
+                if let Some(tabs) = sj.get_mut("tabs").and_then(Value::as_array_mut) {
+                    for (t, c) in tabs.iter_mut().zip(&p.tabs) {
+                        let page = c.focused.iter().chain(c.root.panes().iter().map(|n| &n.id)).find_map(|id| {
+                            use crate::browser::BrowserRegistry as _;
+                            self.browsers.state(id).filter(|_| matches!(c.root.find(id).and_then(|n| n.content()), Some(Content::Browser { .. })))
+                        });
+                        if let Some(st) = page {
+                            crate::browser::view::annotate_tab(t, &st, !c.name.is_empty());
+                        }
+                    }
+                }
+                sj
             })
             .collect();
         let block = terminal_block(&self.chrome, self.focused_pane.as_deref());
@@ -1552,6 +1566,14 @@ impl AppWindow {
                 for p in ctx.root.panes() {
                     let focused = m.active.as_deref() == Some(pr.id.as_str()) && focused_pane.as_deref() == Some(p.id.as_str());
                     let zoomed = ctx.zoomed.as_deref() == Some(p.id.as_str());
+                    // HERDR: browser block. A browser pane: its page's title, url and favicon.
+                    if let Some(Content::Browser { browser }) = p.content() {
+                        use crate::browser::BrowserRegistry as _;
+                        let st = self.browsers.state(&p.id).unwrap_or_default();
+                        let url = if st.url.is_empty() { browser.url.clone() } else { st.url.clone() };
+                        panes.push(json!({ "pane": p.id, "terminal": null, "browser": true, "tab": ctx.id, "title": st.title, "url": url, "favicon": st.favicon, "focused": focused, "zoomed": zoomed, "movable": self.pane_movable(&p.id) }));
+                        continue;
+                    }
                     // A mod pane: what it shows, no terminal.
                     if let Some(Content::Mod { name, .. }) = p.content() {
                         panes.push(json!({ "pane": p.id, "terminal": null, "mod": name, "tab": ctx.id, "title": name, "focused": focused, "zoomed": zoomed, "movable": self.pane_movable(&p.id) }));
@@ -3846,6 +3868,12 @@ impl AppWindow {
                 }
                 // Pick results go to the agent tools (part 5) through the view; nothing for the layout.
                 crate::browser::view::BrowserEvent::Picked { .. } => return,
+                // The page's title or favicon changed: tab strips and panes lists follow.
+                crate::browser::view::BrowserEvent::PageInfo => {
+                    this.publish(cx);
+                    cx.notify();
+                    return;
+                }
             };
             let tab = this.model.tabs().find(|t| crate::layout::browser_blocks(&t.root).iter().any(|(b, _)| b == id)).map(|t| t.id.clone());
             let changed = match tab.and_then(|t| this.model.tab_mut(&t)) {

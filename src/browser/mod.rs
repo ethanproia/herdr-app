@@ -39,6 +39,8 @@ pub struct BrowserState {
     pub can_back: bool,
     pub can_forward: bool,
     pub cursor: String,
+    /// The page's icon url (`Favicon`), empty until the page names one.
+    pub favicon: String,
 }
 
 /// Looks up a live browser by block id; part 1 provides it, part 5 uses it for `browser.*` commands.
