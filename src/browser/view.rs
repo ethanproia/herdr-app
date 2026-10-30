@@ -419,7 +419,7 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
     }
 }
 
-actions!(browser, [FocusAddress]);
+actions!(browser, [FocusAddress, OpenFind]);
 
 /// What was typed into the address bar, as a page to open: a url as it is, a bare host
 /// (`example.com/x`, `localhost:3000`) over https, anything else searched. None: nothing typed.
@@ -490,6 +490,17 @@ pub struct BrowserView {
     zoom_level: f64,
     /// The open context menu (the host asked; the app draws it).
     menu: Option<Menu>,
+    /// The find bar, when open (I9).
+    find: Option<FindBar>,
+}
+
+/// The find bar: its input, what was last searched and the host's "active of count".
+pub struct FindBar {
+    pub input: Entity<InputState>,
+    pub text: String,
+    pub count: u32,
+    pub active: u32,
+    _typed: Subscription,
 }
 
 /// App-handled context menu commands (CEF's MENU_ID_USER_FIRST and up): the app does these itself.
@@ -582,6 +593,9 @@ pub type FrameProbe = Arc<dyn Fn(&FrameEvent) + Send + Sync>;
 /// Height of the bar above the page (back, forward, reload, address), in DIPs.
 pub const CHROME_HEIGHT: f32 = 28.0;
 
+/// Height of the find bar under it, when open.
+pub const FIND_HEIGHT: f32 = 28.0;
+
 impl EventEmitter<BrowserEvent> for BrowserView {}
 
 impl BrowserView {
@@ -644,6 +658,7 @@ impl BrowserView {
             overlay: OverlayState::default(),
             zoom_level: 0.0,
             menu: None,
+            find: None,
         }
     }
 
@@ -758,6 +773,11 @@ impl BrowserView {
                 self.overlay.answer(&answer, &geo);
                 self.send_waiting_hover();
             }
+            H::FindResult { count, active, .. } => {
+                if let Some(f) = &mut self.find {
+                    (f.count, f.active) = (count, active);
+                }
+            }
             H::ContextMenu { req, x, y, link_url, src_url, items, .. } => {
                 if let Some(old) = self.menu.take() {
                     self.link.send(AppToHost::MenuResult { id: self.id.clone(), req: old.req, command: None });
@@ -860,6 +880,112 @@ impl BrowserView {
     /// Overlay rects to draw now, in page DIPs (empty while stale).
     pub fn overlay_rects(&self) -> &[Rect] {
         self.overlay.shown()
+    }
+
+    /// Where the page area starts under the bars, in DIPs from the block's top.
+    pub fn page_top(&self) -> f32 {
+        CHROME_HEIGHT + if self.find.is_some() { FIND_HEIGHT } else { 0.0 }
+    }
+
+    /// The find bar's state: (text, active, count), when open.
+    pub fn find_state(&self) -> Option<(String, u32, u32)> {
+        self.find.as_ref().map(|f| (f.text.clone(), f.active, f.count))
+    }
+
+    /// The find bar's input (tests type into it).
+    pub fn find_input(&self) -> Option<Entity<InputState>> {
+        self.find.as_ref().map(|f| f.input.clone())
+    }
+
+    /// cmd-F: open the find bar (or focus it), its text selected.
+    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in page"));
+            let typed = cx.subscribe_in(&input, window, |v, input, ev: &InputEvent, window, cx| match ev {
+                InputEvent::Change => {
+                    let text = input.read(cx).value().to_string();
+                    v.find_text(text, true, false);
+                    cx.notify();
+                }
+                InputEvent::PressEnter { shift, .. } => {
+                    let text = input.read(cx).value().to_string();
+                    v.find_text(text, !shift, true);
+                    cx.notify();
+                }
+                _ => {
+                    let _ = window;
+                }
+            });
+            self.find = Some(FindBar { input, text: String::new(), count: 0, active: 0, _typed: typed });
+        }
+        if let Some(f) = &self.find {
+            f.input.update(cx, |i, cx| {
+                i.focus(window, cx);
+                i.select_all(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Search `text` (forward or back); `next` continues the current search.
+    pub fn find_text(&mut self, text: String, forward: bool, next: bool) {
+        let Some(f) = &mut self.find else { return };
+        if text.is_empty() {
+            (f.count, f.active) = (0, 0);
+            f.text.clear();
+            self.link.send(AppToHost::StopFind { id: self.id.clone(), clear_selection: true });
+            return;
+        }
+        let next = next && f.text == text;
+        f.text = text.clone();
+        self.link.send(AppToHost::Find { id: self.id.clone(), text, forward, match_case: false, find_next: next });
+    }
+
+    /// Esc or ×: close the bar, clear the highlights, give the page the keyboard back.
+    pub fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.take().is_some() {
+            self.link.send(AppToHost::StopFind { id: self.id.clone(), clear_selection: false });
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    fn find_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let f = self.find.as_ref()?;
+        let label = match (f.text.is_empty(), f.count) {
+            (true, _) => String::new(),
+            (false, 0) => "No matches".into(),
+            // CEF's first answer has no active match yet (ordinal 0).
+            (false, n) if f.active == 0 => format!("{n} matches"),
+            (false, n) => format!("{} of {n}", f.active),
+        };
+        let button = |id: &'static str, label: &'static str| div().id(id).px_1().rounded_sm().cursor_pointer().hover(|d| d.bg(hsla(0., 0., 0.5, 0.15))).child(label);
+        Some(
+            div()
+                .id("find-bar")
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .h(px(FIND_HEIGHT))
+                .px_2()
+                .text_xs()
+                .bg(hsla(0., 0., 0.5, 0.12))
+                .child(div().w(px(220.)).child(Input::new(&f.input)))
+                .child(div().id("find-count").min_w(px(72.)).child(label))
+                .child(button("find-prev", "‹").on_click(cx.listener(|v, _, _, cx| {
+                    let t = v.find.as_ref().map(|f| f.text.clone()).unwrap_or_default();
+                    v.find_text(t, false, true);
+                    cx.notify();
+                })))
+                .child(button("find-next", "›").on_click(cx.listener(|v, _, _, cx| {
+                    let t = v.find.as_ref().map(|f| f.text.clone()).unwrap_or_default();
+                    v.find_text(t, true, true);
+                    cx.notify();
+                })))
+                .child(button("find-close", "×").on_click(cx.listener(|v, _, window, cx| v.close_find(window, cx))))
+                .into_any_element(),
+        )
     }
 
     /// The open context menu, if any.
@@ -1115,13 +1241,20 @@ impl Render for BrowserView {
             .flex()
             .flex_col()
             .key_context("Browser")
-            // Escape closes an open context menu before the page sees the key.
-            .capture_key_down(cx.listener(|v, ev: &KeyDownEvent, _, cx| {
-                if v.menu.is_some() && ev.keystroke.key == "escape" {
+            // Escape closes an open context menu, else an open find bar, before the page sees it.
+            .capture_key_down(cx.listener(|v, ev: &KeyDownEvent, window, cx| {
+                if ev.keystroke.key != "escape" {
+                    return;
+                }
+                if v.menu.is_some() {
                     cx.stop_propagation();
                     v.choose_menu(None, cx);
+                } else if v.find.is_some() {
+                    cx.stop_propagation();
+                    v.close_find(window, cx);
                 }
             }))
+            .on_action(cx.listener(|v, _: &OpenFind, window, cx| v.open_find(window, cx)))
             .on_action(cx.listener(|v, _: &FocusAddress, window, cx| {
                 v.address.update(cx, |a, cx| {
                     a.focus(window, cx);
@@ -1129,6 +1262,7 @@ impl Render for BrowserView {
                 });
             }))
             .child(self.chrome(cx))
+            .children(self.find_bar(cx))
             .child(page)
     }
 }
@@ -1141,7 +1275,11 @@ fn bind_keys(cx: &mut App) {
         return;
     }
     cx.set_global(Bound);
-    cx.bind_keys([KeyBinding::new(if cfg!(target_os = "macos") { "cmd-l" } else { "ctrl-l" }, FocusAddress, Some("Browser"))]);
+    let cmd = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+    cx.bind_keys([
+        KeyBinding::new(&format!("{cmd}-l"), FocusAddress, Some("Browser")),
+        KeyBinding::new(&format!("{cmd}-f"), OpenFind, Some("Browser")),
+    ]);
 }
 
 /// One `BrowserView` per browser block in the layouts. A view lives while its block does (shown
