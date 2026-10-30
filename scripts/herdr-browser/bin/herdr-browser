@@ -15,7 +15,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const HELP = `herdr-browser <cmd> [tab] [key=value ...]
   tabs                         list tabs (browser blocks; controllable ones accept commands)
   open [tab] url=URL           open your own browser block (herdr-app do browser.open)
-  allow TAB on=true|false      the person's agent switch for a block they opened
   navigate TAB url=URL         back TAB | forward TAB | reload TAB
   snapshot TAB                 page outline with [ref=eN] handles
   text TAB                     visible page text
@@ -30,17 +29,18 @@ const HELP = `herdr-browser <cmd> [tab] [key=value ...]
   close TAB                    only tabs you opened
   mcp                          run as an MCP stdio server`;
 
+const auth = () => { try { return { authorization: `Bearer ${readFileSync(join(dir, "agent.token"), "utf8").trim()}` }; } catch { return {}; } };
 async function port() {
   const read = () => { try { return readFileSync(join(dir, "agent.port"), "utf8").trim(); } catch { return null; } };
   let p = read();
-  if (p) { try { await fetch(`http://127.0.0.1:${p}/_agent`, { method: "POST", body: '{"cmd":"tabs"}' }); return p; } catch { rmSync(join(dir, "agent.port"), { force: true }); } }
+  if (p) { try { await fetch(`http://127.0.0.1:${p}/_agent`, { method: "POST", headers: auth(), body: '{"cmd":"tabs"}' }); return p; } catch { rmSync(join(dir, "agent.port"), { force: true }); } }
   spawn("node", [server], { detached: true, stdio: "ignore", env: process.env }).unref();
   for (let i = 0; i < 100 && !(p = read()); i++) await sleep(100);
   if (!p) throw new Error(`herdr-browser daemon did not start (is there a browser host? ${join(dir, "cdp.json")})`);
   return p;
 }
 export async function run(args) {
-  const r = await fetch(`http://127.0.0.1:${await port()}/_agent`, { method: "POST", body: JSON.stringify(args) });
+  const r = await fetch(`http://127.0.0.1:${await port()}/_agent`, { method: "POST", headers: auth(), body: JSON.stringify(args) });
   return r.json();
 }
 

@@ -131,6 +131,20 @@ pub enum EditCommand {
     Redo,
 }
 
+/// One entry of a context menu the host built from CEF's model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MenuItem {
+    /// The host's command id to send back; 0 for a separator.
+    pub command: i32,
+    pub label: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub checked: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submenu: Vec<MenuItem>,
+}
+
 /// A rectangle in CSS pixels (an element box, a selection, a hit-test result).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CssRect {
@@ -191,6 +205,9 @@ pub enum AppToHost {
     /// (`true`). Hidden: the host stops painting and drops pending frames; shown: it sends a fresh
     /// full frame. `Screenshot` still works while hidden.
     SetVisible { id: BrowserId, visible: bool },
+    /// The chosen command for menu `req`, or None if dismissed. The host runs it via CEF's
+    /// RunContextMenuCallback (Back, Forward, Reload, Copy, Cut, Paste, Select All, Inspect ...).
+    MenuResult { id: BrowserId, req: u64, command: Option<i32> },
     Find { id: BrowserId, text: String, forward: bool, match_case: bool, find_next: bool },
     StopFind { id: BrowserId, clear_selection: bool },
     DevTools { id: BrowserId, open: bool },
@@ -230,6 +247,12 @@ pub enum HostToApp {
     CdpTarget { id: BrowserId, target_id: String },
     /// Rects in the answering frame's CSS px; `frames`: enclosing iframe content-box offsets, outermost first. `epoch` echoed.
     OverlayRects { id: BrowserId, req: u64, epoch: u64, rects: Vec<CssRect>, frames: Vec<CssPoint> },
+    /// The page asked for a context menu at (x, y) page DIPs; `kind` flags what is under the pointer:
+    /// "link", "image", "selection", "editable", "media", "page" (several may apply).
+    /// `link_url`, `src_url`: for Open/Copy link and Save image. The app shows `items` and answers with `MenuResult`.
+    /// Commands >= 26500 (CEF's MENU_ID_USER_FIRST) are app-handled extras; the app does them itself,
+    /// then answers `MenuResult` with None to close the CEF callback.
+    ContextMenu { id: BrowserId, req: u64, x: f32, y: f32, kind: Vec<String>, link_url: Option<String>, src_url: Option<String>, selection: Option<String>, items: Vec<MenuItem> },
     /// Scroll or zoom changed (at most one per frame); the app bumps its overlay epoch.
     Viewport { id: BrowserId, scroll_x: f32, scroll_y: f32, zoom_level: f64 },
     EvalResult { id: BrowserId, req: u64, ok: bool, value: serde_json::Value },
@@ -286,6 +309,8 @@ mod tests {
         roundtrip_app(AppToHost::Overlay { id: "b1".into(), req: 4, epoch: 9, query: OverlayQuery::Selector { selector: "#a > b".into() } });
         roundtrip_app(AppToHost::Overlay { id: "b1".into(), req: 5, epoch: 9, query: OverlayQuery::Selection });
         roundtrip_app(AppToHost::SetVisible { id: "b1".into(), visible: false });
+        roundtrip_app(AppToHost::MenuResult { id: "b1".into(), req: 7, command: Some(26500) });
+        roundtrip_app(AppToHost::MenuResult { id: "b1".into(), req: 8, command: None });
         roundtrip_app(AppToHost::Shutdown);
     }
 
@@ -298,6 +323,7 @@ mod tests {
         roundtrip_host(HostToApp::ImeCaret { id: "b1".into(), x: 1.0, y: 2.0, w: 1.0, h: 16.0 });
         roundtrip_host(HostToApp::EvalResult { id: "b1".into(), req: 1, ok: true, value: serde_json::json!({"n": 2}) });
         roundtrip_host(HostToApp::CdpTarget { id: "b1".into(), target_id: "T1".into() });
+        roundtrip_host(HostToApp::ContextMenu { id: "b1".into(), req: 7, x: 4.0, y: 5.0, kind: vec!["link".into()], link_url: Some("https://a.test/".into()), src_url: None, selection: None, items: vec![MenuItem { command: 100, label: "Back".into(), enabled: true, checked: false, submenu: vec![] }, MenuItem { command: 0, label: String::new(), enabled: false, checked: false, submenu: vec![] }] });
         roundtrip_host(HostToApp::OverlayRects { id: "b1".into(), req: 3, epoch: 9, rects: vec![CssRect { x: 1.0, y: 2.0, w: 30.0, h: 40.0 }], frames: vec![CssPoint { x: 5.0, y: 6.0 }] });
         roundtrip_host(HostToApp::Viewport { id: "b1".into(), scroll_x: 0.0, scroll_y: 120.5, zoom_level: 1.0 });
         roundtrip_host(HostToApp::Crashed { id: None, reason: "gpu".into() });
