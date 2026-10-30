@@ -2149,6 +2149,14 @@ impl Browsers {
             let agent = Arc::new(Mutex::new(Agent::new(link.config().dir.clone())));
             let a = agent.clone();
             link.set_tap(Arc::new(move |msg| a.lock().unwrap().on_host(msg)));
+            // HERDR: part 5. CDP on the app's pipe: agents reach it only through the broker (agent.sock + token).
+            if cdp_pipe_wanted() {
+                let (l, ag) = (link.clone(), agent.clone());
+                let started = super::broker::Broker::start(link.config().dir.clone(), Arc::new(move || l.cdp()), Arc::new(move |b| ag.lock().unwrap().cdp.target_of(b)));
+                if let Err(e) = started {
+                    tracing::warn!("the browser broker did not start: {e}");
+                }
+            }
             (self.link, self.agent) = (Some(link), Some(agent));
         }
         self.link.clone().expect("made above")

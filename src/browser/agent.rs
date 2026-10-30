@@ -206,11 +206,11 @@ impl Agent {
     /// Every host message passes here: answers parked commands and keeps cdp.json current.
     pub fn on_host(&mut self, msg: &HostToApp) {
         match msg {
-            HostToApp::Ready { cdp_port, .. } => {
+            HostToApp::Ready { cdp_port, cdp_pipe, .. } => {
                 if std::mem::replace(&mut self.ready, true) {
                     self.new_generation("the browser host restarted");
                 }
-                self.cdp.set_port(*cdp_port)
+                self.cdp.set_ready(*cdp_port, *cdp_pipe)
             }
             HostToApp::CdpTarget { id, target_id } => self.cdp.set_target(id, target_id),
             HostToApp::EvalResult { id, req, ok: true, value } => self.answer(*req, id, Op::Eval, Ok(json!({ "value": value }))),
@@ -371,6 +371,8 @@ fn now_ms() -> u128 {
 pub struct CdpFile {
     dir: PathBuf,
     port: Option<u16>,
+    /// The host serves CDP on the app's pipe: agents go through the broker (agent.sock), never a port.
+    pipe: bool,
     targets: BTreeMap<BrowserId, String>,
 }
 
@@ -384,11 +386,20 @@ impl CdpFile {
     }
 
     pub fn set_port(&mut self, port: Option<u16>) {
-        self.port = port;
-        if port.is_none() {
+        self.set_ready(port, false);
+    }
+
+    pub fn set_ready(&mut self, port: Option<u16>, pipe: bool) {
+        (self.port, self.pipe) = (port, pipe);
+        if port.is_none() && !pipe {
             self.targets.clear();
         }
         self.write();
+    }
+
+    /// The CDP target showing block `id` (the broker attaches to it).
+    pub fn target_of(&self, id: &str) -> Option<String> {
+        self.targets.get(id).cloned()
     }
 
     /// The host reported which CDP target shows block `id`.
@@ -405,11 +416,19 @@ impl CdpFile {
 
     fn write(&self) {
         let path = self.path();
-        let Some(port) = self.port else {
-            let _ = std::fs::remove_file(&path);
-            return;
-        };
-        let body = json!({ "port": port, "targets": self.targets }).to_string();
+        // On the pipe: where the broker is and which blocks it serves; no port, no target ids.
+        let body = match (self.pipe, self.port) {
+            (true, _) => {
+                let blocks: BTreeMap<&BrowserId, bool> = self.targets.keys().map(|b| (b, true)).collect();
+                json!({ "broker": super::broker::Broker::socket(&self.dir), "token_file": super::broker::Broker::token_file(&self.dir), "targets": blocks })
+            }
+            (false, Some(port)) => json!({ "port": port, "targets": self.targets }),
+            (false, None) => {
+                let _ = std::fs::remove_file(&path);
+                return;
+            }
+        }
+        .to_string();
         if let Err(e) = write_atomic(&path, body.as_bytes()) {
             tracing::warn!("cannot write {}: {e}", path.display());
         }
@@ -830,6 +849,18 @@ mod tests {
         std::fs::write(&path, r#"{"port":55580,"targets":{}}"#).unwrap();
         let _again = Agent::new(d.path().join("browser"));
         assert!(!path.exists(), "a port from an earlier run must not be published");
+    }
+
+    #[test]
+    fn on_the_pipe_cdp_json_names_the_broker_and_no_port() {
+        let (d, mut a) = agent();
+        let path = d.path().join("browser/cdp.json");
+        a.on_host(&HostToApp::Ready { version: 1, cef_version: "x".into(), cdp_port: None, cdp_pipe: true });
+        a.on_host(&HostToApp::CdpTarget { id: "b1".into(), target_id: "T1".into() });
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let dir = d.path().join("browser");
+        assert_eq!(v, json!({ "broker": dir.join("agent.sock"), "token_file": dir.join("broker.token"), "targets": { "b1": true } }));
+        assert_eq!(a.cdp.target_of("b1").as_deref(), Some("T1"), "the broker still knows the target");
     }
 
     #[test]
