@@ -1113,12 +1113,9 @@ impl BrowserView {
 
     /// Toggle a mode (Pick or Markup): enter it, or leave it when it is on top.
     pub fn toggle_mode(&mut self, owner: Owner, cx: &mut Context<Self>) {
+        // Opens the mode, swaps pick and markup, or closes it when on top; refused under a lease.
         self.input.update(cx, |i, _| {
-            if i.owner() == owner {
-                i.escape();
-            } else {
-                i.enter(owner);
-            }
+            i.toggle(owner);
         });
         self.drain_overlay(cx);
         cx.notify();
@@ -1637,6 +1634,8 @@ impl Render for BrowserView {
                 }
             }))
             .on_action(cx.listener(|v, _: &OpenFind, window, cx| v.open_find(window, cx)))
+            .on_action(cx.listener(|v, _: &input::TogglePick, _, cx| v.toggle_mode(Owner::Pick, cx)))
+            .on_action(cx.listener(|v, _: &input::ToggleMarkup, _, cx| v.toggle_mode(Owner::Markup, cx)))
             .on_action(cx.listener(|v, _: &ZoomIn, _, cx| v.zoom_step(true, cx)))
             .on_action(cx.listener(|v, _: &ZoomOut, _, cx| v.zoom_step(false, cx)))
             .on_action(cx.listener(|v, _: &ZoomReset, _, cx| v.set_zoom(0.0, cx)))
@@ -1670,6 +1669,13 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{cmd}--"), ZoomOut, Some("Browser")),
         KeyBinding::new(&format!("{cmd}-0"), ZoomReset, Some("Browser")),
     ]);
+    // Mode chords (part 4, docs/browser-input-owner.md): pick and markup.
+    for (k, m) in input::default_chords() {
+        match m {
+            Owner::Pick => cx.bind_keys([KeyBinding::new(k, input::TogglePick, Some("Browser"))]),
+            _ => cx.bind_keys([KeyBinding::new(k, input::ToggleMarkup, Some("Browser"))]),
+        }
+    }
 }
 
 /// One `BrowserView` per browser block in the layouts. A view lives while its block does (shown
