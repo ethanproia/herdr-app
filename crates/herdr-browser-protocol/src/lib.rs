@@ -156,8 +156,13 @@ pub enum AppToHost {
     Input { id: BrowserId, event: InputEvent },
     /// Run an editing command (copy, paste, ...) in the focused frame.
     Edit { id: BrowserId, command: EditCommand },
-    /// The app has taken frame `seq`; the host may recycle that surface and send the next.
+    /// Frame `seq` was presented in a visible window: send the next (one in flight). Paces
+    /// delivery only; a surface is reused only once its IOSurface use count is released.
     FrameAck { id: BrowserId, seq: u64 },
+    /// The block's window is occluded or minimized, or its tab is not shown (`false`), or shown
+    /// again (`true`). Hidden: the host stops painting and drops pending frames; shown: it sends a
+    /// fresh full frame. `Screenshot` still works while hidden.
+    SetVisible { id: BrowserId, visible: bool },
     Find { id: BrowserId, text: String, forward: bool, match_case: bool, find_next: bool },
     StopFind { id: BrowserId, clear_selection: bool },
     DevTools { id: BrowserId, open: bool },
@@ -234,6 +239,7 @@ mod tests {
         roundtrip_app(AppToHost::Create { id: "b1".into(), url: Some("https://example.com".into()), size: Size { w: 800.0, h: 600.0 }, scale: 2.0, profile: None });
         roundtrip_app(AppToHost::Resize { id: "b1".into(), size: Size { w: 400.0, h: 300.0 }, scale: 2.0 });
         roundtrip_app(AppToHost::FrameAck { id: "b1".into(), seq: 7 });
+        roundtrip_app(AppToHost::SetVisible { id: "b1".into(), visible: false });
         roundtrip_app(AppToHost::Input { id: "b1".into(), event: InputEvent::Mouse { kind: MouseKind::Down, x: 1.5, y: 2.5, button: MouseButton::Left, clicks: 2, mods } });
         roundtrip_app(AppToHost::Input { id: "b1".into(), event: InputEvent::Wheel { x: 0.0, y: 0.0, dx: 0.0, dy: -12.0, precise: true, mods } });
         roundtrip_app(AppToHost::Input { id: "b1".into(), event: InputEvent::Key { kind: KeyKind::Down, key: "a".into(), code: "KeyA".into(), native: 0, repeat: false, mods } });
