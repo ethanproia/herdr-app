@@ -11,6 +11,8 @@
 
 pub mod agent;
 pub mod dialogs;
+// HERDR: part 4, design slice S11.
+pub mod edits;
 pub mod frame;
 pub mod geometry;
 pub mod input;
