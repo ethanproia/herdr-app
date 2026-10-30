@@ -371,7 +371,8 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
         | H::FindResult { id, .. }
         | H::Console { id, .. }
         | H::EvalResult { id, .. }
-        | H::ScreenshotDone { id, .. } => Some(id),
+        | H::ScreenshotDone { id, .. }
+        | H::CdpTarget { id, .. } => Some(id),
     }
 }
 
