@@ -4,6 +4,11 @@ use super::{downloads_dir, keep_chooser, keep_dialog, next_req, on_frame, on_pop
 use cef::*;
 use herdr_browser_protocol::{DialogKind, DownloadState, HostToApp};
 
+thread_local! {
+    /// Download paths handed out this run (CEF creates the file later).
+    static RESERVED: std::cell::RefCell<std::collections::HashSet<std::path::PathBuf>> = Default::default();
+}
+
 /// DevTools message ids for evals start here (below are fixed ids such as `TARGET_INFO_MSG`).
 const FIRST_EVAL_MSG: i32 = 1000;
 
@@ -314,7 +319,12 @@ wrap_download_handler! {
             let dir = downloads_dir();
             let _ = std::fs::create_dir_all(&dir);
             let name = s(suggested_name);
-            let path = dir.join(if name.is_empty() { "download".to_string() } else { name.clone() });
+            // Two downloads of the same name can start before either file exists: reserve names.
+            let path = RESERVED.with_borrow_mut(|r| {
+                let p = crate::downloads::unique_path_except(&dir, &name, r);
+                r.insert(p.clone());
+                p
+            });
             cb.cont(Some(&CefString::from(path.to_string_lossy().as_ref())), 0);
             send(HostToApp::Download {
                 id: self.id.clone(),

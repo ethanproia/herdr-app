@@ -310,7 +310,7 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
     };
     let cdp = pick_port(cdp)?;
     std::fs::create_dir_all(&profile_dir)?;
-    let downloads = profile_dir.parent().unwrap_or(&profile_dir).join("downloads");
+    let downloads = crate::downloads::dir();
 
     let mut app = handlers::app();
     let settings = Settings {
