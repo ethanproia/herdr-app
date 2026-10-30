@@ -58,6 +58,11 @@ body{margin:0;height:3000px} #box{position:absolute;left:20px;top:30px;width:100
 const LINKS_PAGE: &str = r#"<!doctype html><html><head><title>links</title></head><body style="margin:0">
 <a href="/b" style="display:block;height:60px;font-size:30px">to b</a></body></html>"#;
 
+/// #a has an inline style attribute and a stylesheet margin; #b has no style attribute.
+const STYLES_PAGE: &str = r#"<!doctype html><html><head><title>styles</title><style>
+.c{margin:2px} #b{color:rgb(0, 128, 0)}</style></head><body style="margin:0">
+<div id=a class=c style="color: red; display:inline-block">secret page text</div><div id=b>more text</div></body></html>"#;
+
 fn pages() -> Pages {
     Pages::start(vec![
         ("a", solid("A", "#3366cc")),
@@ -69,6 +74,7 @@ fn pages() -> Pages {
         ("menu", MENU_PAGE.to_string()),
         ("geo", GEO_PAGE.to_string()),
         ("links", LINKS_PAGE.to_string()),
+        ("styles", STYLES_PAGE.to_string()),
     ])
 }
 
@@ -530,5 +536,75 @@ fn cmd_and_middle_click_ask_for_a_new_tab() {
     std::thread::sleep(SEC / 2);
     assert_eq!(h.eval("b1", 2, "location.pathname"), (true, serde_json::json!("/links")));
     println!("cmd-click -> NewWindow {cmd:?}; middle-click -> NewWindow {mid:?}; tab stayed on /links");
+    h.shutdown();
+}
+
+fn styles(h: &mut Host, msg: AppToHost) -> (bool, Vec<StyleRow>) {
+    let req = match &msg {
+        AppToHost::Styles { req, .. } | AppToHost::SetStyle { req, .. } | AppToHost::RevertStyle { req, .. } => *req,
+        _ => unreachable!(),
+    };
+    h.send(msg);
+    match h.until(10 * SEC, |m| matches!(m, HostToApp::StylesResult { req: r, .. } if *r == req)) {
+        HostToApp::StylesResult { ok, rows, .. } => (ok, rows),
+        _ => unreachable!(),
+    }
+}
+
+fn width(h: &mut Host, req: u64, node: &str) -> f32 {
+    h.send(AppToHost::Overlay { id: "b1".into(), req, epoch: 1, query: OverlayQuery::Selector { selector: node.into() } });
+    match h.until(10 * SEC, |m| matches!(m, HostToApp::OverlayRects { req: r, .. } if *r == req)) {
+        HostToApp::OverlayRects { rects, .. } => rects[0].w,
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn style_panel_reads_sets_and_reverts() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-styles");
+    create(&mut h, "b1", &p.url("styles"), 400.0, 200.0, 1.0);
+    loaded(&mut h);
+    let a = || "#a".to_string();
+    let before_attr = h.eval("b1", 1, "a.getAttribute('style')").1;
+    let (ok, rows) = styles(&mut h, AppToHost::Styles { id: "b1".into(), req: 10, node: a(), props: vec!["padding-left".into(), "color".into(), "margin-top".into()] });
+    assert!(ok);
+    assert_eq!(rows[0].computed, "0px");
+    assert_eq!((rows[1].computed.as_str(), rows[1].inline.as_deref()), ("rgb(255, 0, 0)", Some("red")));
+    assert_eq!((rows[2].computed.as_str(), rows[2].matched.as_deref()), ("2px", Some("2px")));
+    println!("read: {rows:?}");
+    let w0 = width(&mut h, 20, "#a");
+
+    let t0 = std::time::Instant::now();
+    let (ok, rows) = styles(&mut h, AppToHost::SetStyle { id: "b1".into(), req: 11, node: a(), prop: "padding".into(), value: Some("16px".into()) });
+    println!("METRIC set_style_ms={}", t0.elapsed().as_millis());
+    assert!(ok);
+    assert_eq!((rows[0].computed.as_str(), rows[0].inline.as_deref()), ("16px", Some("16px")));
+    std::thread::sleep(SEC / 4);
+    let w1 = width(&mut h, 21, "#a");
+    assert_eq!(w1 - w0, 32.0, "width {w0} -> {w1}");
+    println!("set padding 16px: computed 16px, width {w0} -> {w1} (+32)");
+    // A second change keeps the first original.
+    assert!(styles(&mut h, AppToHost::SetStyle { id: "b1".into(), req: 12, node: a(), prop: "color".into(), value: None }).0);
+
+    let (ok, rows) = styles(&mut h, AppToHost::RevertStyle { id: "b1".into(), req: 13, node: a() });
+    assert!(ok && rows.is_empty());
+    let after_attr = h.eval("b1", 2, "a.getAttribute('style')").1;
+    assert_eq!(after_attr, before_attr, "revert is string-equal");
+    println!("revert: style attribute {after_attr} == {before_attr}");
+
+    // An element with no style attribute gets none back.
+    assert!(styles(&mut h, AppToHost::SetStyle { id: "b1".into(), req: 14, node: "#b".into(), prop: "padding".into(), value: Some("3px".into()) }).0);
+    assert!(styles(&mut h, AppToHost::RevertStyle { id: "b1".into(), req: 15, node: "#b".into() }).0);
+    assert_eq!(h.eval("b1", 3, "b.getAttribute('style')").1, serde_json::json!(null));
+    // Refused: text-bearing properties, bad names, missing nodes. No row ever carries page text.
+    assert!(!styles(&mut h, AppToHost::Styles { id: "b1".into(), req: 16, node: a(), props: vec!["content".into()] }).0);
+    assert!(!styles(&mut h, AppToHost::Styles { id: "b1".into(), req: 17, node: a(), props: vec!["x;y".into()] }).0);
+    assert!(!styles(&mut h, AppToHost::Styles { id: "b1".into(), req: 18, node: "#nope".into(), props: vec!["color".into()] }).0);
+    assert!(!styles(&mut h, AppToHost::Styles { id: "b1".into(), req: 19, node: "[[bad".into(), props: vec!["color".into()] }).0);
+    println!("refused: content, bad name, missing node, bad selector; #b had no style attribute and has none again");
     h.shutdown();
 }

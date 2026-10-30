@@ -26,8 +26,11 @@ pub fn eval_message(id: &str, req: u64, expr: &str) -> Vec<u8> {
 }
 
 /// What a Runtime.evaluate answer turns into.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Op {
+    /// The style panel (S10): `node` is set for SetStyle (to remember the original attribute)
+    /// and RevertStyle (to forget it once restored).
+    Styles { set: Option<String>, revert: Option<String> },
     Eval,
     Overlay { epoch: u64 },
     /// The page-is-live probe for load `generation` (see `super::on_loading`).
@@ -59,6 +62,74 @@ pub fn overlay_message(id: &str, req: u64, epoch: u64, query: &herdr_browser_pro
         Q::Selection => format!("(()=>{{const s=getSelection();if(!s||!s.rangeCount)return{{rects:[]}};return{{rects:[...s.getRangeAt(0).getClientRects()].map({BOX})}}}})()"),
     };
     evaluate(id, req, Op::Overlay { epoch }, &expr)
+}
+
+thread_local! {
+    /// The style attribute each (browser, node) had before the panel's first SetStyle: None if it
+    /// had none. Kept in the host, out of the page's reach, until RevertStyle restores it.
+    static ORIGINAL_STYLE: std::cell::RefCell<std::collections::HashMap<(String, String), Option<String>>> = Default::default();
+}
+
+/// JS shared by the style requests: find `node`, check property names, build rows. Rows carry
+/// CSS values only (computed, inline, best-effort winning stylesheet value); properties that can
+/// hold page text (`content`, `quotes`) are refused (rule 1).
+fn style_js(node: &str, body: &str) -> String {
+    let node = serde_json::to_string(node).expect("string encodes");
+    format!(
+        "(()=>{{let el;try{{el=document.querySelector({node})}}catch(e){{return{{ok:false}}}}if(!el)return{{ok:false}};\
+         const okp=p=>typeof p==='string'&&/^-{{0,2}}[a-z][a-z0-9-]*$/.test(p)&&p!=='content'&&p!=='quotes';\
+         const row=p=>{{let m=null;for(const sh of document.styleSheets){{let rs;try{{rs=sh.cssRules}}catch(e){{continue}}\
+         for(const r of rs){{if(!r.style||!r.selectorText)continue;let hit=false;try{{hit=el.matches(r.selectorText)}}catch(e){{}}\
+         if(hit){{const v=r.style.getPropertyValue(p);if(v)m=v.trim()}}}}}}\
+         const i=el.style.getPropertyValue(p);return{{prop:p,computed:getComputedStyle(el).getPropertyValue(p).trim(),inline:i?i.trim():null,matched:m}}}};\
+         {body}}})()"
+    )
+}
+
+/// `Styles`: one row per property.
+pub fn styles_message(id: &str, req: u64, node: &str, props: &[String]) -> Vec<u8> {
+    let props = serde_json::to_string(props).expect("strings encode");
+    let body = format!("const ps={props};if(!ps.every(okp))return{{ok:false}};return{{ok:true,rows:ps.map(row)}}");
+    evaluate(id, req, Op::Styles { set: None, revert: None }, &style_js(node, &body))
+}
+
+/// `SetStyle`: set (or remove) one inline property; report the attribute it had before.
+pub fn set_style_message(id: &str, req: u64, node: &str, prop: &str, value: Option<&str>) -> Vec<u8> {
+    let (p, v) = (serde_json::to_string(prop).expect("encodes"), serde_json::to_string(&value).expect("encodes"));
+    let body = format!(
+        "const p={p},v={v};if(!okp(p))return{{ok:false}};const orig=el.getAttribute('style');\
+         if(v===null)el.style.removeProperty(p);else el.style.setProperty(p,v);return{{ok:true,orig,rows:[row(p)]}}"
+    );
+    evaluate(id, req, Op::Styles { set: Some(node.into()), revert: None }, &style_js(node, &body))
+}
+
+/// `RevertStyle`: put back the attribute remembered at the first SetStyle (nothing to do if the
+/// panel never changed this node).
+pub fn revert_style_message(id: &str, req: u64, node: &str) -> Vec<u8> {
+    let original = ORIGINAL_STYLE.with_borrow(|m| m.get(&(id.to_string(), node.to_string())).cloned());
+    super::debug(format_args!("{id}: revert {node}: original {original:?}"));
+    let body = match original {
+        None => "return{ok:true,rows:[]}".to_string(),
+        Some(o) => {
+            let o = serde_json::to_string(&o).expect("encodes");
+            // Reading the attribute first flushes Chromium's lazy inline-style sync; without it a
+            // removed attribute comes back as style="" after an el.style change.
+            format!("const o={o};el.getAttribute('style');if(o===null)el.removeAttribute('style');else el.setAttribute('style',o);return{{ok:true,rows:[],after:el.getAttribute('style')}}")
+        }
+    };
+    evaluate(id, req, Op::Styles { set: None, revert: Some(node.into()) }, &style_js(node, &body))
+}
+
+fn style_rows(value: &serde_json::Value) -> Vec<herdr_browser_protocol::StyleRow> {
+    let text = |v: &serde_json::Value| v.as_str().map(str::to_string);
+    value["rows"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|r| herdr_browser_protocol::StyleRow { prop: text(&r["prop"]).unwrap_or_default(), computed: text(&r["computed"]).unwrap_or_default(), inline: text(&r["inline"]), matched: text(&r["matched"]) })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `{rects: [{x, y, w, h}]}` from an overlay evaluate.
@@ -625,6 +696,27 @@ wrap_dev_tools_message_observer! {
                     let (ok, value) = eval_outcome(success != 0, result.unwrap_or_default());
                     match op {
                         Op::Eval => send(HostToApp::EvalResult { id, req, ok, value }),
+                        Op::Styles { set, revert } => {
+                            let ok = ok && value["ok"].as_bool() == Some(true);
+                            if ok {
+                                let key = |node: String| (id.clone(), node);
+                                if let Some(node) = set {
+                                    let orig = value["orig"].as_str().map(str::to_string);
+                                    super::debug(format_args!("{id}: set {node}: page reported original {:?}", value["orig"]));
+                                    ORIGINAL_STYLE.with_borrow_mut(|m| {
+                                        m.entry(key(node)).or_insert(orig);
+                                    });
+                                }
+                                if let Some(node) = revert.as_ref() {
+                                    super::debug(format_args!("{id}: reverted {node}: attribute now {:?}", value["after"]));
+                                }
+                                if let Some(node) = revert {
+                                    ORIGINAL_STYLE.with_borrow_mut(|m| m.remove(&key(node)));
+                                }
+                            }
+                            let rows = if ok { style_rows(&value) } else { vec![] };
+                            send(HostToApp::StylesResult { id, req, ok, rows });
+                        }
                         Op::Ready { generation } => {
                             super::debug(format_args!("{id}: first paint seen: {value}"));
                             super::input_live(&id, generation)

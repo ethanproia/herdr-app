@@ -948,8 +948,26 @@ fn browser_msg(m: AppToHost) {
             }
         }
         // Style panel (S10): the host side is fork-host's slice; until it lands every request answers "no such element".
-        M::Styles { req, .. } | M::SetStyle { req, .. } | M::RevertStyle { req, .. } => {
-            send(HostToApp::StylesResult { id, req, ok: false, rows: vec![] });
+        M::Styles { req, ref node, ref props, .. } => {
+            let call = handlers::styles_message(&id, req, node, props);
+            if host.send_dev_tools_message(Some(&call)) == 0 {
+                handlers::eval_unsent(&id);
+                send(HostToApp::StylesResult { id, req, ok: false, rows: vec![] });
+            }
+        }
+        M::SetStyle { req, ref node, ref prop, ref value, .. } => {
+            let call = handlers::set_style_message(&id, req, node, prop, value.as_deref());
+            if host.send_dev_tools_message(Some(&call)) == 0 {
+                handlers::eval_unsent(&id);
+                send(HostToApp::StylesResult { id, req, ok: false, rows: vec![] });
+            }
+        }
+        M::RevertStyle { req, ref node, .. } => {
+            let call = handlers::revert_style_message(&id, req, node);
+            if host.send_dev_tools_message(Some(&call)) == 0 {
+                handlers::eval_unsent(&id);
+                send(HostToApp::StylesResult { id, req, ok: false, rows: vec![] });
+            }
         }
         M::Overlay { req, epoch, query, .. } => {
             let call = handlers::overlay_message(&id, req, epoch, &query);
