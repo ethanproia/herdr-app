@@ -31,6 +31,8 @@ herdr-browser-host.app/Contents/
 `cef::build_util::mac::bundle()` (feature `build-util`) builds exactly this; the host crate wraps it as `scripts/fork-host-bundle.sh` (stage C). The helper can be the same binary started in helper mode (`cef::execute_process` returns early) or a tiny second binary; the bundle copies whichever is named.
 
 ## Signing and entitlements for local runs
+> **Development only (SEC4).** The host runs Chromium with `no_sandbox: 1` (settings) and without the `sandbox` cargo feature: renderer processes are not sandboxed, so a renderer exploit runs with the user's full rights. That is acceptable only for local development on pages you choose. Before the host ships to anyone (or browses arbitrary sites as a daily browser), it must run sandboxed: `sandbox` feature on, `no_sandbox: 0`, every helper signed with the same identity as the main bundle, hardened runtime, and `cef::sandbox::Sandbox` initialized in each helper. The contract records this as a release gate (D10).
+
 - arm64 binaries are ad-hoc signed by the linker; that is enough to run unsandboxed locally. No developer certificate is needed for `cargo build` + bundle + run.
 - Build with `default-features = false` (no `sandbox` feature) and pass `--no-sandbox`; the Chromium sandbox on macOS needs a properly signed bundle with matching helper signatures.
 - Pass `--use-mock-keychain` so Chromium never asks the login keychain (no prompt on Ethan's screen). Cookies/logins still persist in the profile, encrypted with a mock key (fine for a personal fork; a signed release would drop the flag).
