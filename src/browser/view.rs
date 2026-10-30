@@ -411,7 +411,9 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
         | H::Console { id, .. }
         | H::EvalResult { id, .. }
         | H::ScreenshotDone { id, .. }
-        | H::CdpTarget { id, .. } => Some(id),
+        | H::CdpTarget { id, .. }
+        | H::OverlayRects { id, .. }
+        | H::Viewport { id, .. } => Some(id),
     }
 }
 
