@@ -14,6 +14,11 @@ use std::process::{Child, Command};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+thread_local! {
+    /// The newest non-frame lines, for timeout reports.
+    static RECENT: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub fn real_host() -> Option<PathBuf> {
     std::env::var_os("HERDR_BROWSER_HOST").filter(|v| !v.is_empty()).map(PathBuf::from)
 }
@@ -81,6 +86,14 @@ impl Host {
     /// The next message, or None after `wait`.
     pub fn next(&mut self, wait: Duration) -> Option<HostToApp> {
         let line = self.rx.recv_timeout(wait).ok()?;
+        if !line.contains("\"type\":\"frame\"") {
+            RECENT.with_borrow_mut(|r| {
+                if r.len() == 8 {
+                    r.remove(0);
+                }
+                r.push(line.chars().take(160).collect());
+            });
+        }
         if std::env::var_os("HERDR_TEST_TRACE").is_some() {
             eprintln!("<- {line}");
         }
@@ -93,7 +106,10 @@ impl Host {
         let end = Instant::now() + wait;
         loop {
             let left = end.saturating_duration_since(Instant::now());
-            let Some(m) = self.next(left) else { panic!("timed out after {wait:?}") };
+            let Some(m) = self.next(left) else {
+                let recent = RECENT.with_borrow(|r| r.join("\n  "));
+                panic!("timed out after {wait:?}; last non-frame messages:\n  {recent}")
+            };
             if f(&m) {
                 return m;
             }

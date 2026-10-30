@@ -266,8 +266,14 @@ fn report_viewport(id: &str) {
 
 /// The page finished (or started) loading. Input becomes deliverable on the next frame.
 pub(crate) fn on_loading(id: &str, loading: bool) {
-    if !loading {
-        with_host(|h| h.browsers.get_mut(id).map(|e| e.loaded = true));
+    if loading {
+        return;
+    }
+    let first = with_host(|h| h.browsers.get_mut(id).map(|e| !std::mem::replace(&mut e.loaded, true))).flatten().unwrap_or(false);
+    // A static page may have painted before its load finished and never paint again, which
+    // would hold queued input forever: ask for one fresh paint, which releases it.
+    if first && let Some(host) = browser(id).and_then(|b| b.host()) {
+        host.invalidate(PaintElementType::default());
     }
 }
 
