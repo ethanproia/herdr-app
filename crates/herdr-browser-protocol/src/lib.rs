@@ -118,6 +118,19 @@ pub enum DownloadState {
     Failed,
 }
 
+/// An editing command the host runs on the focused frame (CEF off-screen on macOS does not act on
+/// the cmd-c/x/v/a/z chords sent as keys, so the app sends these instead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditCommand {
+    Copy,
+    Cut,
+    Paste,
+    SelectAll,
+    Undo,
+    Redo,
+}
+
 /// App to host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -136,6 +149,8 @@ pub enum AppToHost {
     /// Zoom level as Chrome counts it: 0.0 is 100%, each step is about 20%.
     SetZoom { id: BrowserId, level: f64 },
     Input { id: BrowserId, event: InputEvent },
+    /// Run an editing command (copy, paste, ...) in the focused frame.
+    Edit { id: BrowserId, command: EditCommand },
     /// The app has taken frame `seq`; the host may recycle that surface and send the next.
     FrameAck { id: BrowserId, seq: u64 },
     Find { id: BrowserId, text: String, forward: bool, match_case: bool, find_next: bool },
@@ -173,6 +188,8 @@ pub enum HostToApp {
     ImeCaret { id: BrowserId, x: f32, y: f32, w: f32, h: f32 },
     FindResult { id: BrowserId, count: u32, active: u32, final_update: bool },
     Console { id: BrowserId, level: String, message: String, source: String, line: u32 },
+    /// The CDP target id for this browser, so agents can attach to the right page via the CDP port.
+    CdpTarget { id: BrowserId, target_id: String },
     EvalResult { id: BrowserId, req: u64, ok: bool, value: serde_json::Value },
     ScreenshotDone { id: BrowserId, req: u64, ok: bool, error: Option<String> },
     Crashed { id: Option<BrowserId>, reason: String },
@@ -220,6 +237,7 @@ mod tests {
         roundtrip_app(AppToHost::Input { id: "b1".into(), event: InputEvent::Ime(ImeEvent::Commit { text: "日本".into() }) });
         roundtrip_app(AppToHost::Input { id: "b1".into(), event: InputEvent::Ime(ImeEvent::Cancel) });
         roundtrip_app(AppToHost::Eval { id: "b1".into(), req: 1, expr: "1+1".into() });
+        roundtrip_app(AppToHost::Edit { id: "b1".into(), command: EditCommand::SelectAll });
         roundtrip_app(AppToHost::Shutdown);
     }
 
@@ -231,6 +249,7 @@ mod tests {
         roundtrip_host(HostToApp::Loading { id: "b1".into(), loading: true, can_back: false, can_forward: false });
         roundtrip_host(HostToApp::ImeCaret { id: "b1".into(), x: 1.0, y: 2.0, w: 1.0, h: 16.0 });
         roundtrip_host(HostToApp::EvalResult { id: "b1".into(), req: 1, ok: true, value: serde_json::json!({"n": 2}) });
+        roundtrip_host(HostToApp::CdpTarget { id: "b1".into(), target_id: "T1".into() });
         roundtrip_host(HostToApp::Crashed { id: None, reason: "gpu".into() });
     }
 
@@ -238,6 +257,8 @@ mod tests {
     fn wire_shape_is_stable() {
         let line = encode(&AppToHost::Navigate { id: "b1".into(), url: "https://x.test".into() });
         assert_eq!(line, r#"{"type":"navigate","id":"b1","url":"https://x.test"}"#);
+        let line = encode(&AppToHost::Edit { id: "b1".into(), command: EditCommand::SelectAll });
+        assert_eq!(line, r#"{"type":"edit","id":"b1","command":"select_all"}"#);
         let line = encode(&HostToApp::Cursor { id: "b1".into(), name: "pointer".into() });
         assert_eq!(line, r#"{"type":"cursor","id":"b1","name":"pointer"}"#);
     }

@@ -5,12 +5,12 @@ Status: v1, written before any part starts. The plan (CEF off-screen rendering, 
 ## Shape
 
 ```
-herdr-app (GPUI, main process)                         herdr-browser-host (CEF OSR, own process)
+the app (GPUI, main process)                           herdr-browser-host (CEF OSR, own process)
   layout block {"browser": {...}}                         one CEF browser per block id, windowless
   BrowserView entity (per block id)  <-- host.sock -->    protocol server, JSON lines
   paints IOSurface via gpui surface()  <-- IOSurface --   OnAcceleratedPaint -> shared IOSurface
   input + IME -> InputEvent  --------------------------->  SendMouse/Key/Ime events
-  herdr-app do browser.*  ----> BrowserView ----------->  Eval/Screenshot/Navigate...
+  agent commands browser.*  ----> BrowserView ----------->  Eval/Screenshot/Navigate...
   CDP port (agents) <-------------------------------------  CEF remote debugging port
 ```
 
@@ -21,7 +21,7 @@ herdr-app (GPUI, main process)                         herdr-browser-host (CEF O
 - **D4 Layout block:** `{ "browser": { "url": "https://...", "profile": "default" } }` as a new `Content::Browser` variant beside terminal/mod/context/agent, one CEF browser per block id; the url persists in the layout document. A browser can be a pane in a tab, a floating block or a layout block.
 - **D5 Input:** all coordinates are DIPs from the block's top-left; the app sends mouse, wheel, key (DOM `key`/`code`/native code), text and IME events (`InputEvent`); the host answers `ImeCaret` so GPUI can position the candidate window and `Cursor` for the pointer shape.
 - **D6 Profile and logins:** one CEF root cache at `$HERDR_APP_HOME/browser/profile`, shared by all blocks; the fork never reads another app's profile.
-- **D7 Agents:** (a) `herdr-app do browser.open|navigate|back|forward|reload|stop|screenshot|eval|find|devtools`, (b) a CDP port (CEF remote debugging, default 0 = pick) advertised in `$HERDR_APP_HOME/browser/cdp.json` as `{ "port": N, "targets": { "<block id>": "<cdp target id>" } }`. The old mod's `herdr-browser` CLI, MCP and `browser_*` tool names retarget to that port; its `selftest.agent.mjs` is the behavior spec.
+- **D7 Agents:** (a) the app commands `browser.open`, `navigate`, `back`, `forward`, `reload`, `stop`, `screenshot`, `eval`, `find`, `devtools` (run through the app's `do` command), (b) a CDP port (CEF remote debugging, default 0 = pick) advertised in `$HERDR_APP_HOME/browser/cdp.json` as `{ "port": N, "targets": { "<block id>": "<cdp target id>" } }`. The old mod's `herdr-browser` CLI, MCP and `browser_*` tool names retarget to that port; its `selftest.agent.mjs` is the behavior spec.
 - **D8 Out of sight.** Nothing runs a visible window for tests: parts test against the **stub host** (`herdr-browser-host --stub`, serves deterministic IOSurfaces and echoes events, no CEF) and against the offscreen render-to-image harness (see `docs/fork-dev.md`). Real CEF runs only headless under a separate `HERDR_APP_HOME`. Nothing ever touches the user's running Herdr.
 - **D9 Spec:** the 13-item browser parity checklist (kept with the project notes) and the old `browser_*` agent tool tests are the acceptance spec; every part says which items it moves.
 
@@ -47,3 +47,7 @@ Cross-part rules: the protocol crate is the only shared type surface; no part im
 
 ## Definition of done per part
 A small PR into `ethan/browser-block`, its tests passing under `cargo test --locked` (offscreen, no window), a rendered PNG or a transcript as evidence, the checklist items it moves, and an honest list of what is unverified in a real window.
+
+## Known red check: third-party notices
+`tests/notices.rs` hashes every Cargo manifest and Cargo.lock, so any PR that adds a crate or dependency makes it fail until `just notices` is rerun (needs `cargo install cargo-about --version 0.9.3 --locked --features cli`). Feature PRs do not regenerate `THIRD-PARTY-NOTICES`: stacked PRs would conflict on it. The lead regenerates it once, at the top of the stack, and reports the check as expected-red until then.
+
