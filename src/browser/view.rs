@@ -478,6 +478,7 @@ pub struct BrowserView {
     _events: Task<()>,
     _focus: [Subscription; 2],
     _address: Subscription,
+    _visibility: Subscription,
 }
 
 impl EventEmitter<BrowserEvent> for BrowserView {}
@@ -517,6 +518,17 @@ impl BrowserView {
             }
             _ => {}
         });
+        // Occluded, minimized, another Space, display asleep: the host stops painting until shown.
+        let visibility = cx.observe_window_visibility(window, |v, visibility, _, cx| {
+            let visible = visibility.is_visible();
+            if v.frames.set_visible(visible) {
+                v.link.send(AppToHost::SetVisible { id: v.id.clone(), visible });
+                if visible {
+                    v.acked = None;
+                }
+                cx.notify();
+            }
+        });
         let state = BrowserState { url: block.url.clone(), ..Default::default() };
         states.lock().unwrap().insert(id.to_owned(), state.clone());
         Self {
@@ -538,6 +550,7 @@ impl BrowserView {
             _events: events,
             _focus: [on, off],
             _address: typed,
+            _visibility: visibility,
         }
     }
 
@@ -796,9 +809,15 @@ impl Render for BrowserView {
         // The page's newest frame; before the first one, a white sheet with its url.
         let frame = if self.crashed.is_none() { self.frames.element() } else { None };
         if frame.is_some() {
+            // Runs once GPUI has drawn and presented this scene (next vsync): only then, and only
+            // in a visible window, is the frame acked (frame.rs: presentation, not receipt).
             let me = cx.entity().downgrade();
-            window.defer(cx, move |_, cx| {
-                let _ = me.update(cx, |v, _| v.send_ack());
+            window.on_next_frame(move |window, cx| {
+                let visible = window.is_visible();
+                let _ = me.update(cx, |v, _| {
+                    v.frames.presented(visible);
+                    v.send_ack();
+                });
             });
         }
         let page = match (&self.crashed, frame) {
