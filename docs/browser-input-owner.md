@@ -38,3 +38,11 @@ Transitions (`BrowserInput::enter`): Browse to Pick or Markup; Pick or Markup to
 ## Known limits (input)
 - Key repeat: the app sends `repeat: true` and the host sets `EVENTFLAG_IS_REPEAT`, but CEF off-screen on macOS drops it: held keys still repeat characters, only pages that read `KeyboardEvent.repeat` see `false`. `tests/browser_input.rs` prints `KNOWN-LIMIT I8`; confirm by hand in the visible session.
 - Native key codes are derived from the key name for a US layout (GPUI does not expose them).
+
+## Mode chords (S14-min)
+`TogglePick` and `ToggleMarkup` (`input.rs`), bound in the `Browser` key context: cmd-shift-c and cmd-shift-m on macOS (cmd-shift-c is Chrome's inspect-element chord), ctrl-alt-c and ctrl-alt-m elsewhere (`default_chords()`). `BrowserInput::toggle(mode)` opens the mode, swaps Pick and Markup, or closes the mode when it is already on top; a chord never closes an open comment (Esc does) and is refused with the cue under a lease. The page never sees a chord: GPUI matches bindings before the page's key listener.
+
+Hooks (view.rs and keys.rs, owned by others):
+1. `bind_keys` in view.rs: `for (k, m) in input::default_chords()` add `KeyBinding::new(k, <TogglePick or ToggleMarkup>, Some("Browser"))`.
+2. The `Browser` element: `.on_action` for `TogglePick` and `ToggleMarkup` calling `input.toggle(Owner::Pick / Owner::Markup)`, then draining `take_overlay()` as today.
+3. keys.json rebinding: `src/keys.rs` `tab()` maps a `"browser"` section to the `Browser` context; the `Browser` element handles `ShellAction` ids with `input::mode_action(id)` (`browser.pick`, `browser.markup`) and propagates anything else.

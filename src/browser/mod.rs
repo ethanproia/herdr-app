@@ -10,11 +10,20 @@
 #![allow(dead_code)]
 
 pub mod agent;
+// HERDR: part 4, design slice S7.
+pub mod annotate;
+pub mod dialogs;
+// HERDR: part 4, design slice S11.
+pub mod edits;
 pub mod frame;
 pub mod geometry;
 pub mod input;
 // HERDR: part 4, design slice S9.
 pub mod markup;
+// HERDR: part 4, design slice S6 (app side).
+pub mod region;
+// HERDR: part 4, design slice S10 (panel model and UI).
+pub mod styles;
 pub mod view;
 
 pub use herdr_browser_protocol as protocol;
