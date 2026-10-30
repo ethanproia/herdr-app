@@ -509,6 +509,17 @@ Close a browser block (default: the focused browser).
 | `id` | no |
 | `pane` | no |
 
+## `browser.pick`
+
+Ask the person to pick an element in a browser (it enters pick mode); answers when they click: its selector, trimmed HTML, box, text, key styles and a cropped screenshot. With x and y (page DIPs), captures the element there at once.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+| `x` | no |
+| `y` | no |
+
 ## `browser.lock`
 
 An agent takes a browser (on, default true): the person's input there is refused with a visible "<agent> is driving · Take Control" strip until the agent unlocks (on: false) or the person takes control.

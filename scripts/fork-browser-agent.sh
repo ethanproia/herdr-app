@@ -13,6 +13,12 @@ root=$HOME/.herdr-fork-home/$name
 run() { "$here/scripts/fork-run.sh" "$name" "$@"; }
 trap 'run down >/dev/null 2>&1 || true' EXIT
 run down >/dev/null 2>&1 || true
+# A window still serving this home (its pid file lost) would answer instead of this build: refuse.
+if run status >/dev/null 2>&1; then
+  echo "fork-browser-agent: a $name window still answers after down (stale, pid file lost); stop it first:" >&2
+  pgrep -fl "herdr-app" | grep -v grep >&2 || true
+  exit 1
+fi
 run up
 run do space.new '{"name":"agent"}' >/dev/null || true # the fork's home keeps spaces between runs
 # `herdr-app do` for this fork, for the daemon and the test.

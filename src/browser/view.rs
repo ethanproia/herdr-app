@@ -14,7 +14,7 @@ use super::markup::{self, Markup, Tool};
 use super::zoom;
 use super::{annotate, region};
 
-/// Eval request ids the view uses for its own page questions (agents count from 1; style
+/// Request ids the view uses for its own `PickInfo` questions (agents count from 1; style
 /// panels from 1 << 40).
 pub const VIEW_REQ_BASE: u64 = 1 << 41;
 
@@ -27,14 +27,6 @@ enum PageAsk {
     RegionAnchor(region::Rect),
 }
 
-/// The element at (__X__, __Y__) viewport CSS px: a selector that finds exactly it (id, else a
-/// tag:nth-of-type chain), a short label and its rect.
-const TARGET_JS: &str = r#"(()=>{const e=document.elementFromPoint(__X__,__Y__);if(!e)return null;
-const sel=el=>{const p=[];while(el&&el.nodeType===1&&el!==document.documentElement){if(el.id){p.unshift('#'+CSS.escape(el.id));break}
-let s=el.localName;const sib=el.parentElement?[...el.parentElement.children].filter(c=>c.localName===el.localName):[];
-if(sib.length>1)s+=`:nth-of-type(${sib.indexOf(el)+1})`;p.unshift(s);el=el.parentElement}return p.join(' > ')};
-const r=e.getBoundingClientRect();const t=(e.innerText||e.textContent||'').trim().replace(/\s+/g,' ').slice(0,30);
-return {selector:sel(e),label:(e.localName+(e.id?'#'+e.id:'')+(t?' '+t:'')),rect:[r.x,r.y,r.width,r.height]}})()"#;
 use super::{BrowserRegistry, BrowserState, FrameSink, FrameView, HostLink};
 use crate::layout::BrowserBlock;
 use gpui::prelude::FluentBuilder as _;
@@ -428,6 +420,7 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
         | H::Title { id, .. }
         | H::ContextMenu { id, .. }
         | H::StylesResult { id, .. }
+        | H::PickInfoResult { id, .. }
         | H::Url { id, .. }
         | H::Loading { id, .. }
         | H::Cursor { id, .. }
@@ -551,7 +544,7 @@ pub struct BrowserView {
     comment_target: Option<annotate::Target>,
     /// The comment field's text when it opened (it isn't cleared between comments yet).
     comment_base: String,
-    /// Page questions in flight (view-owned eval reqs >= VIEW_REQ_BASE).
+    /// Page questions in flight (view-owned PickInfo reqs >= VIEW_REQ_BASE).
     asks: HashMap<u64, PageAsk>,
     next_ask: u64,
     /// JS dialogs, the file chooser and download notices (dialogs.rs, fork-host's).
@@ -944,9 +937,9 @@ impl BrowserView {
                 self.input.update(cx, |i, _| i.on_caret(x, y, w, h));
                 return;
             }
-            H::EvalResult { req, ok, value, .. } if req >= VIEW_REQ_BASE => {
+            H::PickInfoResult { req, ok, selector, label, rect, .. } if req >= VIEW_REQ_BASE => {
                 if let Some(ask) = self.asks.remove(&req) {
-                    self.on_target(ask, ok.then_some(value), cx);
+                    self.on_target(ask, ok.then_some((selector, label, rect)), cx);
                 }
             }
             H::Error { message, .. } => tracing::warn!("browser {}: {message}", self.id),
@@ -1188,17 +1181,16 @@ impl BrowserView {
         self.next_ask += 1;
         let req = VIEW_REQ_BASE + self.next_ask;
         self.asks.insert(req, ask);
-        let expr = TARGET_JS.replace("__X__", &css.x.to_string()).replace("__Y__", &css.y.to_string());
-        self.link.send(AppToHost::Eval { id: self.id.clone(), req, expr });
+        self.link.send(AppToHost::PickInfo { id: self.id.clone(), req, x: css.x, y: css.y });
     }
 
     /// The page answered `ask_target`.
-    fn on_target(&mut self, ask: PageAsk, value: Option<serde_json::Value>, cx: &mut Context<Self>) {
+    /// `label` is untrusted page text: it is shown here, and redacted by agent.rs before an agent sees it.
+    fn on_target(&mut self, ask: PageAsk, answer: Option<(String, String, herdr_browser_protocol::CssRect)>, cx: &mut Context<Self>) {
         let geo = self.geometry();
-        let target = value.filter(|v| v.is_object()).map(|v| {
-            let n = |i: usize| v["rect"][i].as_f64().unwrap_or(0.0) as f32;
-            let (a, b) = (geo.viewport_to_page(Pt { x: n(0), y: n(1) }), geo.viewport_to_page(Pt { x: n(0) + n(2), y: n(1) + n(3) }));
-            annotate::Target { selector: v["selector"].as_str().unwrap_or_default().to_owned(), label: v["label"].as_str().unwrap_or_default().to_owned(), rect: (a.x, a.y, b.x - a.x, b.y - a.y) }
+        let target = answer.map(|(selector, label, r)| {
+            let (a, b) = (geo.viewport_to_page(Pt { x: r.x, y: r.y }), geo.viewport_to_page(Pt { x: r.x + r.w, y: r.y + r.h }));
+            annotate::Target { selector, label, rect: (a.x, a.y, b.x - a.x, b.y - a.y) }
         });
         match ask {
             PageAsk::RegionAnchor(r) => {
@@ -1236,6 +1228,13 @@ impl BrowserView {
         });
         self.drain_overlay(cx);
         cx.notify();
+    }
+
+    /// The view's PickInfo requests still waiting for an answer (tests play the host).
+    pub fn pending_pick_reqs(&self) -> Vec<u64> {
+        let mut v: Vec<u64> = self.asks.keys().copied().collect();
+        v.sort();
+        v
     }
 
     /// Comment-on-pick: a picked element opens a comment field (S7).
@@ -1967,6 +1966,14 @@ impl Browsers {
         }
         let focus = Focus { focused: self.focused.clone().filter(|f| self.views.contains_key(f)), block_of_pane };
         agent.lock().unwrap().run(name, args, self, &focus, reply)
+    }
+
+    // HERDR: browser block (part 5). The person picked an element: the agent captures it for `browser.pick`.
+    pub fn picked(&mut self, id: &str, x: f32, y: f32) {
+        let link = self.link_arc();
+        if let Some(agent) = &self.agent {
+            agent.lock().unwrap().picked(&id.to_owned(), x, y, &*link);
+        }
     }
 
     /// Match the views to `blocks` (every browser block in every layout, as id and block):
