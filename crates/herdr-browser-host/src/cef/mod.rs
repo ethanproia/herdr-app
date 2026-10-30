@@ -525,11 +525,14 @@ fn browser_msg(m: AppToHost) {
         M::StopFind { clear_selection, .. } => host.stop_finding(clear_selection as i32),
         M::DevTools { .. } => send(HostToApp::Error {
             id: Some(id),
-            message: "DevTools needs a window; the host is headless. Use the CDP port (Ready.cdp_port)".into(),
+            message: "unsupported: the DevTools window is not available in the headless browser host yet; attach a DevTools client to the CDP port (Ready.cdp_port) instead".into(),
         }),
         M::Eval { req, expr, .. } => {
-            let Some(f) = b.main_frame() else { return };
-            f.execute_java_script(Some(&CefString::from(handlers::eval_script(req, &expr).as_str())), None, 0);
+            let call = handlers::eval_message(&id, req, &expr);
+            if host.send_dev_tools_message(Some(&call)) == 0 {
+                handlers::eval_unsent(&id);
+                send(HostToApp::EvalResult { id, req, ok: false, value: "DevTools is not available for this page".into() });
+            }
         }
         _ => {}
     }
