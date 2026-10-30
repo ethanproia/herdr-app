@@ -45,6 +45,8 @@ pub(crate) struct Entry {
     popup_shown: bool,
     /// The popup's bounds in DIPs (x, y, w, h).
     popup_rect: Option<(i32, i32, i32, i32)>,
+    /// Messages for this browser that arrived before CEF finished making it.
+    starting: Vec<AppToHost>,
 }
 
 pub(crate) struct Host {
@@ -69,7 +71,7 @@ thread_local! {
     /// Browsers CEF has created and not yet finished closing (`on_before_close`).
     pub(crate) static OPEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Set by the cookie store's flush callback.
-    pub(crate) static FLUSHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FLUSHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How long `cef::shutdown` may take before the host exits on its own (Chromium's watchdog is longer).
@@ -79,7 +81,7 @@ unsafe extern "C" {
     fn _exit(code: i32) -> !;
 }
 
-fn debug(args: std::fmt::Arguments) {
+pub(crate) fn debug(args: std::fmt::Arguments) {
     if std::env::var_os("HERDR_BROWSER_HOST_DEBUG").is_some() {
         eprintln!("herdr-browser-host: {args}");
     }
@@ -132,11 +134,13 @@ pub(crate) fn on_frame(id: &str, src: *mut std::ffi::c_void, w: u32, h: u32) {
 
 /// A `<select>` list, datalist or other popup widget painted (PET_POPUP).
 pub(crate) fn on_popup_frame(id: &str, src: *mut std::ffi::c_void, w: u32, h: u32) {
+    debug(format_args!("{id}: popup paint {w}x{h}"));
     paint(id, Some((true, src, w, h)));
 }
 
 /// The popup widget opened or closed (`OnPopupShow`). Closing repaints the page without it.
 pub(crate) fn on_popup_show(id: &str, show: bool) {
+    debug(format_args!("{id}: popup show={show}"));
     let changed = with_host(|h| {
         h.browsers.get_mut(id).map(|e| {
             let was = e.popup_shown;
@@ -157,6 +161,7 @@ pub(crate) fn on_popup_show(id: &str, show: bool) {
 
 /// Where the popup goes, in DIPs from the view's top-left (`OnPopupSize`).
 pub(crate) fn on_popup_size(id: &str, x: i32, y: i32, w: i32, h: i32) {
+    debug(format_args!("{id}: popup at {x},{y} {w}x{h}"));
     with_host(|host| host.browsers.get_mut(id).map(|e| e.popup_rect = Some((x, y, w.max(0), h.max(0)))));
 }
 
@@ -183,6 +188,7 @@ fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
             if let (true, Some(popup), Some(rect)) = (entry.popup_shown, entry.popup.as_ref(), entry.popup_rect) {
                 let ps = popup.size();
                 let place = popup_place(rect, entry.scale, (ps.w, ps.h), (vs.w, vs.h));
+                debug(format_args!("{id}: compose popup {ps:?} at {rect:?} -> {place:?}"));
                 if let Some((from, to, w, h)) = place {
                     blitter.copy_region(popup.as_ptr(), (ps.w as usize, ps.h as usize), from, dst.as_ptr(), (vs.w as usize, vs.h as usize), to, w, h)?;
                 }
@@ -198,6 +204,9 @@ fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
     })).flatten();
     if let Some(events) = woke {
         replay(id, events);
+    }
+    if let Some(Ok(r)) = &ready {
+        debug(format_args!("{id}: paint popup={} -> {}", layer.is_some_and(|l| l.0), r.as_ref().map_or("pending".into(), |f| format!("send {}", f.0))));
     }
     match ready {
         Some(Ok(Some((seq, s, scale)))) => send_frame(id, seq, s, scale),
@@ -407,13 +416,18 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
     }
     // Write cookies to disk and wait (bounded) for CEF to confirm, so logins never depend on
     // how teardown goes.
-    FLUSHED.set(false);
-    let flushing = cookie_manager_get_global_manager(None).is_some_and(|cm| cm.flush_store(Some(&mut handlers::flush_done())) == 1);
+    // Every profile's cookie store: the default (global) one and each named profile's.
+    FLUSHED.set(0);
+    let contexts: Vec<RequestContext> = with_host(|h| h.contexts.drain().map(|(_, c)| c).collect()).unwrap_or_default();
+    let managers = cookie_manager_get_global_manager(None).into_iter().chain(contexts.iter().filter_map(|c| c.cookie_manager(None)));
+    let started = managers.filter(|cm| cm.flush_store(Some(&mut handlers::flush_done())) == 1).count();
     let end = std::time::Instant::now() + Duration::from_secs(3);
-    while flushing && !FLUSHED.get() && std::time::Instant::now() < end {
+    while FLUSHED.get() < started && std::time::Instant::now() < end {
         do_message_loop_work();
         std::thread::sleep(Duration::from_millis(5));
     }
+    debug(format_args!("cookie stores flushed: {}/{started}", FLUSHED.get()));
+    drop(contexts);
     // Let CEF finish the close and flush tasks it queued; `shutdown` hangs if they are pending.
     for _ in 0..40 {
         do_message_loop_work();
@@ -437,7 +451,7 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
     });
     let t = std::time::Instant::now();
     cef::shutdown();
-    debug(format_args!("CEF shut down in {:?} (cookies flushed: {})", t.elapsed(), FLUSHED.get()));
+    debug(format_args!("CEF shut down in {:?}", t.elapsed()));
     HOST.with_borrow_mut(|h| *h = None);
     Ok(())
 }
@@ -467,7 +481,9 @@ fn context_for(profile: Option<&str>) -> Result<Option<RequestContext>, String> 
         return Ok(Some(c));
     }
     let (root, dark) = with_host(|h| (h.root.clone(), h.dark)).ok_or("host not ready")?;
-    let dir = root.join("profiles").join(&name);
+    // Chrome only opens profiles that sit directly in its data folder (nested paths fail with
+    // "Cannot create profile" and silently fall back to a throwaway profile).
+    let dir = root.join(format!("profile-{name}"));
     std::fs::create_dir_all(&dir).map_err(|e| format!("profile {name}: {e}"))?;
     let settings = RequestContextSettings {
         cache_path: CefString::from(dir.to_string_lossy().as_ref()),
@@ -496,13 +512,21 @@ fn handle(m: AppToHost) {
         M::Hello { .. } => send(HostToApp::Error { id: None, message: "hello already received".into() }),
         M::Shutdown => {}
         M::SetColorScheme { dark } => {
-            let contexts: Vec<RequestContext> = with_host(|h| {
+            let (contexts, browsers): (Vec<RequestContext>, Vec<Browser>) = with_host(|h| {
                 h.dark = Some(dark);
-                h.contexts.values().cloned().collect()
+                (h.contexts.values().cloned().collect(), h.browsers.values().filter_map(|e| e.browser.clone()).collect())
             })
             .unwrap_or_default();
+            // Chrome's colour scheme recolours form controls and scrollbars; the page's
+            // prefers-color-scheme follows the DevTools media emulation (set per page, live).
             for ctx in request_context_get_global_context().into_iter().chain(contexts) {
                 apply_scheme(&ctx, Some(dark));
+            }
+            let call = handlers::scheme_message(dark);
+            for b in browsers {
+                if let Some(host) = b.host() {
+                    host.send_dev_tools_message(Some(&call));
+                }
             }
         }
         M::Create { id, url, size, scale, profile } => {
@@ -518,31 +542,16 @@ fn handle(m: AppToHost) {
                     return;
                 }
             };
-            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, view: None, popup: None, popup_shown: false, popup_rect: None }));
+            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new() }));
             let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
             let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
             let mut client = handlers::client(&id);
             let url = CefString::from(url.as_deref().unwrap_or("about:blank"));
-            match browser_host_create_browser_sync(Some(&window_info), Some(&mut client), Some(&url), Some(&settings), None, context.as_mut()) {
-                Some(b) => {
-                    // Ask DevTools for this page's target id; the observer sends CdpTarget.
-                    let reg = b.host().and_then(|host| {
-                        let mut obs = handlers::devtools_observer(&id);
-                        let reg = host.add_dev_tools_message_observer(Some(&mut obs));
-                        host.execute_dev_tools_method(handlers::TARGET_INFO_MSG, Some(&CefString::from("Target.getTargetInfo")), None);
-                        reg
-                    });
-                    with_host(|h| {
-                        h.browsers.get_mut(&id).map(|e| {
-                            e.browser = Some(b);
-                            e._devtools = reg;
-                        })
-                    });
-                }
-                None => {
-                    with_host(|h| h.browsers.remove(&id));
-                    send(HostToApp::Error { id: Some(id), message: "CEF could not create the browser".into() });
-                }
+            // Async: a named profile's context may still be starting, and a synchronous create
+            // fails then. `on_created` attaches the browser and replays what arrived meanwhile.
+            if browser_host_create_browser(Some(&window_info), Some(&mut client), Some(&url), Some(&settings), None, context.as_mut()) != 1 {
+                with_host(|h| h.browsers.remove(&id));
+                send(HostToApp::Error { id: Some(id), message: "CEF could not create the browser".into() });
             }
         }
         M::FileChooserResult { id, req, paths } => {
@@ -591,6 +600,37 @@ fn handle(m: AppToHost) {
     }
 }
 
+/// CEF made browser `id` (`OnAfterCreated`): attach it, ask for its CDP target and colour scheme,
+/// then run the messages that arrived while it was starting.
+pub(crate) fn on_created(id: &str, b: Browser) {
+    let reg = b.host().and_then(|host| {
+        let mut obs = handlers::devtools_observer(id);
+        let reg = host.add_dev_tools_message_observer(Some(&mut obs));
+        host.execute_dev_tools_method(handlers::TARGET_INFO_MSG, Some(&CefString::from("Target.getTargetInfo")), None);
+        if let Some(dark) = with_host(|h| h.dark).flatten() {
+            host.send_dev_tools_message(Some(&handlers::scheme_message(dark)));
+        }
+        reg
+    });
+    let waiting = with_host(|h| {
+        h.browsers.get_mut(id).map(|e| {
+            e.browser = Some(b.clone());
+            e._devtools = reg;
+            std::mem::take(&mut e.starting)
+        })
+    })
+    .flatten();
+    match waiting {
+        Some(msgs) => msgs.into_iter().for_each(browser_msg),
+        // Closed before CEF finished making it.
+        None => {
+            if let Some(host) = b.host() {
+                host.close_browser(1);
+            }
+        }
+    }
+}
+
 fn browser_msg(m: AppToHost) {
     use AppToHost as M;
     let id = match &m {
@@ -599,7 +639,14 @@ fn browser_msg(m: AppToHost) {
         | M::DevTools { id, .. } | M::Eval { id, .. } => id.clone(),
         _ => return,
     };
-    let Some(b) = browser(&id) else { return unknown(&id) };
+    let Some(b) = browser(&id) else {
+        // Still starting: keep it for `on_created`.
+        let kept = with_host(|h| h.browsers.get_mut(&id).map(|e| e.starting.push(m.clone()))).flatten().is_some();
+        if !kept {
+            unknown(&id);
+        }
+        return;
+    };
     let Some(host) = b.host() else { return unknown(&id) };
     match m {
         M::Navigate { url, .. } => {

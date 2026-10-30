@@ -106,7 +106,8 @@ wrap_render_handler! {
             1
         }
 
-        fn on_paint(&self, _browser: Option<&mut Browser>, _type_: PaintElementType, _dirty_rects: Option<&[Rect]>, _buffer: *const u8, _width: ::std::os::raw::c_int, _height: ::std::os::raw::c_int) {
+        fn on_paint(&self, _browser: Option<&mut Browser>, type_: PaintElementType, _dirty_rects: Option<&[Rect]>, _buffer: *const u8, width: ::std::os::raw::c_int, height: ::std::os::raw::c_int) {
+            super::debug(format_args!("{}: software paint type {:?} {width}x{height} (unused)", self.id, *type_.as_ref()));
             // Software frames are not used: shared_texture_enabled routes paints to on_accelerated_paint.
         }
 
@@ -232,8 +233,11 @@ wrap_life_span_handler! {
     }
 
     impl LifeSpanHandler {
-        fn on_after_created(&self, _browser: Option<&mut Browser>) {
+        fn on_after_created(&self, browser: Option<&mut Browser>) {
             super::OPEN.set(super::OPEN.get() + 1);
+            if let Some(b) = browser {
+                super::on_created(&self.id, b.clone());
+            }
         }
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
@@ -420,13 +424,26 @@ wrap_completion_callback! {
 
     impl CompletionCallback {
         fn on_complete(&self) {
-            super::FLUSHED.set(true);
+            super::FLUSHED.set(super::FLUSHED.get() + 1);
         }
     }
 }
 
 pub fn flush_done() -> CompletionCallback {
     FlushDone::new()
+}
+
+/// The DevTools message id for `Emulation.setEmulatedMedia` (its result is not needed).
+pub const SCHEME_MSG: i32 = 2;
+
+/// prefers-color-scheme for one page, through DevTools media emulation (live; survives navigation).
+pub fn scheme_message(dark: bool) -> Vec<u8> {
+    let call = serde_json::json!({
+        "id": SCHEME_MSG,
+        "method": "Emulation.setEmulatedMedia",
+        "params": { "features": [{ "name": "prefers-color-scheme", "value": if dark { "dark" } else { "light" } }] },
+    });
+    serde_json::to_vec(&call).expect("json encodes")
 }
 
 /// The DevTools message id used for `Target.getTargetInfo` (one per browser, so any fixed id works).

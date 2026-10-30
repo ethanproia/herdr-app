@@ -276,10 +276,18 @@ fn select_dropdown_paints_and_takes_input() {
     h.send(AppToHost::Focus { id: "b1".into(), focused: true });
     h.send(AppToHost::Input { id: "b1".into(), event: click(MouseKind::Down) });
     h.send(AppToHost::Input { id: "b1".into(), event: click(MouseKind::Up) });
-    // The open list sits just below the select (it starts near y = 30); its options are green.
-    let green = |px: [u8; 4]| px[1] > 200 && px[0] < 80 && px[2] < 80;
-    let (seq, px) = h.frame_where("b1", 40, 45, green);
-    println!("dropdown open: frame {seq}, pixel under the select {px:02x?} (green list)");
+    // The open list sits just below the select (CEF puts it at y = 31). Chromium draws the popup
+    // list in its own style (option colours do not apply), so check it covers the white page.
+    let green = |px: [u8; 4]| px != [0xff, 0xff, 0xff, 0xff];
+    if std::env::var_os("HERDR_TEST_TRACE").is_some() {
+        std::thread::sleep(SEC);
+        let shot = scratch("cef-select-shot").join("open.png");
+        h.send(AppToHost::Screenshot { id: "b1".into(), req: 77, path: shot.display().to_string() });
+        h.until(10 * SEC, |m| matches!(m, HostToApp::ScreenshotDone { .. }));
+        eprintln!("trace: screenshot {} ; focus {:?}", shot.display(), h.eval("b1", 78, "document.activeElement.id"));
+    }
+    let (seq, px) = h.frame_where("b1", 15, 33, green);
+    println!("dropdown open: frame {seq}, pixel under the select {px:02x?} (the list, not page white)");
     h.send(AppToHost::FrameAck { id: "b1".into(), seq });
     // Pick the second option with the keyboard, as a person would.
     for (key, code, native) in [("ArrowDown", "ArrowDown", 125), ("Enter", "Enter", 36)] {
@@ -287,7 +295,7 @@ fn select_dropdown_paints_and_takes_input() {
             h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Key { kind, key: key.into(), code: code.into(), native, repeat: false, mods } });
         }
     }
-    let (seq, px) = h.frame_where("b1", 40, 60, |px| px == [0xff, 0xff, 0xff, 0xff]);
+    let (seq, px) = h.frame_where("b1", 15, 33, |px| px == [0xff, 0xff, 0xff, 0xff]);
     println!("dropdown closed: frame {seq}, pixel below the select back to white {px:02x?}");
     std::thread::sleep(SEC / 4);
     assert_eq!(h.eval("b1", 2, "s.value"), (true, serde_json::json!("b")));
@@ -316,7 +324,10 @@ fn color_scheme_follows_the_app_live() {
     h.until(15 * SEC, |m| matches!(m, HostToApp::Loading { id, loading: false, .. } if id == "b2"));
     assert_eq!(h.eval("b2", 3, dark), (true, serde_json::json!(true)));
     h.send(AppToHost::SetColorScheme { dark: false });
-    assert_eq!(page_event(&mut h, "scheme"), serde_json::json!({"dark": false}));
+    // Both pages flip; wait for each to say so (b2 may still report its own start in dark first).
+    for id in ["b1", "b2"] {
+        h.until(10 * SEC, |m| matches!(m, HostToApp::Console { id: i, message, .. } if i == id && message == r#"ev scheme {"dark":false}"#));
+    }
     println!("new browser in profile work starts dark; back to light live");
     h.shutdown();
 }
@@ -348,5 +359,26 @@ fn profiles_keep_cookies_and_storage_apart_and_across_restarts() {
     assert!(ok);
     assert_eq!(v, serde_json::json!(["sess=1; who=work", "work"]));
     println!("after a host restart, profile work still has {v} (persistent and session cookie, localStorage)");
+    h.shutdown();
+}
+
+#[test]
+fn one_arrow_press_moves_the_caret_once() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-arrow");
+    create(&mut h, "b1", &p.url("input"), 200.0, 100.0, 1.0);
+    loaded(&mut h);
+    h.send(AppToHost::Focus { id: "b1".into(), focused: true });
+    h.eval("b1", 1, "t.focus(); t.value='abcd'; t.setSelectionRange(4,4); 0");
+    let mods = Modifiers::default();
+    for kind in [KeyKind::Down, KeyKind::Up] {
+        h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Key { kind, key: "ArrowLeft".into(), code: "ArrowLeft".into(), native: 123, repeat: false, mods } });
+    }
+    std::thread::sleep(SEC / 2);
+    assert_eq!(h.eval("b1", 2, "t.selectionStart"), (true, serde_json::json!(3)));
+    println!("one ArrowLeft press: caret 4 -> 3 (it moved twice before the macOS function-key characters)");
     h.shutdown();
 }
