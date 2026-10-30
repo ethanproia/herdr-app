@@ -37,6 +37,11 @@ notify = "7"
 sha2 = "0.10"
 
 [[test]]
+name = "surface_pixels"
+path = "tests/surface_pixels.rs"
+harness = false
+
+[[test]]
 name = "shot_pixels"
 path = "tests/shot_pixels.rs"
 harness = false
@@ -52,6 +57,10 @@ gpui_linux = { package = "gpui-pre-linux", version = "=0.3.8", features = ["rend
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_macos = { package = "gpui-pre-macos", version = "=0.3.8", features = ["render-to-image"] }
 libc = "0.2"
+core-video = "0.5.2"
+core-foundation = "0.10"
+herdr-browser-surface = { path = "crates/herdr-browser-surface" }
+herdr-browser-protocol = { path = "crates/herdr-browser-protocol" }
 
 [target.'cfg(windows)'.dependencies]
 gpui_windows = { package = "gpui-pre-windows", version = "=0.3.8", features = ["render-to-image"] }
