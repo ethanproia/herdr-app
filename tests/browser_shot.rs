@@ -421,7 +421,7 @@ fn main() {
     assert_ne!(at(400., 14.), [255, 255, 255, 255], "the chrome bar above the page");
     // The host was told the page area in DIPs (block minus the 28px bar) at the window's scale.
     let create = seen.lock().unwrap().iter().find_map(|m| match m {
-        AppToHost::Create { id, size, scale, url } if id == "web" => Some((*size, *scale, url.clone())),
+        AppToHost::Create { id, size, scale, url, .. } if id == "web" => Some((*size, *scale, url.clone())),
         _ => None,
     });
     let (size, k, url) = create.expect("Create sent");
