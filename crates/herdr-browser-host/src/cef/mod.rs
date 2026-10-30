@@ -949,12 +949,34 @@ fn browser_msg(m: AppToHost) {
             }
         }
         // Pick payload (S4): fork-host implements; until then "nothing there".
-        M::PickInfo { req, .. } => {
-            send(HostToApp::PickInfoResult { id, req, ok: false, selector: String::new(), label: String::new(), rect: herdr_browser_protocol::CssRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } });
+        M::PickInfo { req, x, y, .. } => {
+            let call = handlers::pick_message(&id, req, x, y);
+            if host.send_dev_tools_message(Some(&call)) == 0 {
+                handlers::eval_unsent(&id);
+                send(HostToApp::PickInfoResult { id, req, ok: false, selector: String::new(), label: String::new(), rect: herdr_browser_protocol::CssRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } });
+            }
         }
         // Style panel (S10): the host side is fork-host's slice; until it lands every request answers "no such element".
-        M::Styles { req, .. } | M::SetStyle { req, .. } | M::RevertStyle { req, .. } => {
-            send(HostToApp::StylesResult { id, req, ok: false, rows: vec![] });
+        M::Styles { req, ref node, ref props, .. } => {
+            let call = handlers::styles_message(&id, req, node, props);
+            if host.send_dev_tools_message(Some(&call)) == 0 {
+                handlers::eval_unsent(&id);
+                send(HostToApp::StylesResult { id, req, ok: false, rows: vec![] });
+            }
+        }
+        M::SetStyle { req, ref node, ref prop, ref value, .. } => {
+            let call = handlers::set_style_message(&id, req, node, prop, value.as_deref());
+            if host.send_dev_tools_message(Some(&call)) == 0 {
+                handlers::eval_unsent(&id);
+                send(HostToApp::StylesResult { id, req, ok: false, rows: vec![] });
+            }
+        }
+        M::RevertStyle { req, ref node, .. } => {
+            let call = handlers::revert_style_message(&id, req, node);
+            if host.send_dev_tools_message(Some(&call)) == 0 {
+                handlers::eval_unsent(&id);
+                send(HostToApp::StylesResult { id, req, ok: false, rows: vec![] });
+            }
         }
         M::Overlay { req, epoch, query, .. } => {
             let call = handlers::overlay_message(&id, req, epoch, &query);
