@@ -7,6 +7,9 @@ Measured on Ethan's Mac (macOS 27.0.1, arm64, Rust 1.95.0) on 2026-10-30. Anythi
 - **Fetch:** set `CEF_PATH` to a cache outside the repo (for the fork: `~/.herdr-fork-home/host/cef`). If the folder is missing, the build script downloads and unpacks it there once (`<CEF_PATH>/156.0.14/cef_macos_aarch64`); later builds reuse it.
 - **Build needs `cmake` and `ninja`** (`brew install ninja`): `cef-dll-sys` compiles CEF's C++ wrapper (`libcef_dll`) with CMake + Ninja.
 
+## System installs made for this work
+- `brew install ninja` (2026-10-30, ninja for the `cef-dll-sys` CMake build). Nothing else.
+
 ## Sizes (measured)
 | Item | Size |
 |---|---|
