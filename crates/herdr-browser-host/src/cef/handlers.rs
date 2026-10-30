@@ -280,6 +280,37 @@ wrap_load_handler! {
     }
 }
 
+/// The protocol's name for where a link or script wants a page opened.
+fn disposition_name(d: &WindowOpenDisposition) -> &'static str {
+    use sys::cef_window_open_disposition_t as W;
+    match *d.as_ref() {
+        W::CEF_WOD_CURRENT_TAB => "current_tab",
+        W::CEF_WOD_NEW_FOREGROUND_TAB => "new_foreground_tab",
+        W::CEF_WOD_NEW_BACKGROUND_TAB => "new_background_tab",
+        W::CEF_WOD_NEW_POPUP => "new_popup",
+        W::CEF_WOD_NEW_WINDOW => "new_window",
+        _ => "other",
+    }
+}
+
+wrap_request_handler! {
+    pub(crate) struct Requests {
+        id: String,
+    }
+
+    impl RequestHandler {
+        /// Cmd-click, middle-click and shift-click on links arrive here, not in OnBeforePopup:
+        /// anything but "current tab" goes to the app as NewWindow and the tab stays put.
+        fn on_open_urlfrom_tab(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, target_url: Option<&CefString>, target_disposition: WindowOpenDisposition, _user_gesture: ::std::os::raw::c_int) -> ::std::os::raw::c_int {
+            if *target_disposition.as_ref() == sys::cef_window_open_disposition_t::CEF_WOD_CURRENT_TAB {
+                return 0;
+            }
+            send(HostToApp::NewWindow { id: self.id.clone(), url: s(target_url), disposition: disposition_name(&target_disposition).into() });
+            1
+        }
+    }
+}
+
 wrap_life_span_handler! {
     pub(crate) struct LifeSpan {
         id: String,
@@ -298,14 +329,7 @@ wrap_life_span_handler! {
         }
 
         fn on_before_popup(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _popup_id: ::std::os::raw::c_int, target_url: Option<&CefString>, _target_frame_name: Option<&CefString>, target_disposition: WindowOpenDisposition, _user_gesture: ::std::os::raw::c_int, _popup_features: Option<&PopupFeatures>, _window_info: Option<&mut WindowInfo>, _client: Option<&mut Option<Client>>, _settings: Option<&mut BrowserSettings>, _extra_info: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut ::std::os::raw::c_int>) -> ::std::os::raw::c_int {
-            use sys::cef_window_open_disposition_t as W;
-            let disposition = match *target_disposition.as_ref() {
-                W::CEF_WOD_NEW_FOREGROUND_TAB => "new_foreground_tab",
-                W::CEF_WOD_NEW_BACKGROUND_TAB => "new_background_tab",
-                W::CEF_WOD_NEW_POPUP => "new_popup",
-                W::CEF_WOD_NEW_WINDOW => "new_window",
-                _ => "other",
-            };
+            let disposition = disposition_name(&target_disposition);
             send(HostToApp::NewWindow { id: self.id.clone(), url: s(target_url), disposition: disposition.into() });
             1 // the app decides; CEF never opens its own window
         }
@@ -517,6 +541,7 @@ wrap_client! {
         download: DownloadHandler,
         find: FindHandler,
         menus: ContextMenuHandler,
+        requests: RequestHandler,
     }
 
     impl Client {
@@ -546,6 +571,9 @@ wrap_client! {
         }
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
             Some(self.menus.clone())
+        }
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(self.requests.clone())
         }
     }
 }
@@ -639,7 +667,8 @@ pub fn client(id: &str) -> Client {
         Files::new(id.clone()),
         Downloads::new(id.clone()),
         Finds::new(id.clone()),
-        Menus::new(id),
+        Menus::new(id.clone()),
+        Requests::new(id),
     )
 }
 

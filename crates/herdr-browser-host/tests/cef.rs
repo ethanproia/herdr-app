@@ -54,6 +54,10 @@ body{margin:0;height:3000px} #box{position:absolute;left:20px;top:30px;width:100
 </style></head><body><div id=box></div><div class=item style="top:0"></div><div class=item style="top:20px"></div>
 <div class=item style="top:40px"></div><p id=p>select me please</p></body></html>"#;
 
+/// One big link to page b.
+const LINKS_PAGE: &str = r#"<!doctype html><html><head><title>links</title></head><body style="margin:0">
+<a href="/b" style="display:block;height:60px;font-size:30px">to b</a></body></html>"#;
+
 fn pages() -> Pages {
     Pages::start(vec![
         ("a", solid("A", "#3366cc")),
@@ -64,6 +68,7 @@ fn pages() -> Pages {
         ("scheme", SCHEME_PAGE.to_string()),
         ("menu", MENU_PAGE.to_string()),
         ("geo", GEO_PAGE.to_string()),
+        ("links", LINKS_PAGE.to_string()),
     ])
 }
 
@@ -496,5 +501,34 @@ fn overlay_geometry_and_viewport() {
 
     // SetVisible's full behaviour (dropping pending frames, a fresh frame on show) is fork-frames'
     // PR #22; this host only passes visibility to CEF, so it is not asserted here.
+    h.shutdown();
+}
+
+#[test]
+fn cmd_and_middle_click_ask_for_a_new_tab() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-links");
+    create(&mut h, "b1", &p.url("links"), 300.0, 200.0, 1.0);
+    loaded(&mut h);
+    let click = |h: &mut Host, button: MouseButton, mods: Modifiers| {
+        for kind in [MouseKind::Down, MouseKind::Up] {
+            h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Mouse { kind, x: 30.0, y: 20.0, button, clicks: 1, mods } });
+        }
+        match h.until(10 * SEC, |m| matches!(m, HostToApp::NewWindow { .. })) {
+            HostToApp::NewWindow { url, disposition, .. } => (url, disposition),
+            _ => unreachable!(),
+        }
+    };
+    let cmd = click(&mut h, MouseButton::Left, Modifiers { platform: true, ..Default::default() });
+    let mid = click(&mut h, MouseButton::Middle, Modifiers::default());
+    assert_eq!(cmd.0, p.url("b"));
+    assert_eq!(mid.0, p.url("b"));
+    assert!(cmd.1.starts_with("new_") && mid.1.starts_with("new_"), "{cmd:?} {mid:?}");
+    std::thread::sleep(SEC / 2);
+    assert_eq!(h.eval("b1", 2, "location.pathname"), (true, serde_json::json!("/links")));
+    println!("cmd-click -> NewWindow {cmd:?}; middle-click -> NewWindow {mid:?}; tab stayed on /links");
     h.shutdown();
 }
