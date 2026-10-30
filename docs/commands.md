@@ -499,6 +499,15 @@ Find text in a browser's page (answers the match count); no text ends the find.
 | `match_case` | no |
 | `next` | no |
 
+## `browser.close`
+
+Close a browser block (default: the focused browser).
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+
 ## `browser.devtools`
 
 Open a browser's DevTools (open: false closes them).

@@ -29,6 +29,8 @@ pub enum Step {
     Done,
     /// `browser.open`: the window makes a browser block (at `place`, default a new tab) and answers with its id.
     Open { url: Option<String>, place: Option<String>, reply: Reply },
+    /// `browser.close`: the window closes block `id` (and calls `Agent::closed`) and answers.
+    Close { id: BrowserId, reply: Reply },
 }
 
 #[derive(Default)]
@@ -74,6 +76,9 @@ impl Agent {
                 return Step::Done;
             }
         };
+        if name == "browser.close" {
+            return Step::Close { id, reply };
+        }
         let link = reg.link();
         let sent = |reply: Reply, msg: AppToHost| {
             link.send(msg);
@@ -142,6 +147,7 @@ impl Agent {
     pub fn on_host(&mut self, msg: &HostToApp) {
         match msg {
             HostToApp::Ready { cdp_port, .. } => self.cdp.set_port(*cdp_port),
+            HostToApp::CdpTarget { id, target_id } => self.cdp.set_target(id, target_id),
             HostToApp::EvalResult { req, ok: true, value, .. } => self.answer(*req, Ok(json!({ "value": value }))),
             HostToApp::EvalResult { req, value, .. } => self.answer(*req, Err(value.as_str().map(Into::into).unwrap_or_else(|| value.to_string()))),
             HostToApp::ScreenshotDone { req, ok: true, .. } => self.answer(*req, Ok(Value::Null)),
@@ -415,14 +421,26 @@ mod tests {
     }
 
     #[test]
+    fn close_goes_to_the_window_for_a_live_browser() {
+        let (_d, mut a) = agent();
+        let reg = reg();
+        let pane = |p: &str| (p == "p2").then(|| "b2".to_string());
+        let (_got, reply) = catch();
+        let step = a.run("browser.close", &json!({ "pane": "p2" }), &reg, &Focus { focused: Some("b1".into()), block_of_pane: &pane }, reply);
+        assert!(matches!(step, Step::Close { id, .. } if id == "b2"));
+        assert_eq!(run(&mut a, &reg, "browser.close", json!({ "id": "gone" })), Some(Err("no browser \"gone\"".into())));
+        assert!(sent(&reg).is_empty(), "the window closes it, not the host link");
+    }
+
+    #[test]
     fn cdp_file_follows_the_host() {
         let (d, mut a) = agent();
         let path = d.path().join("browser/cdp.json");
         let read = || serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap();
         a.on_host(&HostToApp::Ready { version: 1, cef_version: "x".into(), cdp_port: Some(9333) });
         assert_eq!(read(), json!({ "port": 9333, "targets": {} }));
-        a.cdp.set_target(&"b1".into(), "T1");
-        a.cdp.set_target(&"b2".into(), "T2");
+        a.on_host(&HostToApp::CdpTarget { id: "b1".into(), target_id: "T1".into() });
+        a.on_host(&HostToApp::CdpTarget { id: "b2".into(), target_id: "T2".into() });
         assert_eq!(read(), json!({ "port": 9333, "targets": { "b1": "T1", "b2": "T2" } }));
         a.closed(&"b1".into());
         assert_eq!(read(), json!({ "port": 9333, "targets": { "b2": "T2" } }));

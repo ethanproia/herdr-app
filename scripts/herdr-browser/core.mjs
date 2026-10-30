@@ -90,9 +90,10 @@ async function openTab(id) {
 
 async function closeTab(id) {
   const s = await sessions.get(id);
-  if (!standin) throw new Error("closing a browser block from an agent needs the app's browser close command (not wired yet)");
-  await fetch(`http://${endpoint()}/json/close/${s.targetId}`);
-  const c = readCdp(); delete c.targets[id]; writeCdp(c);
+  if (standin) {
+    await fetch(`http://${endpoint()}/json/close/${s.targetId}`);
+    const c = readCdp(); delete c.targets[id]; writeCdp(c);
+  } else await new Promise((ok, fail) => execFile(process.env.HERDR_APP_BIN || "herdr-app", ["do", "browser.close", "--id", id], (e) => (e ? fail(e) : ok())));
   s.ws.close(); sessions.delete(id);
 }
 

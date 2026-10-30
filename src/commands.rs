@@ -89,6 +89,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("browser.screenshot", &[opt("id"), opt("pane"), opt("path")], "Save a full-resolution PNG of a browser's page to path (default: browser/shots/ in the app's home); answers the path."),
     cmd("browser.eval", &[req("expr"), opt("id"), opt("pane")], "Run JavaScript in a browser's page; answers its value."),
     cmd("browser.find", &[opt("text"), opt("id"), opt("pane"), opt("forward"), opt("match_case"), opt("next")], "Find text in a browser's page (answers the match count); no text ends the find."),
+    cmd("browser.close", &[opt("id"), opt("pane")], "Close a browser block (default: the focused browser)."),
     cmd("browser.devtools", &[opt("id"), opt("pane"), opt("open")], "Open a browser's DevTools (open: false closes them)."),
     // The app.
     cmd("app.help", &[], "Show the keys."),
