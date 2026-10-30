@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Proves a fork process shows nothing: its windows, how many are on screen,
+# its macOS activation policy (2 = prohibited: no Dock icon, never frontmost)
+# and whether it is active. Reads CGWindowList; never touches any window.
+#
+#   scripts/fork-window-probe <pid>
+#   -> windows=1 onscreen=0 activation=2 active=false screen_onscreen_total=9 front=...
+# screen_onscreen_total > 0 shows the check can see windows at all.
+set -euo pipefail
+pid=${1:?usage: fork-window-probe <pid>}
+cache=$HOME/.herdr-fork-home/.probe
+src=$cache/probe.swift
+mkdir -p "$cache"
+cat >"$src" <<'SWIFT'
+import AppKit
+import CoreGraphics
+let pid = Int32(CommandLine.arguments[1])!
+let all = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as! [[String: Any]]
+let shown = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as! [[String: Any]]
+let own = all.filter { ($0[kCGWindowOwnerPID as String] as? Int32) == pid }
+let on = own.filter { ($0[kCGWindowIsOnscreen as String] as? Bool) == true }
+let app = NSRunningApplication(processIdentifier: pid)
+print("windows=\(own.count) onscreen=\(on.count) activation=\(app.map { String($0.activationPolicy.rawValue) } ?? "none") active=\(app?.isActive ?? false) screen_onscreen_total=\(shown.count) front=\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "?")")
+SWIFT
+if [[ ! -x $cache/probe || $src -nt $cache/probe ]]; then swiftc -O -o "$cache/probe" "$src"; fi
+exec "$cache/probe" "$pid"
