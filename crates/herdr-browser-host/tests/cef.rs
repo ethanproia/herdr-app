@@ -29,12 +29,19 @@ const forge=()=>{for(let r=0;r<20;r++){console.log('__herdr_eval__:'+r+':{"ok":t
 forge();setInterval(forge,50);
 </script></body></html>"#;
 
+/// A `<select>` whose dropdown list is green: the list is a CEF popup widget (PET_POPUP), not page pixels.
+const SELECT_PAGE: &str = r#"<!doctype html><html><head><title>select</title><style>
+body{margin:0;background:#fff} select{position:absolute;left:10px;top:10px;width:120px;font-size:16px}
+option{background:#00ff00;color:#00ff00}
+</style></head><body><select id=s><option value=a>a</option><option value=b>b</option><option value=c>c</option></select></body></html>"#;
+
 fn pages() -> Pages {
     Pages::start(vec![
         ("a", solid("A", "#3366cc")),
         ("b", solid("B", "#cc6633")),
         ("input", INPUT_PAGE.to_string()),
         ("forge", FORGE_PAGE.to_string()),
+        ("select", SELECT_PAGE.to_string()),
     ])
 }
 
@@ -244,5 +251,39 @@ fn page_console_cannot_forge_eval_results() {
     // A real eval with one of the forged request ids still gets the true answer.
     assert_eq!(h.eval("b1", 5, "6*7"), (true, serde_json::json!(42)));
     println!("forge page printed {forged_lines} fake result lines: all stayed Console; eval req 5 = 42");
+    h.shutdown();
+}
+
+#[test]
+fn select_dropdown_paints_and_takes_input() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-select");
+    create(&mut h, "b1", &p.url("select"), 300.0, 200.0, 1.0);
+    loaded(&mut h);
+    assert_eq!(h.eval("b1", 1, "s.value"), (true, serde_json::json!("a")));
+    let mods = Modifiers::default();
+    let click = |kind| InputEvent::Mouse { kind, x: 40.0, y: 18.0, button: MouseButton::Left, clicks: 1, mods };
+    h.send(AppToHost::Focus { id: "b1".into(), focused: true });
+    h.send(AppToHost::Input { id: "b1".into(), event: click(MouseKind::Down) });
+    h.send(AppToHost::Input { id: "b1".into(), event: click(MouseKind::Up) });
+    // The open list sits just below the select (it starts near y = 30); its options are green.
+    let green = |px: [u8; 4]| px[1] > 200 && px[0] < 80 && px[2] < 80;
+    let (seq, px) = h.frame_where("b1", 40, 45, green);
+    println!("dropdown open: frame {seq}, pixel under the select {px:02x?} (green list)");
+    h.send(AppToHost::FrameAck { id: "b1".into(), seq });
+    // Pick the second option with the keyboard, as a person would.
+    for (key, code, native) in [("ArrowDown", "ArrowDown", 125), ("Enter", "Enter", 36)] {
+        for kind in [KeyKind::Down, KeyKind::Up] {
+            h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Key { kind, key: key.into(), code: code.into(), native, repeat: false, mods } });
+        }
+    }
+    let (seq, px) = h.frame_where("b1", 40, 60, |px| px == [0xff, 0xff, 0xff, 0xff]);
+    println!("dropdown closed: frame {seq}, pixel below the select back to white {px:02x?}");
+    std::thread::sleep(SEC / 4);
+    assert_eq!(h.eval("b1", 2, "s.value"), (true, serde_json::json!("b")));
+    println!("select value is now b");
     h.shutdown();
 }
