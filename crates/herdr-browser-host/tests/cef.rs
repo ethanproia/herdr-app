@@ -341,8 +341,11 @@ fn color_scheme_follows_the_app_live() {
     assert_eq!(h.eval("b2", 3, dark), (true, serde_json::json!(true)));
     h.send(AppToHost::SetColorScheme { dark: false });
     // Both pages flip; wait for each to say so (b2 may still report its own start in dark first).
-    for id in ["b1", "b2"] {
-        h.until(10 * SEC, |m| matches!(m, HostToApp::Console { id: i, message, .. } if i == id && message == r#"ev scheme {"dark":false}"#));
+    let mut flipped = std::collections::HashSet::new();
+    while flipped.len() < 2 {
+        if let HostToApp::Console { id, .. } = h.until(10 * SEC, |m| matches!(m, HostToApp::Console { message, .. } if message == r#"ev scheme {"dark":false}"#)) {
+            flipped.insert(id);
+        }
     }
     println!("new browser in profile work starts dark; back to light live");
     h.shutdown();

@@ -34,11 +34,13 @@ pub(crate) struct Entry {
     last: Option<Surface>,
     /// Keeps the DevTools observer that reports the CDP target id alive.
     _devtools: Option<Registration>,
-    /// Input waits here until the page can take it: Chromium drops events sent between the first
-    /// load finishing and the first frame painted after it. See `input_ready`.
+    /// Input waits here until the page can take it: Chromium drops input that arrives right after
+    /// a load finishes, before the renderer is live. See `on_loading` and `input_live`.
     queued: Vec<InputEvent>,
     loaded: bool,
     input_ready: bool,
+    /// Counts main-page loads, so a readiness answer from an older load is ignored.
+    load_gen: u64,
     /// Copies of the newest page and popup paints, composed into each frame sent.
     view: Option<Surface>,
     popup: Option<Surface>,
@@ -208,13 +210,6 @@ fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
         Some(res)
     })
     .flatten();
-    let woke = with_host(|h| h.browsers.get_mut(id).filter(|e| e.loaded && !e.input_ready).map(|e| {
-        e.input_ready = true;
-        std::mem::take(&mut e.queued)
-    })).flatten();
-    if let Some(events) = woke {
-        replay(id, events);
-    }
     if let Some(Ok(r)) = &ready {
         debug(format_args!("{id}: paint popup={} -> {}", layer.is_some_and(|l| l.0), r.as_ref().map_or("pending".into(), |f| format!("send {}", f.0))));
     }
@@ -264,16 +259,45 @@ fn report_viewport(id: &str) {
     }
 }
 
-/// The page finished (or started) loading. Input becomes deliverable on the next frame.
+/// The page started or finished loading. A new load holds input; when it finishes, one privileged
+/// DevTools evaluate goes to the page, and its answer (`input_live`) proves the renderer is running
+/// script for the loaded page and releases the held input. Measured: input sent the moment
+/// loading ends (or on the first paint after it) is dropped by Chromium under load.
 pub(crate) fn on_loading(id: &str, loading: bool) {
-    if loading {
-        return;
+    let probe = with_host(|h| {
+        let e = h.browsers.get_mut(id)?;
+        if loading {
+            e.load_gen += 1;
+            e.loaded = false;
+            e.input_ready = false;
+            return None;
+        }
+        e.loaded = true;
+        (!e.input_ready).then_some(e.load_gen)
+    })
+    .flatten();
+    let Some(generation) = probe else { return };
+    let sent = browser(id).and_then(|b| b.host()).is_some_and(|host| host.send_dev_tools_message(Some(&handlers::ready_message(id, generation))) == 1);
+    if !sent {
+        handlers::eval_unsent(id);
+        input_live(id, generation);
     }
-    let first = with_host(|h| h.browsers.get_mut(id).map(|e| !std::mem::replace(&mut e.loaded, true))).flatten().unwrap_or(false);
-    // A static page may have painted before its load finished and never paint again, which
-    // would hold queued input forever: ask for one fresh paint, which releases it.
-    if first && let Some(host) = browser(id).and_then(|b| b.host()) {
-        host.invalidate(PaintElementType::default());
+}
+
+/// The readiness evaluate for load `generation` answered: deliver held input (if still current).
+pub(crate) fn input_live(id: &str, generation: u64) {
+    let events = with_host(|h| {
+        let e = h.browsers.get_mut(id)?;
+        if e.load_gen != generation || e.input_ready {
+            return None;
+        }
+        e.input_ready = true;
+        Some(std::mem::take(&mut e.queued))
+    })
+    .flatten();
+    if let Some(events) = events {
+        debug(format_args!("{id}: page live (load {generation}), releasing {} held input events", events.len()));
+        replay(id, events);
     }
 }
 
@@ -305,6 +329,21 @@ enum Incoming {
 /// exit; the browser process serves `socket`.
 pub fn main(socket: Option<&Path>) -> i32 {
     let is_helper = std::env::args().any(|a| a.starts_with("--type="));
+    // Listen before loading the framework (hundreds of MB; seconds under load), so the app's
+    // connect succeeds at once and the slow part waits behind Hello instead of the start timeout.
+    let listener = match socket.filter(|_| !is_helper) {
+        Some(sock) => {
+            let _ = std::fs::remove_file(sock);
+            match UnixListener::bind(sock) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    eprintln!("herdr-browser-host: cannot listen on {}: {e}", sock.display());
+                    return 1;
+                }
+            }
+        }
+        None => None,
+    };
     let exe = std::env::current_exe().expect("current exe");
     let loader = library_loader::LibraryLoader::new(&exe, is_helper);
     if !loader.load() {
@@ -316,11 +355,11 @@ pub fn main(socket: Option<&Path>) -> i32 {
     if is_helper {
         return execute_process(Some(args.as_main_args()), None::<&mut App>, std::ptr::null_mut());
     }
-    let Some(socket) = socket else {
+    let (Some(socket), Some(listener)) = (socket, listener) else {
         eprintln!("usage: herdr-browser-host --socket <path>");
         return 2;
     };
-    match serve(socket, &args) {
+    match serve(socket, listener, &args) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("herdr-browser-host: {e}");
@@ -342,10 +381,8 @@ fn pick_port(want: Option<u16>) -> io::Result<Option<u16>> {
     }
 }
 
-fn serve(socket: &Path, args: &Args) -> io::Result<()> {
+fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
     mac_app::setup();
-    let _ = std::fs::remove_file(socket);
-    let listener = UnixListener::bind(socket)?;
     let (stream, _) = listener.accept()?;
     let mut out = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
@@ -587,7 +624,7 @@ fn handle(m: AppToHost) {
                     return;
                 }
             };
-            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new(), scroll: None, viewport: None }));
+            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, load_gen: 0, view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new(), scroll: None, viewport: None }));
             let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
             let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
             let mut client = handlers::client(&id);
