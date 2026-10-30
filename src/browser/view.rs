@@ -388,7 +388,7 @@ impl FrameSink for NoFrames {
         Ok(())
     }
     fn on_resize_pending(&mut self, _: Dips) {}
-    fn ack(&self) -> Option<u64> {
+    fn ack(&mut self) -> Option<u64> {
         self.newest
     }
 }
