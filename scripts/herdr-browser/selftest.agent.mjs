@@ -109,10 +109,12 @@ try {
 
   // MCP wrapper: initialize, list tools, call one.
   const m = spawn("node", [join(here, "bin/herdr-browser"), "mcp"], { env, stdio: ["pipe", "pipe", "inherit"] });
-  let buf = ""; m.stdout.on("data", (d) => (buf += d));
+  // Wait for the answer to call 3 itself, not a fixed time: under load the server can take seconds to start.
+  let buf = "";
+  const answered = new Promise((r) => m.stdout.on("data", (d) => { buf += d; if (buf.split("\n").some((l) => /"id":3\b/.test(l))) r(); }));
   for (const [id, method, params] of [[1, "initialize", {}], [2, "tools/list"], [3, "tools/call", { name: "browser_text", arguments: { tab: "t1" } }]])
     m.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-  for (let i = 0; i < 50 && buf.split("\n").length < 4; i++) await new Promise((r) => setTimeout(r, 100));
+  await Promise.race([answered, new Promise((r) => setTimeout(r, 60000))]);
   m.kill();
   const rs = buf.trim().split("\n").map((l) => JSON.parse(l));
   check(rs[1]?.result?.tools?.some((t) => t.name === "browser_take_screenshot") && rs[1].result.tools.length >= 25 && rs[2]?.result?.content?.[0]?.text.includes("Hello Bob"), `MCP lists ${rs[1]?.result?.tools?.length} tools and a call returns page text`);
