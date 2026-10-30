@@ -11,6 +11,7 @@
 
 pub mod agent;
 pub mod frame;
+pub mod geometry;
 pub mod input;
 pub mod view;
 

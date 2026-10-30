@@ -131,6 +131,31 @@ pub enum EditCommand {
     Redo,
 }
 
+/// A rectangle in CSS pixels (an element box, a selection, a hit-test result).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CssRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// A point in CSS pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CssPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// What an overlay request asks the page. Coordinates: viewport CSS px.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OverlayQuery {
+    HitTest { x: f32, y: f32 },
+    Selector { selector: String },
+    Selection,
+}
+
 /// App to host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -153,11 +178,19 @@ pub enum AppToHost {
     /// The app's appearance changed (or Hello was just sent): every page's prefers-color-scheme
     /// follows it, live. Applies to browsers created later too.
     SetColorScheme { dark: bool },
+    /// Rects for an overlay; answered by `OverlayRects` with the same `req` and `epoch`.
+    Overlay { id: BrowserId, req: u64, epoch: u64, query: OverlayQuery },
     Input { id: BrowserId, event: InputEvent },
     /// Run an editing command (copy, paste, ...) in the focused frame.
     Edit { id: BrowserId, command: EditCommand },
-    /// The app has taken frame `seq`; the host may recycle that surface and send the next.
+    /// Frame `seq` (and every older one) was presented in a visible window: the host may send more
+    /// (at most two unacked). Paces delivery only; a surface is reused only once its IOSurface use
+    /// count is released.
     FrameAck { id: BrowserId, seq: u64 },
+    /// The block's window is occluded or minimized, or its tab is not shown (`false`), or shown again
+    /// (`true`). Hidden: the host stops painting and drops pending frames; shown: it sends a fresh
+    /// full frame. `Screenshot` still works while hidden.
+    SetVisible { id: BrowserId, visible: bool },
     Find { id: BrowserId, text: String, forward: bool, match_case: bool, find_next: bool },
     StopFind { id: BrowserId, clear_selection: bool },
     DevTools { id: BrowserId, open: bool },
@@ -195,6 +228,10 @@ pub enum HostToApp {
     Console { id: BrowserId, level: String, message: String, source: String, line: u32 },
     /// The CDP target id for this browser, so agents can attach to the right page via the CDP port.
     CdpTarget { id: BrowserId, target_id: String },
+    /// Rects in the answering frame's CSS px; `frames`: enclosing iframe content-box offsets, outermost first. `epoch` echoed.
+    OverlayRects { id: BrowserId, req: u64, epoch: u64, rects: Vec<CssRect>, frames: Vec<CssPoint> },
+    /// Scroll or zoom changed (at most one per frame); the app bumps its overlay epoch.
+    Viewport { id: BrowserId, scroll_x: f32, scroll_y: f32, zoom_level: f64 },
     EvalResult { id: BrowserId, req: u64, ok: bool, value: serde_json::Value },
     ScreenshotDone { id: BrowserId, req: u64, ok: bool, error: Option<String> },
     Crashed { id: Option<BrowserId>, reason: String },
@@ -245,6 +282,10 @@ mod tests {
         roundtrip_app(AppToHost::Edit { id: "b1".into(), command: EditCommand::SelectAll });
         roundtrip_app(AppToHost::SetColorScheme { dark: true });
         roundtrip_app(AppToHost::Create { id: "b2".into(), url: None, size: Size { w: 10.0, h: 10.0 }, scale: 1.0, profile: Some("work".into()) });
+        roundtrip_app(AppToHost::Overlay { id: "b1".into(), req: 3, epoch: 9, query: OverlayQuery::HitTest { x: 1.5, y: 2.5 } });
+        roundtrip_app(AppToHost::Overlay { id: "b1".into(), req: 4, epoch: 9, query: OverlayQuery::Selector { selector: "#a > b".into() } });
+        roundtrip_app(AppToHost::Overlay { id: "b1".into(), req: 5, epoch: 9, query: OverlayQuery::Selection });
+        roundtrip_app(AppToHost::SetVisible { id: "b1".into(), visible: false });
         roundtrip_app(AppToHost::Shutdown);
     }
 
@@ -257,6 +298,8 @@ mod tests {
         roundtrip_host(HostToApp::ImeCaret { id: "b1".into(), x: 1.0, y: 2.0, w: 1.0, h: 16.0 });
         roundtrip_host(HostToApp::EvalResult { id: "b1".into(), req: 1, ok: true, value: serde_json::json!({"n": 2}) });
         roundtrip_host(HostToApp::CdpTarget { id: "b1".into(), target_id: "T1".into() });
+        roundtrip_host(HostToApp::OverlayRects { id: "b1".into(), req: 3, epoch: 9, rects: vec![CssRect { x: 1.0, y: 2.0, w: 30.0, h: 40.0 }], frames: vec![CssPoint { x: 5.0, y: 6.0 }] });
+        roundtrip_host(HostToApp::Viewport { id: "b1".into(), scroll_x: 0.0, scroll_y: 120.5, zoom_level: 1.0 });
         roundtrip_host(HostToApp::Crashed { id: None, reason: "gpu".into() });
     }
 

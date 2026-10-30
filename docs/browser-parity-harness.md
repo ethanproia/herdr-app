@@ -87,5 +87,7 @@ fn main() {
 ## Notes
 - The CEF host's windowless frame rate is 60 (`BrowserSettings.windowless_frame_rate` in
   crates/herdr-browser-host/src/cef/mod.rs).
+- R6 baseline (smoke, 2026-10-30, debug build, loaded machine): one tab = 6 processes, 689 MB RSS,
+  2.5 % idle CPU. Watch the RSS: a Chrome/Cursor idle tab is well under that.
 - Known findings from the smoke run: drag-select selects nothing on the CEF host although the app
   sends button-held moves (I4); CEF has no default context menu offscreen (I5 needs the app menu).
