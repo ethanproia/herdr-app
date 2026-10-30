@@ -108,6 +108,11 @@ path = "tests/browser_annotate.rs"
 harness = false
 
 [[test]]
+name = "browser_pick_cef"
+path = "tests/browser_pick_cef.rs"
+harness = false
+
+[[test]]
 name = "browser_dialogs"
 path = "tests/browser_dialogs.rs"
 harness = false
