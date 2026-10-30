@@ -5,7 +5,7 @@ Status: v1, written before any part starts. The plan (CEF off-screen rendering, 
 ## Shape
 
 ```
-herdr-app (GPUI, main process)                         herdr-browser-host (CEF OSR, own process)
+the app (GPUI, main process)                           herdr-browser-host (CEF OSR, own process)
   layout block {"browser": {...}}                         one CEF browser per block id, windowless
   BrowserView entity (per block id)  <-- host.sock -->    protocol server, JSON lines
   paints IOSurface via gpui surface()  <-- IOSurface --   OnAcceleratedPaint -> shared IOSurface
@@ -47,3 +47,7 @@ Cross-part rules: the protocol crate is the only shared type surface; no part im
 
 ## Definition of done per part
 A small PR into `ethan/browser-block`, its tests passing under `cargo test --locked` (offscreen, no window), a rendered PNG or a transcript as evidence, the checklist items it moves, and an honest list of what is unverified in a real window.
+
+## Known red check: third-party notices
+`tests/notices.rs` hashes every Cargo manifest and Cargo.lock, so any PR that adds a crate or dependency makes it fail until `just notices` is rerun (needs `cargo install cargo-about --version 0.9.3 --locked --features cli`). Feature PRs do not regenerate `THIRD-PARTY-NOTICES`: stacked PRs would conflict on it. The lead regenerates it once, at the top of the stack, and reports the check as expected-red until then.
+
