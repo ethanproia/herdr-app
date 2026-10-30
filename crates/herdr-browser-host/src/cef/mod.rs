@@ -794,6 +794,9 @@ fn handle(m: AppToHost) {
         | M::Focus { .. }
         | M::SetZoom { .. }
         | M::Overlay { .. }
+        | M::Styles { .. }
+        | M::SetStyle { .. }
+        | M::RevertStyle { .. }
         | M::Input { .. }
         | M::Edit { .. }
         | M::SetVisible { .. }
@@ -840,7 +843,7 @@ fn browser_msg(m: AppToHost) {
     let id = match &m {
         M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. } | M::Stop { id } | M::Resize { id, .. }
         | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Input { id, .. } | M::Edit { id, .. } | M::Find { id, .. } | M::StopFind { id, .. }
-        | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::SetVisible { id, .. } => id.clone(),
+        | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } => id.clone(),
         other => {
             debug(format_args!("not a browser message, dropped: {}", encode(&other)));
             return;
@@ -943,6 +946,10 @@ fn browser_msg(m: AppToHost) {
                 handlers::eval_unsent(&id);
                 send(HostToApp::EvalResult { id, req, ok: false, value: "DevTools is not available for this page".into() });
             }
+        }
+        // Style panel (S10): the host side is fork-host's slice; until it lands every request answers "no such element".
+        M::Styles { req, .. } | M::SetStyle { req, .. } | M::RevertStyle { req, .. } => {
+            send(HostToApp::StylesResult { id, req, ok: false, rows: vec![] });
         }
         M::Overlay { req, epoch, query, .. } => {
             let call = handlers::overlay_message(&id, req, epoch, &query);
