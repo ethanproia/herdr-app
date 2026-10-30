@@ -23,7 +23,7 @@ pub fn eval_message(id: &str, req: u64, expr: &str) -> Vec<u8> {
     let call = serde_json::json!({
         "id": msg,
         "method": "Runtime.evaluate",
-        "params": { "expression": expr, "awaitPromise": true, "returnByValue": true, "userGesture": true, "replMode": true },
+        "params": { "expression": expr, "awaitPromise": true, "returnByValue": true, "userGesture": true },
     });
     serde_json::to_vec(&call).expect("json encodes")
 }
