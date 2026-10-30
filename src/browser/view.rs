@@ -10,6 +10,7 @@ use super::{BrowserRegistry, BrowserState, FrameSink, HostLink};
 use crate::layout::BrowserBlock;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
+use gpui_base::input::{Input, InputEvent, InputState};
 use herdr_browser_protocol::{self as protocol, AppToHost, BrowserId, HostToApp, PixelSize, Size as Dips, SurfaceRef};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -393,6 +394,34 @@ impl FrameSink for NoFrames {
     }
 }
 
+actions!(browser, [FocusAddress]);
+
+/// What was typed into the address bar, as a page to open: a url as it is, a bare host
+/// (`example.com/x`, `localhost:3000`) over https, anything else searched. None: nothing typed.
+pub fn address_to_url(typed: &str, engine: crate::settings::SearchEngine) -> Option<String> {
+    let t = typed.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let scheme = t.split_once(':').is_some_and(|(s, rest)| {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) && (rest.starts_with("//") || ["about", "data", "file", "javascript", "mailto", "chrome", "view-source"].contains(&s.to_ascii_lowercase().as_str()))
+    });
+    if scheme {
+        return Some(t.to_owned());
+    }
+    let host = t.split(['/', '?', '#']).next().unwrap_or("");
+    let name = host.rsplit_once(':').filter(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())).map_or(host, |(h, _)| h);
+    let hostlike = !t.contains(char::is_whitespace)
+        && !name.is_empty()
+        && (name.eq_ignore_ascii_case("localhost") || (name.contains('.') && !name.starts_with('.') && !name.ends_with('.')))
+        && name.chars().all(|c| c.is_alphanumeric() || "-.[]:".contains(c));
+    if hostlike {
+        let local = name.eq_ignore_ascii_case("localhost") || name.split('.').all(|p| p.parse::<u8>().is_ok());
+        return Some(format!("{}://{t}", if local { "http" } else { "https" }));
+    }
+    Some(engine.url(t))
+}
+
 /// What the block tells its window: the page moved, so the layout document follows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BrowserEvent {
@@ -412,9 +441,13 @@ pub struct BrowserView {
     sink: Box<dyn FrameSink>,
     acked: Option<u64>,
     focus: FocusHandle,
+    /// The address bar; shows the page's url unless someone is typing in it.
+    address: Entity<InputState>,
+    address_stale: bool,
     states: Arc<Mutex<HashMap<BrowserId, BrowserState>>>,
     _events: Task<()>,
     _focus: [Subscription; 2],
+    _address: Subscription,
 }
 
 impl EventEmitter<BrowserEvent> for BrowserView {}
@@ -432,6 +465,23 @@ impl BrowserView {
         let focus = cx.focus_handle();
         let on = cx.on_focus(&focus, window, |v, _, _| v.link.send(AppToHost::Focus { id: v.id.clone(), focused: true }));
         let off = cx.on_blur(&focus, window, |v, _, _| v.link.send(AppToHost::Focus { id: v.id.clone(), focused: false }));
+        bind_keys(cx);
+        let address = cx.new(|cx| InputState::new(window, cx).placeholder("Search or enter address"));
+        let typed = cx.subscribe_in(&address, window, |v, input, ev: &InputEvent, window, cx| match ev {
+            InputEvent::PressEnter { .. } => {
+                let text = input.read(cx).value();
+                if let Some(url) = address_to_url(&text, crate::settings::get().search_engine) {
+                    v.navigate(url, cx);
+                    window.focus(&v.focus, cx);
+                }
+            }
+            // Left without Enter: back to the page's url.
+            InputEvent::Blur => {
+                v.address_stale = true;
+                cx.notify();
+            }
+            _ => {}
+        });
         let state = BrowserState { url: block.url.clone(), ..Default::default() };
         states.lock().unwrap().insert(id.to_owned(), state.clone());
         Self {
@@ -444,9 +494,12 @@ impl BrowserView {
             sink: Box::new(NoFrames::default()),
             acked: None,
             focus,
+            address,
+            address_stale: true,
             states,
             _events: events,
             _focus: [on, off],
+            _address: typed,
         }
     }
 
@@ -455,12 +508,27 @@ impl BrowserView {
         self.sink = sink;
     }
 
+    /// The address bar's text state (tests type into it).
+    pub fn address(&self) -> &Entity<InputState> {
+        &self.address
+    }
+
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
     }
 
     pub fn crashed(&self) -> Option<&str> {
         self.crashed.as_deref()
+    }
+
+    /// Open `url` in this block (the address bar, agents).
+    pub fn navigate(&mut self, url: String, cx: &mut Context<Self>) {
+        self.block.url = url.clone();
+        if self.sized.is_some() {
+            self.link.send(AppToHost::Navigate { id: self.id.clone(), url });
+        }
+        self.address_stale = true;
+        cx.notify();
     }
 
     /// The layout changed the block (another url typed into the document): follow it.
@@ -483,6 +551,7 @@ impl BrowserView {
                 if url != self.state.url {
                     self.state.url = url.clone();
                     self.block.url = url.clone();
+                    self.address_stale = true;
                     cx.emit(BrowserEvent::Url(url));
                 }
             }
@@ -576,7 +645,7 @@ impl BrowserView {
                 let id = id.clone();
                 button("↻", true).on_click(cx.listener(move |v, _, _, _| v.link.send(AppToHost::Reload { id: id.clone(), ignore_cache: false })))
             })
-            .child(div().flex_1().overflow_hidden().whitespace_nowrap().text_ellipsis().child(self.shown_url()))
+            .child(div().flex_1().min_w_0().overflow_hidden().child(Input::new(&self.address)))
             .when(self.state.loading, |d| d.child("loading"))
     }
 
@@ -593,7 +662,12 @@ impl Drop for BrowserView {
 }
 
 impl Render for BrowserView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.address_stale && !self.address.read(cx).focus_handle(cx).is_focused(window) {
+            self.address_stale = false;
+            let url = self.state.url.clone();
+            self.address.update(cx, |a, cx| a.set_value(url, window, cx));
+        }
         let me = cx.entity().downgrade();
         let page = div()
             .id("page")
@@ -653,8 +727,31 @@ impl Render for BrowserView {
                     ),
             ),
         };
-        div().size_full().flex().flex_col().child(self.chrome(cx)).child(page)
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .key_context("Browser")
+            .on_action(cx.listener(|v, _: &FocusAddress, window, cx| {
+                v.address.update(cx, |a, cx| {
+                    a.focus(window, cx);
+                    a.select_all(window, cx);
+                });
+            }))
+            .child(self.chrome(cx))
+            .child(page)
     }
+}
+
+/// cmd-L (ctrl-L elsewhere) puts the cursor in the address bar, once per app.
+fn bind_keys(cx: &mut App) {
+    struct Bound;
+    impl Global for Bound {}
+    if cx.has_global::<Bound>() {
+        return;
+    }
+    cx.set_global(Bound);
+    cx.bind_keys([KeyBinding::new(if cfg!(target_os = "macos") { "cmd-l" } else { "ctrl-l" }, FocusAddress, Some("Browser"))]);
 }
 
 /// One `BrowserView` per browser block in the layouts. A view lives while its block does (shown
@@ -780,6 +877,24 @@ mod tests {
             }
         });
         (seen, kill)
+    }
+
+    #[::core::prelude::v1::test]
+    fn the_address_bar_opens_urls_hosts_and_searches() {
+        use crate::settings::SearchEngine::{Bing, Google};
+        let go = |t: &str| address_to_url(t, Google);
+        assert_eq!(go("  "), None);
+        assert_eq!(go("https://example.com/a?b=1").as_deref(), Some("https://example.com/a?b=1"));
+        assert_eq!(go("example.com").as_deref(), Some("https://example.com"));
+        assert_eq!(go("docs.rs/gpui/latest").as_deref(), Some("https://docs.rs/gpui/latest"));
+        assert_eq!(go("localhost:3000/x").as_deref(), Some("http://localhost:3000/x"));
+        assert_eq!(go("127.0.0.1:8080").as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(go("about:blank").as_deref(), Some("about:blank"));
+        assert_eq!(go("file:///tmp/a.html").as_deref(), Some("file:///tmp/a.html"));
+        assert_eq!(go("how do iosurfaces work").as_deref(), Some("https://www.google.com/search?q=how+do+iosurfaces+work"));
+        assert_eq!(go("rust").as_deref(), Some("https://www.google.com/search?q=rust"));
+        assert_eq!(go("what is 3.5 kg").as_deref(), Some("https://www.google.com/search?q=what+is+3.5+kg"));
+        assert_eq!(address_to_url("cef osr", Bing).as_deref(), Some("https://www.bing.com/search?q=cef+osr"));
     }
 
     fn size() -> Size {
