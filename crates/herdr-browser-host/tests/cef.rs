@@ -41,6 +41,12 @@ const q=matchMedia('(prefers-color-scheme: dark)');
 q.addEventListener('change',e=>console.log('ev scheme '+JSON.stringify({dark:e.matches})));
 </script></body></html>"#;
 
+/// A link at the top, a filled text box below it: two different context menus.
+const MENU_PAGE: &str = r#"<!doctype html><html><head><title>menu</title></head><body style="margin:0">
+<a id=l href="/b" style="display:block;height:30px;font-size:20px">a link</a>
+<textarea id=t style="display:block;width:200px;height:60px;margin:0;border:0">hello menu</textarea>
+</body></html>"#;
+
 fn pages() -> Pages {
     Pages::start(vec![
         ("a", solid("A", "#3366cc")),
@@ -49,6 +55,7 @@ fn pages() -> Pages {
         ("forge", FORGE_PAGE.to_string()),
         ("select", SELECT_PAGE.to_string()),
         ("scheme", SCHEME_PAGE.to_string()),
+        ("menu", MENU_PAGE.to_string()),
     ])
 }
 
@@ -381,5 +388,57 @@ fn one_arrow_press_moves_the_caret_once() {
     std::thread::sleep(SEC / 2);
     assert_eq!(h.eval("b1", 2, "t.selectionStart"), (true, serde_json::json!(3)));
     println!("one ArrowLeft press: caret 4 -> 3 (it moved twice before the macOS function-key characters)");
+    h.shutdown();
+}
+
+fn find_item<'a>(items: &'a [MenuItem], want: &str) -> Option<&'a MenuItem> {
+    items.iter().find_map(|i| if i.label.eq_ignore_ascii_case(want) { Some(i) } else { find_item(&i.submenu, want) })
+}
+
+#[test]
+fn context_menus_carry_cef_items_and_extras_and_run_commands() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-menu");
+    create(&mut h, "b1", &p.url("menu"), 300.0, 200.0, 1.0);
+    loaded(&mut h);
+    assert!(h.eval("b1", 1, "1").0);
+    let mods = Modifiers::default();
+    let right = |h: &mut Host, x: f32, y: f32| {
+        for kind in [MouseKind::Down, MouseKind::Up] {
+            h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Mouse { kind, x, y, button: MouseButton::Right, clicks: 1, mods } });
+        }
+        match h.until(10 * SEC, |m| matches!(m, HostToApp::ContextMenu { .. })) {
+            HostToApp::ContextMenu { req, kind, link_url, items, .. } => (req, kind, link_url, items),
+            _ => unreachable!(),
+        }
+    };
+    let t0 = std::time::Instant::now();
+    let (req, kind, link, items) = right(&mut h, 20.0, 12.0);
+    let ms = t0.elapsed().as_millis();
+    assert!(kind.contains(&"link".to_string()), "{kind:?}");
+    assert_eq!(link.as_deref(), Some(p.url("b").as_str()));
+    let open = find_item(&items, "Open Link in New Tab").expect("extra");
+    assert!(open.command >= 26500 && find_item(&items, "Copy Link Address").is_some());
+    let cef_items: Vec<&str> = items.iter().filter(|i| i.command > 0 && i.command < 26500).map(|i| i.label.as_str()).collect();
+    println!("link menu: kind {kind:?}, {} items, CEF items {cef_items:?}", items.len());
+    println!("METRIC context_menu_latency_ms={ms}");
+    // An extra is the app's job: it answers None, the host just closes CEF's menu.
+    h.send(AppToHost::MenuResult { id: "b1".into(), req, command: None });
+
+    let (req, kind, _, items) = right(&mut h, 40.0, 50.0);
+    assert!(kind.contains(&"editable".to_string()), "{kind:?}");
+    let all = find_item(&items, "Select All").expect("CEF's Select All");
+    assert!(all.command > 0 && all.command < 26500);
+    h.send(AppToHost::MenuResult { id: "b1".into(), req, command: Some(all.command) });
+    std::thread::sleep(SEC / 2);
+    let (ok, v) = h.eval("b1", 2, "[t.selectionStart, t.selectionEnd]");
+    assert_eq!((ok, v.clone()), (true, serde_json::json!([0, 10])));
+    println!("text box menu: Select All (command {}) selected {v}", all.command);
+    // A stale or foreign answer is refused, not run.
+    h.send(AppToHost::MenuResult { id: "b1".into(), req, command: Some(all.command) });
+    assert!(matches!(h.until(5 * SEC, |m| matches!(m, HostToApp::Error { .. }) || matches!(m, HostToApp::Error { .. })), HostToApp::Error { .. }));
     h.shutdown();
 }

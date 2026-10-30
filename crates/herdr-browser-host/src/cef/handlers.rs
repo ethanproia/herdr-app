@@ -379,6 +379,80 @@ wrap_find_handler! {
     }
 }
 
+/// App-handled menu extras (CEF's MENU_ID_USER_FIRST and up): the app acts, then answers None.
+pub const MENU_OPEN_LINK_IN_NEW_TAB: i32 = 26500;
+pub const MENU_COPY_LINK_ADDRESS: i32 = 26501;
+pub const MENU_SAVE_IMAGE_AS: i32 = 26502;
+
+fn menu_items(model: &MenuModel) -> Vec<herdr_browser_protocol::MenuItem> {
+    use sys::cef_menu_item_type_t as T;
+    (0..model.count())
+        .filter(|&i| model.is_visible_at(i) == 1)
+        .map(|i| {
+            let kind = *model.type_at(i).as_ref();
+            let separator = kind == T::MENUITEMTYPE_SEPARATOR;
+            herdr_browser_protocol::MenuItem {
+                command: if separator { 0 } else { model.command_id_at(i) },
+                // CEF labels carry "&" accelerator marks ("&Back"); "&&" is a literal "&".
+                label: uf(&model.label_at(i)).replace("&&", "\u{0}").replace('&', "").replace('\u{0}', "&"),
+                enabled: !separator && model.is_enabled_at(i) == 1,
+                checked: model.is_checked_at(i) == 1,
+                submenu: if kind == T::MENUITEMTYPE_SUBMENU { model.sub_menu_at(i).map(|m| menu_items(&m)).unwrap_or_default() } else { vec![] },
+            }
+        })
+        .collect()
+}
+
+fn extra(command: i32, label: &str) -> herdr_browser_protocol::MenuItem {
+    herdr_browser_protocol::MenuItem { command, label: label.into(), enabled: true, checked: false, submenu: vec![] }
+}
+
+wrap_context_menu_handler! {
+    pub(crate) struct Menus {
+        id: String,
+    }
+
+    impl ContextMenuHandler {
+        fn run_context_menu(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, params: Option<&mut ContextMenuParams>, model: Option<&mut MenuModel>, callback: Option<&mut RunContextMenuCallback>) -> ::std::os::raw::c_int {
+            let (Some(params), Some(model), Some(cb)) = (params, model, callback) else { return 0 };
+            use sys::cef_context_menu_type_flags_t as F;
+            let flags = params.type_flags().as_ref().0;
+            let mut kind: Vec<String> = Vec::new();
+            for (flag, name) in [(F::CM_TYPEFLAG_PAGE, "page"), (F::CM_TYPEFLAG_LINK, "link"), (F::CM_TYPEFLAG_MEDIA, "media"), (F::CM_TYPEFLAG_SELECTION, "selection"), (F::CM_TYPEFLAG_EDITABLE, "editable")] {
+                if flags & flag.0 != 0 {
+                    kind.push(name.into());
+                }
+            }
+            let image = params.has_image_contents() == 1 || *params.media_type().as_ref() == sys::cef_context_menu_media_type_t::CM_MEDIATYPE_IMAGE;
+            if image {
+                kind.push("image".into());
+            }
+            let nonempty = |s: String| (!s.is_empty()).then_some(s);
+            let link_url = nonempty(uf(&params.link_url()));
+            let src_url = nonempty(uf(&params.source_url()));
+            let selection = nonempty(uf(&params.selection_text()));
+            let mut items = menu_items(model);
+            let mut extras = Vec::new();
+            if link_url.is_some() {
+                extras.push(extra(MENU_OPEN_LINK_IN_NEW_TAB, "Open Link in New Tab"));
+                extras.push(extra(MENU_COPY_LINK_ADDRESS, "Copy Link Address"));
+            }
+            if image && src_url.is_some() {
+                extras.push(extra(MENU_SAVE_IMAGE_AS, "Save Image As…"));
+            }
+            if !extras.is_empty() {
+                extras.push(herdr_browser_protocol::MenuItem { command: 0, label: String::new(), enabled: false, checked: false, submenu: vec![] });
+                extras.append(&mut items);
+                items = extras;
+            }
+            let req = next_req();
+            super::keep_menu(&self.id, req, cb.clone());
+            send(HostToApp::ContextMenu { id: self.id.clone(), req, x: params.xcoord() as f32, y: params.ycoord() as f32, kind, link_url, src_url, selection, items });
+            1 // the app draws the menu; CEF never opens a native one
+        }
+    }
+}
+
 wrap_client! {
     pub(crate) struct ClientBuilder {
         render: RenderHandler,
@@ -389,6 +463,7 @@ wrap_client! {
         dialog: DialogHandler,
         download: DownloadHandler,
         find: FindHandler,
+        menus: ContextMenuHandler,
     }
 
     impl Client {
@@ -415,6 +490,9 @@ wrap_client! {
         }
         fn find_handler(&self) -> Option<FindHandler> {
             Some(self.find.clone())
+        }
+        fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
+            Some(self.menus.clone())
         }
     }
 }
@@ -494,7 +572,8 @@ pub fn client(id: &str) -> Client {
         Dialogs::new(id.clone()),
         Files::new(id.clone()),
         Downloads::new(id.clone()),
-        Finds::new(id),
+        Finds::new(id.clone()),
+        Menus::new(id),
     )
 }
 

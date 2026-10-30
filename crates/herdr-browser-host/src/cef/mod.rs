@@ -57,6 +57,7 @@ pub(crate) struct Host {
     next_req: u64,
     dialogs: HashMap<u64, JsdialogCallback>,
     choosers: HashMap<u64, FileDialogCallback>,
+    menus: HashMap<u64, (String, RunContextMenuCallback)>,
     quit: bool,
     /// The Hello profile root; named profiles live in folders under it.
     root: PathBuf,
@@ -121,6 +122,11 @@ pub(crate) fn downloads_dir() -> PathBuf {
 
 pub(crate) fn keep_dialog(req: u64, cb: JsdialogCallback) {
     with_host(|h| h.dialogs.insert(req, cb));
+}
+
+/// Hold browser `id`'s context-menu callback until the app answers `MenuResult` for `req`.
+pub(crate) fn keep_menu(id: &str, req: u64, cb: RunContextMenuCallback) {
+    with_host(|h| h.menus.insert(req, (id.to_string(), cb)));
 }
 
 pub(crate) fn keep_chooser(req: u64, cb: FileDialogCallback) {
@@ -357,6 +363,7 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
             dark: None,
             dialogs: HashMap::new(),
             choosers: HashMap::new(),
+            menus: HashMap::new(),
             quit: false,
         })
     });
@@ -428,6 +435,10 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
     }
     debug(format_args!("cookie stores flushed: {}/{started}", FLUSHED.get()));
     drop(contexts);
+    // Menus still open: dismiss them (outside the state borrow: CEF may call back).
+    for (_, (_, cb)) in with_host(|h| h.menus.drain().collect::<Vec<_>>()).unwrap_or_default() {
+        cb.cancel();
+    }
     // Let CEF finish the close and flush tasks it queued; `shutdown` hangs if they are pending.
     for _ in 0..40 {
         do_message_loop_work();
@@ -566,6 +577,17 @@ fn handle(m: AppToHost) {
                     list.append(p);
                 }
                 cb.cont(Some(&mut list));
+            }
+        }
+        M::MenuResult { id, req, command } => {
+            // Only the browser that opened the menu may answer it.
+            let Some((_, cb)) = with_host(|h| h.menus.remove(&req).filter(|(owner, _)| *owner == id)).flatten() else {
+                return send(HostToApp::Error { id: Some(id), message: format!("no context menu {req}") });
+            };
+            match command {
+                // App-handled extras were done by the app; CEF's own commands run here.
+                Some(c) if c > 0 && c < handlers::MENU_OPEN_LINK_IN_NEW_TAB => cb.cont(c, EventFlags::default()),
+                _ => cb.cancel(),
             }
         }
         M::DialogResult { id, req, accept, text } => {
