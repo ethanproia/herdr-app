@@ -20,7 +20,9 @@ pub mod geometry;
 pub mod input;
 // HERDR: part 4, design slice S9.
 pub mod markup;
-// HERDR: part 4, design slice S10 (panel model).
+// HERDR: part 4, design slice S6 (app side).
+pub mod region;
+// HERDR: part 4, design slice S10 (panel model and UI).
 pub mod styles;
 pub mod view;
 
