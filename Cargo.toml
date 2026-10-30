@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ghostty-sys", "crates/herdr-browser-protocol", "crates/herdr-browser-surface"]
+members = ["crates/ghostty-sys", "crates/herdr-browser-protocol", "crates/herdr-browser-surface", "crates/herdr-browser-host"]
 exclude = ["vendor/gpui-kit", "vendor/gpui-pre", "vendor/gpui-pre-wgpu", "vendor/gpui-pre-apple", "vendor/gpui-pre-linux", "vendor/gpui-pre-macos", "vendor/gpui-pre-windows", "vendor/taffy", "vendor/quickjs-jit-runtime", "vendor/zed-xim", "vendor/xim-ctext"]
 resolver = "2"
 

@@ -3725,6 +3725,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "herdr-browser-host"
+version = "0.1.0"
+dependencies = [
+ "herdr-browser-protocol",
+ "herdr-browser-surface",
+ "serde_json",
+]
+
+[[package]]
 name = "herdr-browser-protocol"
 version = "0.1.0"
 dependencies = [
