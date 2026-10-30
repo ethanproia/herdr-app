@@ -321,7 +321,8 @@ fn color_scheme_follows_the_app_live() {
     println!("SetColorScheme dark -> page saw the change live, matchMedia dark = true");
     // A browser made later starts in the current scheme, in a named profile too.
     h.send(AppToHost::Create { id: "b2".into(), url: Some(p.url("scheme")), size: Size { w: 100.0, h: 50.0 }, scale: 1.0, profile: Some("work".into()) });
-    h.until(15 * SEC, |m| matches!(m, HostToApp::Loading { id, loading: false, .. } if id == "b2"));
+    // A new profile starts cold (slow on a first run): give it time.
+    h.until(40 * SEC, |m| matches!(m, HostToApp::Loading { id, loading: false, .. } if id == "b2"));
     assert_eq!(h.eval("b2", 3, dark), (true, serde_json::json!(true)));
     h.send(AppToHost::SetColorScheme { dark: false });
     // Both pages flip; wait for each to say so (b2 may still report its own start in dark first).
