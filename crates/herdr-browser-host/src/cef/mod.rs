@@ -132,6 +132,9 @@ thread_local! {
     pub(crate) static FLUSHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Hello asked for CDP over fds 3/4 (`remote-debugging-pipe`); read by the App's command line hook.
+pub(crate) static CDP_PIPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// How long `cef::shutdown` may take before the host exits on its own (Chromium's watchdog is longer).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
@@ -512,7 +515,21 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
             return Ok(());
         }
         match decode::<AppToHost>(&line) {
-            Ok(AppToHost::Hello { profile_dir, cdp_port, .. }) => break (PathBuf::from(profile_dir), cdp_port),
+            Ok(AppToHost::Hello { profile_dir, cdp_port, cdp_pipe, .. }) => {
+                // Chromium would read and write fds 3/4 blindly: only use them if both are pipes.
+                let is_pipe = |fd: i32| unsafe {
+                    let mut st: libc::stat = std::mem::zeroed();
+                    libc::fstat(fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFIFO
+                };
+                let fds_open = is_pipe(3) && is_pipe(4);
+                if cdp_pipe && !fds_open {
+                    writeln!(out, "{}", encode(&HostToApp::Error { id: None, message: "cdp_pipe asked but fds 3/4 are not pipes: no CDP".into() }))?;
+                }
+                let cdp_pipe = cdp_pipe && fds_open;
+                CDP_PIPE.store(cdp_pipe, std::sync::atomic::Ordering::SeqCst);
+                // The pipe replaces the TCP port: with the pipe there is no port at all.
+                break (PathBuf::from(profile_dir), if cdp_pipe { None } else { cdp_port });
+            }
             Ok(AppToHost::Shutdown) => return Ok(()),
             Ok(_) => writeln!(out, "{}", encode(&HostToApp::Error { id: None, message: "send hello first".into() }))?,
             Err(e) => writeln!(out, "{}", encode(&HostToApp::Error { id: None, message: format!("bad message: {e}") }))?,
@@ -560,7 +577,7 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
     if with_host(|h| h.blitter.is_none()).unwrap_or(true) {
         send(HostToApp::Error { id: None, message: "no Metal device: frames cannot be copied".into() });
     }
-    send(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: cef_version(), cdp_port: cdp, cdp_pipe: false });
+    send(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: cef_version(), cdp_port: cdp, cdp_pipe: CDP_PIPE.load(std::sync::atomic::Ordering::SeqCst) });
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -985,7 +1002,7 @@ fn browser_msg(m: AppToHost) {
         M::StopFind { clear_selection, .. } => host.stop_finding(clear_selection as i32),
         M::DevTools { .. } => send(HostToApp::Error {
             id: Some(id),
-            message: "unsupported: the DevTools window is not available in the headless browser host yet; attach a DevTools client to the CDP port (Ready.cdp_port) instead".into(),
+            message: "unsupported: the DevTools window is not available in the headless browser host; inspect will come from a built-in panel driven through the app's CDP broker".into(),
         }),
         M::Eval { req, expr, .. } => {
             let call = handlers::eval_message(&id, req, &expr);
