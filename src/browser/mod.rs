@@ -24,15 +24,7 @@ pub trait HostLink: Send + Sync {
     fn send(&self, msg: AppToHost);
 }
 
-/// Part 3 implements this; `BrowserView` hands it every `Frame` the host sends.
-pub trait FrameSink {
-    /// A new frame arrived. The implementation imports the surface and keeps only the newest.
-    fn on_frame(&mut self, seq: u64, surface: SurfaceRef, size: PixelSize, scale: f32) -> anyhow::Result<()>;
-    /// The block was resized and the host has not delivered a frame of the new size yet.
-    fn on_resize_pending(&mut self, dips: Size);
-    /// The newest frame sequence that has been painted and may be acknowledged to the host.
-    fn ack(&self) -> Option<u64>;
-}
+pub use frame::{FrameSink, FrameView};
 
 /// What a browser block tells the rest of the app about itself (part 1 fills it from host events).
 #[derive(Debug, Clone, Default, PartialEq)]

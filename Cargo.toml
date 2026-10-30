@@ -38,6 +38,11 @@ notify = "7"
 sha2 = "0.10"
 
 [[test]]
+name = "browser_frame"
+path = "tests/browser_frame.rs"
+harness = false
+
+[[test]]
 name = "surface_pixels"
 path = "tests/surface_pixels.rs"
 harness = false

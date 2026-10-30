@@ -16,14 +16,20 @@ fn one_in_flight_newest_pending_recycled() {
     assert_eq!(p.pending_seq(), Some(6), "only the newest pending frame is kept");
     assert!(p.ack(99).is_none(), "stale ack ignored");
     assert_eq!(p.ack(1).map(|f| f.seq), Some(6));
-    assert_eq!(p.ack(6).map(|f| f.seq), None);
-    assert!(p.created() <= 3, "recycled, created {}", p.created());
+    assert_eq!(p.displayed_seq(), Some(1), "acked frame stays on screen");
+    let fresh = p.acquire(S).unwrap();
+    assert_ne!(fresh.id(), p.displayed_id(), "never repaint the frame on screen");
+    p.submit(fresh);
+    assert_eq!(p.ack(6).map(|f| f.seq), Some(7));
+    assert_eq!(p.displayed_seq(), Some(6));
+    p.ack(7);
+    assert!(p.created() <= 4, "recycled, created {}", p.created());
     for _ in 0..50 {
         let s = p.acquire(S).unwrap();
         let seq = p.submit(s).unwrap().seq;
         p.ack(seq);
     }
-    assert!(p.created() <= 3, "steady state allocates nothing, created {}", p.created());
+    assert!(p.created() <= 4, "steady state allocates nothing, created {}", p.created());
 }
 
 #[test]
