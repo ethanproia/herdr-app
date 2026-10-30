@@ -3846,6 +3846,12 @@ impl AppWindow {
                 }
                 // Pick results go to the agent tools (part 5) through the view; nothing for the layout.
                 crate::browser::view::BrowserEvent::Picked { .. } => return,
+                // A download finished or failed: a toast, like other notices.
+                crate::browser::view::BrowserEvent::Notice(n) => {
+                    let spec = json!({ "kind": "toast", "notification": n });
+                    this.open_overlay(mods::new_overlay_id(), spec, window, cx);
+                    return;
+                }
             };
             let tab = this.model.tabs().find(|t| crate::layout::browser_blocks(&t.root).iter().any(|(b, _)| b == id)).map(|t| t.id.clone());
             let changed = match tab.and_then(|t| this.model.tab_mut(&t)) {
