@@ -1,16 +1,19 @@
 #!/bin/sh
 # Build herdr-browser-host with CEF and lay it out as a macOS .app (framework + 5 helper apps).
 # Usage: scripts/fork-host-bundle.sh [release]   -> prints the path of the bundle's executable.
-# Env: CEF_PATH (CEF cache, default ~/.herdr-fork-home/host/cef), CARGO_TARGET_DIR.
+# Env: CEF_PATH (CEF cache, default $HERDR_FORK_DIR/cef), CARGO_TARGET_DIR (default
+# $HERDR_FORK_DIR/target); HERDR_FORK_DIR defaults to ~/work.noindex/herdr-fork (Spotlight skips it).
 # Never installs anything and never touches a running Herdr. See docs/fork-host.md.
 set -eu
 profile=debug
 flag=
 if [ "${1:-}" = release ]; then profile=release; flag=--release; fi
-: "${CEF_PATH:=$HOME/.herdr-fork-home/host/cef}"
+: "${HERDR_FORK_DIR:=$HOME/work.noindex/herdr-fork}"
+: "${CEF_PATH:=$HERDR_FORK_DIR/cef}"
 export CEF_PATH
 root=$(cd "$(dirname "$0")/.." && pwd)
-target=${CARGO_TARGET_DIR:-$root/target}
+target=${CARGO_TARGET_DIR:-$HERDR_FORK_DIR/target}
+export CARGO_TARGET_DIR=$target
 cargo build -q -p herdr-browser-host --features cef $flag --manifest-path "$root/Cargo.toml" >&2
 framework=$(find "$CEF_PATH" -maxdepth 3 -type d -name 'Chromium Embedded Framework.framework' | head -n 1)
 [ -n "$framework" ] || { echo "no CEF framework under $CEF_PATH" >&2; exit 1; }

@@ -3413,6 +3413,18 @@ impl AppWindow {
                     let _ = reply.send(r.unwrap_or_else(|error| json!({ "error": error })));
                 }), window, cx);
             }
+            // HERDR: a headless window is never asked to display, so its picture stays the first
+            // frame ("Loading..."): draw it now, outside this view's update, then take the shot.
+            Request::Control { cmd, reply } if crate::control::headless() && cmd.get("shot").and_then(Value::as_str).is_some() => {
+                let path = PathBuf::from(cmd["shot"].as_str().unwrap_or_default());
+                window.defer(cx, move |window, cx| {
+                    window.draw(cx).clear(cx);
+                    let _ = reply.send(match crate::control::save_shot(window, &path) {
+                        Ok(()) => json!({ "path": path }),
+                        Err(error) => json!({ "error": format!("cannot save screenshot: {error:#}") }),
+                    });
+                });
+            }
             Request::Control { cmd, reply } => {
                 let _ = reply.send(self.control(cmd, window, cx));
             }

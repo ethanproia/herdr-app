@@ -158,6 +158,9 @@ impl Agent {
                 }
             }
             HostToApp::Crashed { id, reason } => self.fail_all(id.as_ref(), &format!("browser crashed: {reason}")),
+            // HERDR: browser block. An error carries no request id: what waits on that browser
+            // (or on any, for an error without one) fails now instead of at the reply timeout.
+            HostToApp::Error { id, message } => self.fail_all(id.as_ref(), message),
             _ => {}
         }
     }
@@ -369,6 +372,23 @@ mod tests {
         // The first one is still waiting; a crash of b1 fails it.
         a.on_host(&HostToApp::Crashed { id: Some("b1".into()), reason: "gpu".into() });
         assert!(a.pending.is_empty(), "{req}");
+    }
+
+    #[test]
+    fn a_host_error_fails_what_waits_on_that_browser_at_once() {
+        let (_d, mut a) = agent();
+        let reg = reg();
+        let pane = |_: &str| None;
+        let (got1, r1) = catch();
+        let (got2, r2) = catch();
+        a.run("browser.eval", &json!({ "expr": "1" }), &reg, &Focus { focused: Some("b1".into()), block_of_pane: &pane }, r1);
+        a.run("browser.eval", &json!({ "expr": "2" }), &reg, &Focus { focused: Some("b2".into()), block_of_pane: &pane }, r2);
+        a.on_host(&HostToApp::Error { id: Some("b1".into()), message: "no browser b1".into() });
+        assert_eq!(got1.lock().unwrap().take(), Some(Err("no browser b1".into())));
+        assert_eq!(got2.lock().unwrap().take(), None, "b2 still waits");
+        a.on_host(&HostToApp::Error { id: None, message: "bad message".into() });
+        assert_eq!(got2.lock().unwrap().take(), Some(Err("bad message".into())));
+        assert!(a.pending.is_empty());
     }
 
     #[test]

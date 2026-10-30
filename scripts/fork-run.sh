@@ -26,7 +26,7 @@ if [[ $(canon "$home") == "$(canon "$real")" || $(canon "$home") == "$(canon "$H
   echo "fork-run: refusing to use the real home $real" >&2
   exit 1
 fi
-bin=${HERDR_APP_BIN:-$here/target/debug/herdr-app}
+bin=${HERDR_APP_BIN:-${CARGO_TARGET_DIR:-${HERDR_FORK_DIR:-$HOME/work.noindex/herdr-fork}/target}/debug/herdr-app}
 # A build without the headless switch would show a window: refuse it.
 has_headless() { [[ -x $bin ]] && grep -aq HERDR_APP_HEADLESS "$bin"; }
 
@@ -45,7 +45,7 @@ export PATH=$root/bin:$PATH
 cmd=${1:-status}
 case $cmd in
   up)
-    [[ -x $bin ]] || (cd "$here" && cargo build --locked)
+    [[ -x $bin ]] || (cd "$here" && CARGO_TARGET_DIR=${bin%/debug/herdr-app} cargo build --locked)
     if ! has_headless; then
       echo "fork-run: $bin has no HERDR_APP_HEADLESS switch (old build?); refusing to start it" >&2
       exit 1
@@ -62,7 +62,7 @@ case $cmd in
       echo "fork-run: set FORK_RUN_WINDOW=1 to open it anyway." >&2
       exit 1
     fi
-    [[ -x $bin ]] || (cd "$here" && cargo build --locked)
+    [[ -x $bin ]] || (cd "$here" && CARGO_TARGET_DIR=${bin%/debug/herdr-app} cargo build --locked)
     nohup "$bin" >"$root/app.log" 2>&1 </dev/null &
     echo $! >"$root/pid"
     echo "fork window pid $(cat "$root/pid"), log $root/app.log"

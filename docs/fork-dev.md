@@ -109,3 +109,14 @@ cef-rs examples.
   <https://docs.rs/crate/cef/latest/source/src/osr_texture_import/mod.rs>
   (docs page is for 148.1.0). The first CEF version with macOS support is
   unconfirmed.
+
+## Known issues
+- `files::tests::a_watched_folder_reports_changes_and_misses_none_between_waits` can hang
+  (idle at 0% CPU for minutes) on a busy Mac; run the suite with
+  `cargo test --locked --bin herdr-app -- --skip a_watched_folder` until it is fixed.
+- A headless window (`HERDR_APP_HEADLESS=1`) is never asked to display, so it paints only when
+  something asks: `herdr-app shot` draws first (HERDR: in window.rs), so the picture is current.
+- Disposable output lives under `$HERDR_FORK_DIR` (default `~/work.noindex/herdr-fork`, which
+  Spotlight skips): `target/` (the one `CARGO_TARGET_DIR`), `wt/` (worktrees), `cef/`
+  (`CEF_PATH`), `scratch/`. New worktrees take ghostty with
+  `git submodule update --init --reference ~/code/herdr-app/.git/modules/vendor/ghostty vendor/ghostty`.

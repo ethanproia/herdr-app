@@ -64,7 +64,7 @@ echo "ok   screenshot is a PNG ($(wc -c <"$shot" | tr -d ' ') bytes): $shot"
 
 cdp=$HOME/.herdr-fork-home/$name/home/browser/cdp.json
 r=$(cat "$cdp" 2>/dev/null || echo '{}'); check "$r" "'$id' in r.get('targets', {})" "cdp.json lists the page's CDP target"
-run shot "$out/window.png" >/dev/null && echo "ok   window picture: $out/window.png"
+r=$(run shot "$out/window.png" || true); check "{\"p\": \"$r\"}" 'r["p"].endswith("window.png")' "window picture: $out/window.png"
 
 r=$(do_ browser.close "$(args '{}')"); check "$r" 'r.get("closed") is True' "browser.close"
 sleep 0.5
