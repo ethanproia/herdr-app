@@ -36,11 +36,29 @@ pub enum Step {
 #[derive(Default)]
 pub struct Agent {
     next_req: u64,
-    pending: HashMap<u64, (BrowserId, Reply)>,
+    pending: HashMap<u64, Pending>,
+    /// Host generation: bumped each time a new host process says Ready after an earlier one (a restart).
+    /// A reply counts only for a request parked in this generation, for its browser and operation.
+    generation: u64,
+    ready: bool,
     /// The find waiting on each browser (FindResult carries no request id).
     finds: HashMap<BrowserId, u64>,
     pub cdp: CdpFile,
     pub grants: Grants,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Eval,
+    Screenshot,
+    Find,
+}
+
+struct Pending {
+    id: BrowserId,
+    generation: u64,
+    op: Op,
+    reply: Reply,
 }
 
 fn arg<'a>(a: &'a Value, k: &str) -> Option<&'a str> {
@@ -97,7 +115,7 @@ impl Agent {
             "browser.devtools" => sent(reply, AppToHost::DevTools { id: id.clone(), open: flag(a, "open", true) }),
             "browser.eval" => match arg(a, "expr") {
                 Some(expr) => {
-                    let req = self.park(&id, reply);
+                    let req = self.park(&id, Op::Eval, reply);
                     link.send(AppToHost::Eval { id, req, expr: expr.into() });
                 }
                 None => reply(Err("browser.eval needs expr".into())),
@@ -108,7 +126,7 @@ impl Agent {
                     let _ = std::fs::create_dir_all(dir);
                 }
                 let path = path.to_string_lossy().into_owned();
-                let req = self.park(&id, Box::new({
+                let req = self.park(&id, Op::Screenshot, Box::new({
                     let path = path.clone();
                     move |r: Result<Value, String>| reply(r.map(|_| json!({ "path": path })))
                 }));
@@ -116,9 +134,9 @@ impl Agent {
             }
             "browser.find" => match arg(a, "text") {
                 Some(text) => {
-                    let req = self.park(&id, reply);
+                    let req = self.park(&id, Op::Find, reply);
                     if let Some(old) = self.finds.insert(id.clone(), req) {
-                        self.answer(old, Err("a newer find replaced this one".into()));
+                        self.settle(old, Err("a newer find replaced this one".into()));
                     }
                     link.send(AppToHost::Find { id, text: text.into(), forward: flag(a, "forward", true), match_case: flag(a, "match_case", false), find_next: flag(a, "next", false) });
                 }
@@ -132,31 +150,52 @@ impl Agent {
         Step::Done
     }
 
-    fn park(&mut self, id: &BrowserId, reply: Reply) -> u64 {
+    fn park(&mut self, id: &BrowserId, op: Op, reply: Reply) -> u64 {
         self.next_req += 1;
-        self.pending.insert(self.next_req, (id.clone(), reply));
+        self.pending.insert(self.next_req, Pending { id: id.clone(), generation: self.generation, op, reply });
         self.next_req
     }
 
-    fn answer(&mut self, req: u64, r: Result<Value, String>) {
-        if let Some((_, reply)) = self.pending.remove(&req) {
-            reply(r);
+    /// A host reply: answers request `req` only when it was parked for this browser, this operation and this
+    /// host generation; anything else (a forged or stale reply) is dropped and the request keeps waiting.
+    fn answer(&mut self, req: u64, id: &BrowserId, op: Op, r: Result<Value, String>) {
+        match self.pending.get(&req) {
+            Some(p) if &p.id == id && p.op == op && p.generation == self.generation => self.settle(req, r),
+            Some(_) => tracing::warn!("dropped a host reply for request {req} that does not match its browser, operation or host"),
+            None => {}
+        }
+    }
+
+    /// Ends request `req` from the app side (failures, replacements).
+    fn settle(&mut self, req: u64, r: Result<Value, String>) {
+        if let Some(p) = self.pending.remove(&req) {
+            (p.reply)(r);
         }
     }
 
     /// Every host message passes here: answers parked commands and keeps cdp.json current.
     pub fn on_host(&mut self, msg: &HostToApp) {
         match msg {
-            HostToApp::Ready { cdp_port, .. } => self.cdp.set_port(*cdp_port),
+            HostToApp::Ready { cdp_port, .. } => {
+                if std::mem::replace(&mut self.ready, true) {
+                    self.new_generation("the browser host restarted");
+                }
+                self.cdp.set_port(*cdp_port)
+            }
             HostToApp::CdpTarget { id, target_id } => self.cdp.set_target(id, target_id),
-            HostToApp::EvalResult { req, ok: true, value, .. } => self.answer(*req, Ok(json!({ "value": value }))),
-            HostToApp::EvalResult { req, value, .. } => self.answer(*req, Err(value.as_str().map(Into::into).unwrap_or_else(|| value.to_string()))),
-            HostToApp::ScreenshotDone { req, ok: true, .. } => self.answer(*req, Ok(Value::Null)),
-            HostToApp::ScreenshotDone { req, error, .. } => self.answer(*req, Err(error.clone().unwrap_or_else(|| "screenshot failed".into()))),
+            HostToApp::EvalResult { id, req, ok: true, value } => self.answer(*req, id, Op::Eval, Ok(json!({ "value": value }))),
+            HostToApp::EvalResult { id, req, value, .. } => self.answer(*req, id, Op::Eval, Err(value.as_str().map(Into::into).unwrap_or_else(|| value.to_string()))),
+            HostToApp::ScreenshotDone { id, req, ok: true, .. } => self.answer(*req, id, Op::Screenshot, Ok(Value::Null)),
+            HostToApp::ScreenshotDone { id, req, error, .. } => self.answer(*req, id, Op::Screenshot, Err(error.clone().unwrap_or_else(|| "screenshot failed".into()))),
             HostToApp::FindResult { id, count, active, final_update: true } => {
                 if let Some(req) = self.finds.remove(id) {
-                    self.answer(req, Ok(json!({ "id": id, "count": count, "active": active })));
+                    self.answer(req, id, Op::Find, Ok(json!({ "id": id, "count": count, "active": active })));
                 }
+            }
+            // The whole host died: what it owed will never come, and its late replies must not count.
+            HostToApp::Crashed { id: None, reason } => {
+                self.ready = false;
+                self.new_generation(&format!("browser crashed: {reason}"));
             }
             HostToApp::Crashed { id, reason } => self.fail_all(id.as_ref(), &format!("browser crashed: {reason}")),
             // HERDR: browser block. An error carries no request id: what waits on that browser
@@ -174,11 +213,16 @@ impl Agent {
     }
 
     fn fail_all(&mut self, id: Option<&BrowserId>, why: &str) {
-        let reqs: Vec<u64> = self.pending.iter().filter(|(_, (b, _))| id.is_none_or(|id| b == id)).map(|(r, _)| *r).collect();
+        let reqs: Vec<u64> = self.pending.iter().filter(|(_, p)| id.is_none_or(|id| &p.id == id)).map(|(r, _)| *r).collect();
         for req in reqs {
-            self.answer(req, Err(why.into()));
+            self.settle(req, Err(why.into()));
         }
         self.finds.retain(|b, _| id.is_some_and(|id| b != id));
+    }
+
+    fn new_generation(&mut self, why: &str) {
+        self.fail_all(None, why);
+        self.generation += 1;
     }
 }
 
@@ -530,6 +574,42 @@ mod tests {
         assert!(matches!(step, Step::Close { id, .. } if id == "b2"));
         assert_eq!(run(&mut a, &reg, "browser.close", json!({ "id": "gone" })), Some(Err("no browser \"gone\"".into())));
         assert!(sent(&reg).is_empty(), "the window closes it, not the host link");
+    }
+
+    /// A reply counts only for its own browser, operation and host generation (forged-eval hole, app side).
+    #[test]
+    fn mismatched_or_stale_replies_are_dropped() {
+        let (_d, mut a) = agent();
+        let reg = reg();
+        a.on_host(&HostToApp::Ready { version: 1, cef_version: "x".into(), cdp_port: None });
+        assert_eq!(run(&mut a, &reg, "browser.eval", json!({ "expr": "1" })), None);
+        let [AppToHost::Eval { req, .. }] = &sent(&reg)[..] else { panic!() };
+        let req = *req;
+        // Another browser's answer under this request id: dropped, still waiting.
+        a.on_host(&HostToApp::EvalResult { id: "b2".into(), req, ok: true, value: json!("forged") });
+        // The right browser but another operation: dropped.
+        a.on_host(&HostToApp::ScreenshotDone { id: "b1".into(), req, ok: true, error: None });
+        assert_eq!(a.pending.len(), 1, "mismatched replies must not answer");
+        // A matching reply answers.
+        let pane = |_: &str| None;
+        let (got, reply) = catch();
+        a.run("browser.eval", &json!({ "expr": "2" }), &reg, &Focus { focused: Some("b1".into()), block_of_pane: &pane }, reply);
+        let [AppToHost::Eval { req: req2, .. }] = &sent(&reg)[..] else { panic!() };
+        a.on_host(&HostToApp::EvalResult { id: "b1".into(), req: *req2, ok: true, value: json!(2) });
+        assert_eq!(got.lock().unwrap().take(), Some(Ok(json!({ "value": 2 }))));
+        // The host restarts: the old request fails, and its late reply (stale generation) answers nothing.
+        let (got, reply) = catch();
+        a.run("browser.eval", &json!({ "expr": "3" }), &reg, &Focus { focused: Some("b1".into()), block_of_pane: &pane }, reply);
+        let [AppToHost::Eval { req: req3, .. }] = &sent(&reg)[..] else { panic!() };
+        a.on_host(&HostToApp::Ready { version: 1, cef_version: "x".into(), cdp_port: None });
+        assert_eq!(got.lock().unwrap().take(), Some(Err("the browser host restarted".into())));
+        a.on_host(&HostToApp::EvalResult { id: "b1".into(), req: *req3, ok: true, value: json!("late") });
+        assert!(a.pending.is_empty());
+        // A request parked in the old generation that somehow survived is not answered by the new host either.
+        a.pending.insert(99, Pending { id: "b1".into(), generation: a.generation - 1, op: Op::Eval, reply: Box::new(|_| panic!("stale answered")) });
+        a.on_host(&HostToApp::EvalResult { id: "b1".into(), req: 99, ok: true, value: json!("stale") });
+        assert!(a.pending.contains_key(&99));
+        let _ = req;
     }
 
     #[test]
