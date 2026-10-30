@@ -109,6 +109,8 @@ async function closeTab(id) {
 
 register({
   sessions, dir, openTab, closeTab, targets,
+  // What the person sent from a block (comments, markup, a picture): the app keeps it (agent.rs).
+  annotations: async (args) => { if (standin) throw new Error("annotations come from the app; the stand-in has none"); const r = await app("browser.annotations", args); if (r.error) throw new Error(`browser.annotations: ${r.error}`); return r; },
   lease: async (id, on) => { if (!standin) { const r = await app("browser.lock", { id, on, agent: process.env.HERDR_BROWSER_AGENT || "an agent" }); if (r.error) throw new Error(`browser.lock: ${r.error}`); } },
   onEvent: (method, fn) => events.set(method, [...(events.get(method) ?? []), fn]),
   onOpen: (fn) => openHooks.push(fn),

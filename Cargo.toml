@@ -123,6 +123,11 @@ path = "tests/browser_attach.rs"
 harness = false
 
 [[test]]
+name = "browser_annotations_agent"
+path = "tests/browser_annotations_agent.rs"
+harness = false
+
+[[test]]
 name = "browser_pick_cef"
 path = "tests/browser_pick_cef.rs"
 harness = false
