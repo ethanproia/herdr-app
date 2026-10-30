@@ -7,7 +7,8 @@
 // on a person's block until its switch is on, DevTools refusal, and the MCP wrapper.
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, statSync } from "node:fs";
+import { connect } from "node:net";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -33,6 +34,9 @@ const personBlock = async (id) => {
   return id;
 };
 let P; // the person's block
+// The person's grant in the block (the app writes grants.json from its UI; the test plays the person).
+const grant = (id, g) => { let all = {}; try { all = JSON.parse(readFileSync(join(dir, "grants.json"), "utf8")); } catch {}
+  all[id] = { ...all[id], ...g }; writeFileSync(join(dir, "grants.json"), JSON.stringify(all), { mode: 0o600 }); };
 let T = "t1"; // the agent's tab: the app picks block ids, so it is whatever open answers
 let failed = 0;
 const check = (ok, what) => { console.log(`${ok ? "ok  " : "FAIL"} ${what}`); if (!ok) failed++; };
@@ -44,7 +48,7 @@ const json = async (...a) => { const o = (await cli(...a)).replace(/^EXIT \S+ /,
 const html = `<!doctype html><title>Form</title><body style="margin:0;font:16px sans-serif">
 <h1>Agent test</h1><input id=q placeholder="Your name"><button id=go onclick="document.getElementById('out').textContent='Hello '+q.value;console.log('clicked',q.value)">Greet</button>
 <p id=out>nobody yet</p><select id=pick><option value=a>Apple</option><option value=b>Banana</option></select>
-<input id=f placeholder="Fill me" oninput="document.title='filled '+this.value">
+<input id=f placeholder="Fill me" oninput="document.title='filled '+this.value"><input type=password id=pw placeholder="Password" value="hunter2-secret"><input id=card_number placeholder="Card" value="4111111111111111">
 <div id=src draggable=true style="width:40px;height:20px;background:red">drag</div><div id=dst style="width:60px;height:30px;background:#ccc" ondragover="event.preventDefault()">drop</div><img src="/missing.png" alt=x><script>console.warn('page ready')</script></body>`;
 const web = createServer((req, res) => { if (req.url === "/missing.png") { res.statusCode = 404; res.end(); return; } res.setHeader("content-type", "text/html"); res.end(html); });
 await new Promise((r) => web.listen(0, "127.0.0.1", r));
@@ -76,6 +80,8 @@ try {
   const snap2 = (await cli("browser_snapshot", T));
   const r2 = (re) => snap2.split("\n").find((l) => re.test(l))?.match(/ref=(e\d+)/)?.[1];
   const sel = r2(/combobox/), fill = r2(/textbox "Fill me"/);
+  // X3: password and card values never reach the agent (the fields still show, marked hidden).
+  check(!/hunter2-secret|4111111111111111/.test(snap2) && /textbox "Password" value=<hidden>/.test(snap2), "X3 snapshot hides password and card values");
   check((await json("browser_select_option", T, `ref=${sel}`, 'values=["Banana"]')).selected?.[0] === "b", "select_option by label");
   check((await json("browser_fill", T, `ref=${fill}`, "value=xyz")).ok && (await json("eval", T, "expression=document.title")).value === "filled xyz", "fill sets the value and fires input");
   const bb = await json("browser_get_bounding_box", T, `ref=${sel}`);
@@ -85,7 +91,11 @@ try {
   check((await json("browser_drag", T, `sourceRef=${r2(/text "drag"/)}`, `targetRef=${r2(/text "drop"/)}`)).to?.x > 0, "drag between refs");
   check((await json("browser_press_key", T, "key=Tab")).ok, "press_key");
   check((await json("browser_scroll", T, "direction=down", "amount=50")).ok, "scroll by direction");
-  check((await json("browser_cdp", T, "method=Runtime.evaluate", 'params={"expression":"1+1"}')).result?.result?.value === 2, "cdp passthrough");
+  // X2: raw CDP is brokered: refused without the person's grant, and only allowed methods with it.
+  check(/needs the person's cdp grant/.test(await cli("browser_cdp", T, "method=Runtime.evaluate", 'params={"expression":"1+1"}')), "X2 raw CDP refused without a grant");
+  grant(T, { cdp: true });
+  check((await json("browser_cdp", T, "method=Runtime.evaluate", 'params={"expression":"1+1"}')).result?.result?.value === 2, "cdp passthrough with the grant");
+  check(/not allowed for agents/.test(await cli("browser_cdp", T, "method=Storage.getCookies")), "X2 cookie and profile methods refused even with the grant");
   check((await json("browser_lock", T, "action=lock")).locked === true && (await json("tabs")).ok, "lock sets the lock flag");
   (await json("browser_lock", T, "action=unlock"));
   const tl = await json("browser_tabs", "action=list");
@@ -108,10 +118,12 @@ try {
   // A block the person opened refuses until their switch turns it on.
   P = await personBlock("panel");
   check(/not agent-controllable/.test((await cli("text", P))), "panel tab refuses agent commands by default");
-  (await json("allow", P, "on=true"));
+  // X1: an agent cannot grant itself control: the old allow command is gone from the agent API.
+  check(/unknown cmd allow/.test(await cli("allow", P, "on=true")) && /not agent-controllable/.test(await cli("text", P)), "X1 an agent cannot self-grant");
+  grant(P, { control: true });
   check((await json("navigate", P, `url=${site}`)).ok, "toggle on lets the agent drive the panel tab");
   check(/only tabs an agent opened/.test((await cli("close", P))), "close is limited to agent tabs");
-  (await json("allow", P, "on=false"));
+  grant(P, { control: false });
   check(/not agent-controllable/.test((await cli("text", P))), "toggle off takes control back");
 
   // DevTools open for a tab (an inspector page for its target) blocks agent commands on it.
@@ -121,6 +133,18 @@ try {
   check(/DevTools is open/.test((await cli("text", T))), "refuses while DevTools is open for the tab");
   await fetch(`${cdpHttp()}/json/close/${dt.id}`);
   check((await cli("text", T)).includes("Hello"), "works again after DevTools closes");
+
+  // X5: the agent daemon answers only token holders and never a web page.
+  const ap = readFileSync(join(dir, "agent.port"), "utf8").trim(), tok = readFileSync(join(dir, "agent.token"), "utf8").trim();
+  const st = async (h) => (await fetch(`http://127.0.0.1:${ap}/_agent`, { method: "POST", headers: h, body: '{"cmd":"tabs"}' })).status;
+  check(await st({}) === 401 && await st({ authorization: "Bearer nope" }) === 401, "X5 daemon refuses a client without the token");
+  check(await st({ authorization: `Bearer ${tok}`, origin: "http://evil.test" }) === 403, "X5 daemon refuses a web page Origin even with the token");
+  check((statSync(join(dir, "agent.token")).mode & 0o777) === 0o600, "X5 the token file is owner-only");
+  // The raw CDP port refuses a websocket from a foreign Origin (Chromium's --remote-allow-origins check).
+  const raw = await new Promise((r) => { const c = connect(JSON.parse(readFileSync(join(dir, "cdp.json"), "utf8")).port, "127.0.0.1", () =>
+    c.write(`GET /devtools/page/x HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: http://evil.test\r\n\r\n`));
+    c.once("data", (d) => { r(String(d).split("\r\n")[0]); c.destroy(); }); c.on("error", (e) => r(String(e))); });
+  check(!/ 101 /.test(raw), `X5 raw CDP port refuses a foreign Origin (${raw})`);
 
   // MCP wrapper: initialize, list tools, call one.
   const m = spawn("node", [join(here, "bin/herdr-browser"), "mcp"], { env, stdio: ["pipe", "pipe", "inherit"] });

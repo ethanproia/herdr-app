@@ -4,7 +4,7 @@ Agents drive Herdr's browser blocks through the CEF host's CDP port. Ported from
 
 - `bin/herdr-browser <cmd> [tab] [key=value ...]`: the CLI; `bin/herdr-browser mcp` is an MCP stdio server with the same commands as `browser_*` tools. A tab is a browser block id.
 - `core.mjs`: the daemon the CLI starts. It reads `$HERDR_APP_HOME/browser/cdp.json` (`{ "port": N, "targets": { "<block id>": "<cdp target id>" } }`, written by `src/browser/agent.rs`), keeps one CDP connection per block (so console and network logs survive between calls) and serves `POST /_agent` on the port in `browser/agent.port`.
-- `agent.mjs`: the commands (snapshot with refs, click, type, fill, select_option, drag, scroll, wait, screenshot, console, network, eval, cdp, lock, tabs). Agents act only on blocks they opened, or ones the person allowed (`allow TAB on=true`).
+- `agent.mjs`: the commands (snapshot with refs, click, type, fill, select_option, drag, scroll, wait, screenshot, console, network, eval, cdp, lock, tabs). Agents act only on blocks they opened, or ones the person granted in the block (app-owned `browser/grants.json`; no agent command can grant). Raw `cdp` needs the person's `cdp` grant and an allowed method (`CDP_ALLOWED`). The daemon answers only callers with the 0600 `browser/agent.token` and refuses any request carrying an Origin.
 - `open` runs `herdr-app do browser.open`; set `HERDR_BROWSER_BACKEND=standin` to use a plain headless Chrome instead (tests).
 
 Test (headless, never a window, never the running app's home):

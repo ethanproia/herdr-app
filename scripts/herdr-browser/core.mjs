@@ -8,7 +8,8 @@
 // make targets over CDP HTTP and this daemon writes their ids into cdp.json itself.
 import { createServer } from "node:http";
 import { execFile } from "node:child_process";
-import { readFileSync, writeFileSync, renameSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, chmodSync } from "node:fs";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 import register from "./agent.mjs";
 import { browserDir } from "./dir.mjs";
@@ -112,8 +113,21 @@ register({
   route: (method, path, fn) => routes.set(`${method} ${path}`, fn),
 });
 
+// Only callers that can read <dir>/agent.token (0600, this user) may drive pages; a request with an Origin header
+// comes from a web page (a site probing localhost) and is refused whatever it carries.
+mkdirSync(dir, { recursive: true, mode: 0o700 });
+const token = randomBytes(32).toString("hex");
+writeFileSync(join(dir, "agent.token"), token, { mode: 0o600 });
+chmodSync(join(dir, "agent.token"), 0o600);
+const authorized = (req) => {
+  const got = Buffer.from(String(req.headers.authorization ?? "").replace(/^Bearer /, "")), want = Buffer.from(token);
+  return got.length === want.length && timingSafeEqual(got, want);
+};
+
 let last = Date.now();
 const server = createServer(async (req, res) => {
+  if (req.headers.origin !== undefined) { res.statusCode = 403; return res.end('{"ok":false,"error":"web pages may not call the browser agent"}'); }
+  if (!authorized(req)) { res.statusCode = 401; return res.end('{"ok":false,"error":"missing or wrong agent token"}'); }
   last = Date.now();
   let body = ""; for await (const c of req) body += c;
   const fn = routes.get(`${req.method} ${req.url}`);
@@ -122,7 +136,7 @@ const server = createServer(async (req, res) => {
   await fn(req, res, body);
 });
 server.listen(0, "127.0.0.1", () => writeFileSync(join(dir, "agent.port"), String(server.address().port)));
-const stop = () => { rmSync(join(dir, "agent.port"), { force: true }); process.exit(0); };
+const stop = () => { rmSync(join(dir, "agent.port"), { force: true }); rmSync(join(dir, "agent.token"), { force: true }); process.exit(0); };
 process.on("SIGTERM", stop); process.on("SIGINT", stop);
 // Leave when the host is gone or nobody has asked for 30 minutes.
 // (On the app, cdp.json appears with the first browser block, so a host never seen is not a host gone.)

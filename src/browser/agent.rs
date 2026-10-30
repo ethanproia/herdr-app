@@ -40,6 +40,7 @@ pub struct Agent {
     /// The find waiting on each browser (FindResult carries no request id).
     finds: HashMap<BrowserId, u64>,
     pub cdp: CdpFile,
+    pub grants: Grants,
 }
 
 fn arg<'a>(a: &'a Value, k: &str) -> Option<&'a str> {
@@ -52,7 +53,7 @@ fn flag(a: &Value, k: &str, default: bool) -> bool {
 
 impl Agent {
     pub fn new(dir: PathBuf) -> Self {
-        Self { cdp: CdpFile::new(dir), ..Default::default() }
+        Self { grants: Grants::new(dir.clone()), cdp: CdpFile::new(dir), ..Default::default() }
     }
 
     /// The browser a command acts on: `id`, else the block in `pane`, else the focused browser.
@@ -169,6 +170,7 @@ impl Agent {
     pub fn closed(&mut self, id: &BrowserId) {
         self.fail_all(Some(id), "the browser closed");
         self.cdp.remove(id);
+        self.grants.revoke_all(id);
     }
 
     fn fail_all(&mut self, id: Option<&BrowserId>, why: &str) {
@@ -234,12 +236,90 @@ impl CdpFile {
     }
 }
 
-fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+/// What the person lets agents do in one browser block. Only the block's own UI calls `Grants::set` (there is no
+/// `herdr-app do` command for it), so an agent cannot grant itself anything through the agent tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grant {
+    /// Drive a block the person opened (agents always drive the ones they opened).
+    Control,
+    /// Raw CDP on the block (still limited to the allowed methods in scripts/herdr-browser/agent.mjs).
+    Cdp,
+    /// Screenshots of a page the person marked sensitive.
+    Capture,
+}
+
+impl Grant {
+    fn key(self) -> &'static str {
+        match self {
+            Grant::Control => "control",
+            Grant::Cdp => "cdp",
+            Grant::Capture => "capture",
+        }
     }
+}
+
+/// `$HERDR_APP_HOME/browser/grants.json` = `{ "<block id>": { "control": bool, "cdp": bool, "capture": bool } }`,
+/// 0600, app-owned; the agent daemon reads it on every call.
+#[derive(Default)]
+pub struct Grants {
+    dir: PathBuf,
+    by_block: BTreeMap<BrowserId, BTreeMap<&'static str, bool>>,
+}
+
+impl Grants {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir, ..Default::default() }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.dir.join("grants.json")
+    }
+
+    pub fn get(&self, id: &BrowserId, grant: Grant) -> bool {
+        self.by_block.get(id).and_then(|g| g.get(grant.key())).copied().unwrap_or(false)
+    }
+
+    /// The person turned a grant on or off in the block.
+    pub fn set(&mut self, id: &BrowserId, grant: Grant, on: bool) {
+        self.by_block.entry(id.clone()).or_default().insert(grant.key(), on);
+        self.write();
+    }
+
+    pub fn revoke_all(&mut self, id: &BrowserId) {
+        if self.by_block.remove(id).is_some() {
+            self.write();
+        }
+    }
+
+    fn write(&self) {
+        let path = self.path();
+        if let Err(e) = write_atomic(&path, json!(self.by_block).to_string().as_bytes()) {
+            tracing::warn!("cannot write {}: {e}", path.display());
+        }
+    }
+}
+
+/// Writes owner-only (0600 file, 0700 dir): these files name the CDP port and what agents may do.
+fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        if let Some(dir) = path.parent() {
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        std::io::Write::write_all(&mut f, body)?;
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&tmp, body)?;
+    }
     std::fs::rename(tmp, path)
 }
 
@@ -453,12 +533,39 @@ mod tests {
     }
 
     #[test]
+    fn grants_are_app_owned_and_private() {
+        let (d, mut a) = agent();
+        let id: BrowserId = "b1".into();
+        assert!(!a.grants.get(&id, Grant::Control), "nothing is granted by default");
+        a.grants.set(&id, Grant::Control, true);
+        a.grants.set(&id, Grant::Cdp, false);
+        let path = d.path().join("browser/grants.json");
+        let read = || serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(read(), json!({ "b1": { "cdp": false, "control": true } }));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        a.closed(&id);
+        assert_eq!(read(), json!({}), "a closed block keeps no grants");
+        // No `herdr-app do` command can grant: the agent surface has none.
+        assert!(crate::commands::COMMANDS.iter().all(|c| !c.name.contains("allow") && !c.name.contains("grant")));
+    }
+
+    #[test]
     fn cdp_file_follows_the_host() {
         let (d, mut a) = agent();
         let path = d.path().join("browser/cdp.json");
         let read = || serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap();
         a.on_host(&HostToApp::Ready { version: 1, cef_version: "x".into(), cdp_port: Some(9333) });
         assert_eq!(read(), json!({ "port": 9333, "targets": {} }));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600, "cdp.json is owner-only");
+        }
         a.on_host(&HostToApp::CdpTarget { id: "b1".into(), target_id: "T1".into() });
         a.on_host(&HostToApp::CdpTarget { id: "b2".into(), target_id: "T2".into() });
         assert_eq!(read(), json!({ "port": 9333, "targets": { "b1": "T1", "b2": "T2" } }));
