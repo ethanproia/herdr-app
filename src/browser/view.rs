@@ -398,6 +398,7 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
         H::Crashed { id, .. } | H::Error { id, .. } => id.as_ref(),
         H::Frame { id, .. }
         | H::Title { id, .. }
+        | H::ContextMenu { id, .. }
         | H::Url { id, .. }
         | H::Loading { id, .. }
         | H::Cursor { id, .. }
