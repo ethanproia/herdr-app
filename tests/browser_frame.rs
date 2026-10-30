@@ -104,5 +104,24 @@ fn main() {
     shoot(&mut cx, "cleared", &[(30., 20., BLACK)]);
     assert!(!b.in_use(), "frame 2 released after clear");
     let _ = (&mut a, &mut b);
+    // Stats mode: a paint line per new frame, the host's coalesced seqs counted as dropped.
+    let home = std::env::temp_dir().join(format!("herdr-frame-stats-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    unsafe {
+        std::env::set_var("HERDR_APP_HOME", &home);
+        std::env::set_var("HERDR_BROWSER_STATS", "1");
+    }
+    let mut v = FrameView::new();
+    for seq in [1, 2, 5] {
+        v.on_frame(seq, ref_a.clone(), a.size(), 2.0).unwrap();
+        assert!(v.element().is_some());
+        assert!(v.element().is_some(), "a repaint of the same frame is not counted");
+    }
+    let log = std::fs::read_to_string(home.join("browser/stats.log")).unwrap();
+    let paints: Vec<_> = log.lines().filter(|l| l.contains(" paint ")).collect();
+    assert_eq!(paints.len(), 3, "{log}");
+    assert!(paints[2].contains("seq=5") && paints[2].ends_with("dropped=2"), "{log}");
+    let _ = std::fs::remove_dir_all(&home);
+    println!("stats: {} paint lines ok", paints.len());
     println!("browser frame test passed");
 }

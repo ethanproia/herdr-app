@@ -7,6 +7,11 @@
 //! Metal renderer keeps its CVMetalTextures until the GPU is done (HERDR: patch in
 //! vendor/gpui-pre-apple). No image cache is involved, so herdr issue 22 (image cache leak) does
 //! not apply here.
+//!
+//! Stats mode (`HERDR_BROWSER_STATS=1`, off by default): every view appends to
+//! `<app home>/browser/stats.log` one `paint` line per paint of a new frame (interval since the
+//! view's previous paint, frame arrival to paint latency, frames the host coalesced away before
+//! this one) and a `summary` line every 2 s (paints/s, p50/p95 interval, p95 latency, dropped).
 
 use gpui::{AnyElement, IntoElement, ObjectFit, Styled, surface};
 use herdr_browser_protocol::{PixelSize, Size, SurfaceRef};
@@ -43,6 +48,7 @@ mod cv {
 
 struct Frame {
     seq: u64,
+    arrived: std::time::Instant,
     size: PixelSize,
     scale: f32,
     #[cfg(target_os = "macos")]
@@ -56,11 +62,12 @@ pub struct FrameView {
     frame: Option<Frame>,
     pending_resize: Option<Size>,
     painted: Option<u64>,
+    stats: Option<Stats>,
 }
 
 impl FrameView {
     pub fn new() -> Self {
-        Self::default()
+        Self { stats: Stats::from_env(), ..Self::default() }
     }
 
     /// The element to put inside the block's bounds: the newest frame filling them (stretched
@@ -69,6 +76,9 @@ impl FrameView {
         #[cfg(target_os = "macos")]
         {
             let frame = self.frame.as_ref()?;
+            if let Some(stats) = &mut self.stats {
+                stats.painted(frame.seq, frame.arrived);
+            }
             self.painted = Some(frame.seq);
             Some(surface(frame.buffer.clone()).size_full().object_fit(ObjectFit::Fill).into_any_element())
         }
@@ -109,6 +119,7 @@ impl FrameSink for FrameView {
         let buffer = cv::wrap(&imported)?;
         self.frame = Some(Frame {
             seq,
+            arrived: std::time::Instant::now(),
             size,
             scale,
             #[cfg(target_os = "macos")]
@@ -127,5 +138,76 @@ impl FrameSink for FrameView {
 
     fn ack(&mut self) -> Option<u64> {
         self.painted.take()
+    }
+}
+
+/// Per-view paint statistics for `HERDR_BROWSER_STATS=1` (see the module docs).
+struct Stats {
+    view: u32,
+    out: std::fs::File,
+    start: std::time::Instant,
+    last_paint: Option<std::time::Instant>,
+    last_seq: u64,
+    window_start: std::time::Instant,
+    intervals: Vec<f64>,
+    latencies: Vec<f64>,
+    dropped: u64,
+}
+
+impl Stats {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn from_env() -> Option<Self> {
+        if std::env::var_os("HERDR_BROWSER_STATS").is_none_or(|v| v.is_empty() || v == "0") {
+            return None;
+        }
+        // Same lookup as `mods::app_dir` (this file is also built alone by tests/browser_frame.rs).
+        let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+        let home = env("HERDR_APP_HOME").or_else(|| Some(env("XDG_CONFIG_HOME").or_else(|| env("HOME").map(|h| h.join(".config")))?.join("herdr-app")))?;
+        let dir = home.join("browser");
+        std::fs::create_dir_all(&dir).ok()?;
+        let out = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("stats.log")).ok()?;
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+        let now = std::time::Instant::now();
+        let mut s = Stats { view: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), out, start: now, last_paint: None, last_seq: 0, window_start: now, intervals: Vec::new(), latencies: Vec::new(), dropped: 0 };
+        s.line(format_args!("start pid={}", std::process::id()));
+        Some(s)
+    }
+
+    fn line(&mut self, what: std::fmt::Arguments) {
+        use std::io::Write;
+        let _ = writeln!(self.out, "{:.1} view={} {what}", self.start.elapsed().as_secs_f64() * 1e3, self.view);
+    }
+
+    /// A paint of frame `seq` (counted once per seq; repaints of the same frame are ignored).
+    fn painted(&mut self, seq: u64, arrived: std::time::Instant) {
+        if seq == self.last_seq {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let dropped = if self.last_seq == 0 { 0 } else { seq.saturating_sub(self.last_seq + 1) };
+        let interval = self.last_paint.map(|t| (now - t).as_secs_f64() * 1e3);
+        let latency = (now - arrived).as_secs_f64() * 1e3;
+        self.line(format_args!("paint seq={seq} interval_ms={} latency_ms={latency:.2} dropped={dropped}", interval.map_or("-".into(), |i| format!("{i:.2}"))));
+        if let Some(i) = interval {
+            self.intervals.push(i);
+        }
+        self.latencies.push(latency);
+        self.dropped += dropped;
+        self.last_seq = seq;
+        self.last_paint = Some(now);
+        let span = now - self.window_start;
+        if span >= Self::WINDOW {
+            let pct = |v: &mut Vec<f64>, p: f64| {
+                v.sort_by(f64::total_cmp);
+                v.get(((v.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(0.0)
+            };
+            let fps = self.latencies.len() as f64 / span.as_secs_f64();
+            let (mut iv, mut lat) = (std::mem::take(&mut self.intervals), std::mem::take(&mut self.latencies));
+            let (p50, p95, l95) = (pct(&mut iv, 0.5), pct(&mut iv, 0.95), pct(&mut lat, 0.95));
+            let dropped = std::mem::take(&mut self.dropped);
+            self.line(format_args!("summary paints_per_s={fps:.1} interval_p50_ms={p50:.2} interval_p95_ms={p95:.2} latency_p95_ms={l95:.2} dropped={dropped}"));
+            self.window_start = now;
+        }
     }
 }
