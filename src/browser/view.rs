@@ -7,13 +7,14 @@
 //! `BrowserState`, sizes the page to the block, hands frames to a `FrameSink` and shows a reload
 //! card after a crash. `Browsers` keeps one view per browser block in the layouts.
 use super::agent::{Agent, Focus, Reply, Step};
+use super::geometry::{Change, Epoch, Geometry, HoverSend, OverlayAnswer, OverlayState, Pt, Rect, zoom_factor};
 use super::input::{self, BrowserInput};
 use super::{BrowserRegistry, BrowserState, FrameSink, FrameView, HostLink};
 use crate::layout::BrowserBlock;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_base::input::{Input, InputEvent, InputState};
-use herdr_browser_protocol::{self as protocol, AppToHost, BrowserId, HostToApp, PixelSize, Size as Dips};
+use herdr_browser_protocol::{self as protocol, OverlayQuery, AppToHost, BrowserId, HostToApp, PixelSize, Size as Dips};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -482,6 +483,10 @@ pub struct BrowserView {
     _focus: [Subscription; 2],
     _address: Subscription,
     probe: Option<FrameProbe>,
+    /// Page overlays (highlight, pick, find matches): epochs and hover coalescing (geometry.rs).
+    overlay: OverlayState,
+    /// Chrome zoom level the page reported (`Viewport`).
+    zoom_level: f64,
 }
 
 /// What a frame probe hears (`BrowserView::set_frame_probe`). `Painted` comes with every draw
@@ -557,6 +562,8 @@ impl BrowserView {
             _focus: [on, off],
             _address: typed,
             probe: None,
+            overlay: OverlayState::default(),
+            zoom_level: 0.0,
         }
     }
 
@@ -610,6 +617,7 @@ impl BrowserView {
         use HostToApp as H;
         match msg {
             H::Url { url, .. } => {
+                self.overlay.changed(Change::Navigate);
                 if url != self.state.url {
                     self.state.url = url.clone();
                     self.block.url = url.clone();
@@ -653,6 +661,23 @@ impl BrowserView {
                 self.console.push_back(message);
                 return;
             }
+            H::Viewport { zoom_level, .. } => {
+                let why = if zoom_level != self.zoom_level { Change::Zoom } else { Change::Scroll };
+                self.zoom_level = zoom_level;
+                self.overlay.changed(why);
+                self.send_waiting_hover();
+            }
+            H::OverlayRects { req, epoch, rects, frames, .. } => {
+                let answer = OverlayAnswer {
+                    req,
+                    epoch: Epoch(epoch),
+                    rects: rects.iter().map(|r| Rect::new(r.x, r.y, r.w, r.h)).collect(),
+                    frames: frames.iter().map(|p| Pt { x: p.x, y: p.y }).collect(),
+                };
+                let geo = self.geometry();
+                self.overlay.answer(&answer, &geo);
+                self.send_waiting_hover();
+            }
             H::NewWindow { url, .. } => {
                 cx.emit(BrowserEvent::NewWindow(url));
                 return;
@@ -683,6 +708,7 @@ impl BrowserView {
             Some((s, k)) if (s.w - size.w).abs() < 0.5 && (s.h - size.h).abs() < 0.5 && k == scale => return,
             Some(_) => {
                 self.frames.on_resize_pending(size);
+                self.overlay.changed(Change::Resize);
                 self.link.send(AppToHost::Resize { id: self.id.clone(), size, scale });
             }
         }
@@ -715,6 +741,44 @@ impl BrowserView {
                 p(&FrameEvent::Acked { seq });
             }
         }
+    }
+
+    /// The page's geometry, with the page area's top-left as the origin (overlays draw inside it).
+    pub fn geometry(&self) -> Geometry {
+        let ((w, h), scale) = self.sized.map_or(((0.0, 0.0), 1.0), |(s, k)| ((s.w, s.h), k));
+        Geometry { zoom: zoom_factor(self.zoom_level), origin: Pt::default(), scale, size: Pt { x: w, y: h } }
+    }
+
+    /// Ask the page for overlay rects (a selector, the selection); they show when the answer is current.
+    /// Returns the request id and epoch it was sent with.
+    pub fn request_overlay(&mut self, query: OverlayQuery) -> (u64, u64) {
+        let (req, epoch) = self.overlay.request();
+        self.link.send(AppToHost::Overlay { id: self.id.clone(), req, epoch: epoch.0, query });
+        (req, epoch.0)
+    }
+
+    /// The pointer is over the page at `at` (page DIPs): a coalesced hit test for a highlight.
+    pub fn hover_overlay(&mut self, at: Pt) {
+        let css = self.geometry().page_to_viewport(at);
+        if let HoverSend::Now { req, epoch, at } = self.overlay.hover(css) {
+            self.link.send(AppToHost::Overlay { id: self.id.clone(), req, epoch: epoch.0, query: OverlayQuery::HitTest { x: at.x, y: at.y } });
+        }
+    }
+
+    fn send_waiting_hover(&mut self) {
+        if let Some(HoverSend::Now { req, epoch, at }) = self.overlay.next_hover() {
+            self.link.send(AppToHost::Overlay { id: self.id.clone(), req, epoch: epoch.0, query: OverlayQuery::HitTest { x: at.x, y: at.y } });
+        }
+    }
+
+    /// Overlay rects to draw now, in page DIPs (empty while stale).
+    pub fn overlay_rects(&self) -> &[Rect] {
+        self.overlay.shown()
+    }
+
+    /// The page zoom level (Chrome's: 0 is 100 %).
+    pub fn zoom_level(&self) -> f64 {
+        self.zoom_level
     }
 
     /// Tests and the parity harness: hear each frame arrive, paint and get acked.
@@ -868,6 +932,10 @@ impl Render for BrowserView {
                     ),
             ),
         };
+        // Current overlay rects (stale ones are already gone), outlined over the frame.
+        let page = page.children(self.overlay.shown().iter().map(|r| {
+            div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_2().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.15))
+        }));
         div()
             .size_full()
             .flex()
