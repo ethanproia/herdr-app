@@ -9,11 +9,12 @@
 //! `$HERDR_APP_HOME/browser/cdp.json` = `{ "port": N, "targets": { "<block id>": "<cdp target id>" } }`
 //! tells agents (scripts/herdr-browser) where the host's CDP port is and which target is which block.
 
-use super::BrowserRegistry;
+use super::{BrowserRegistry, HostLink};
 use herdr_browser_protocol::{AppToHost, BrowserId, HostToApp};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Answers one `herdr-app do` call; called once.
 pub type Reply = Box<dyn FnOnce(Result<Value, String>) + Send>;
@@ -33,6 +34,9 @@ pub enum Step {
     /// `browser.open`: the window makes a browser block (at `place`, default a new tab) and answers with its id.
     /// `profile` defaults to "agent": a browser an agent opens never shares the person's cookies or logins.
     Open { url: Option<String>, place: Option<String>, profile: String, reply: Reply },
+    /// `browser.pick`: the window puts block `id` in pick mode; the reply waits (parked in the agent) for the
+    /// person's click, which the view reports through `Agent::picked`.
+    Pick { id: BrowserId },
     /// `browser.lock`: the window grants `agent` the block's input lease (the person's input is refused with a
     /// visible cue), or ends it (`agent` None).
     Lease { id: BrowserId, agent: Option<String>, reply: Reply },
@@ -48,6 +52,8 @@ pub struct Agent {
     /// A reply counts only for a request parked in this generation, for its browser and operation.
     generation: u64,
     ready: bool,
+    /// Replies waiting for the person to pick an element in each browser.
+    pick_waiters: HashMap<BrowserId, Vec<Reply>>,
     /// The find waiting on each browser (FindResult carries no request id).
     finds: HashMap<BrowserId, u64>,
     pub cdp: CdpFile,
@@ -107,6 +113,16 @@ impl Agent {
         };
         if name == "browser.close" {
             return Step::Close { id, reply };
+        }
+        if name == "browser.pick" {
+            self.pick_waiters.entry(id.clone()).or_default().push(reply);
+            // With x and y the agent names the point itself (no person, no pick mode): the same capture.
+            let at = |k| a.get(k).and_then(Value::as_f64);
+            if let (Some(x), Some(y)) = (at("x"), at("y")) {
+                self.picked(&id, x as f32, y as f32, reg.link());
+                return Step::Done;
+            }
+            return Step::Pick { id };
         }
         if name == "browser.lock" {
             let agent = flag(a, "on", true).then(|| arg(a, "agent").unwrap_or("an agent").to_string());
@@ -219,6 +235,23 @@ impl Agent {
         }
     }
 
+    /// The person clicked (x, y) page DIPs in pick mode. The element's facts (an eval) and a picture of the page (a
+    /// host screenshot) are asked for at once; when both are in, the picture is cropped to the element and every
+    /// waiting `browser.pick` gets the capture. Secret field values never appear; the capture is labelled untrusted.
+    pub fn picked(&mut self, id: &BrowserId, x: f32, y: f32, link: &dyn HostLink) {
+        let Some(waiters) = self.pick_waiters.remove(id) else { return };
+        let dir = self.cdp.dir.join("picks");
+        let _ = std::fs::create_dir_all(&dir);
+        let stem = dir.join(format!("{id}-{}", now_ms()));
+        let (page, crop) = (stem.with_extension("page.png"), stem.with_extension("png"));
+        let job = Arc::new(Mutex::new(PickJob { facts: None, shot: None, waiters, page: page.clone(), crop }));
+        let on_facts = job.clone();
+        let req = self.park(id, Op::Eval, Box::new(move |r| PickJob::step(&on_facts, |j| j.facts = Some(r))));
+        link.send(AppToHost::Eval { id: id.clone(), req, expr: pick_js(x, y) });
+        let req = self.park(id, Op::Screenshot, Box::new(move |r| PickJob::step(&job, |j| j.shot = Some(r.map(|_| ())))));
+        link.send(AppToHost::Screenshot { id: id.clone(), req, path: page.to_string_lossy().into_owned() });
+    }
+
     /// A browser block closed: fail what waits on it and drop it from cdp.json.
     pub fn closed(&mut self, id: &BrowserId) {
         self.fail_all(Some(id), "the browser closed");
@@ -227,6 +260,12 @@ impl Agent {
     }
 
     fn fail_all(&mut self, id: Option<&BrowserId>, why: &str) {
+        let gone: Vec<BrowserId> = self.pick_waiters.keys().filter(|b| id.is_none_or(|id| *b == id)).cloned().collect();
+        for b in gone {
+            for reply in self.pick_waiters.remove(&b).unwrap_or_default() {
+                reply(Err(why.into()));
+            }
+        }
         let reqs: Vec<u64> = self.pending.iter().filter(|(_, p)| id.is_none_or(|id| &p.id == id)).map(|(r, _)| *r).collect();
         for req in reqs {
             self.settle(req, Err(why.into()));
@@ -238,6 +277,89 @@ impl Agent {
         self.fail_all(None, why);
         self.generation += 1;
     }
+}
+
+/// One pick in flight: the element's facts and the page picture arrive separately.
+struct PickJob {
+    facts: Option<Result<Value, String>>,
+    shot: Option<Result<(), String>>,
+    waiters: Vec<Reply>,
+    page: PathBuf,
+    crop: PathBuf,
+}
+
+impl PickJob {
+    fn step(job: &Arc<Mutex<PickJob>>, set: impl FnOnce(&mut PickJob)) {
+        let mut j = job.lock().unwrap();
+        set(&mut j);
+        if j.facts.is_none() || j.shot.is_none() {
+            return;
+        }
+        let (Some(facts), Some(shot)) = (j.facts.take(), j.shot.take()) else { return };
+        let r = facts.and_then(|f| {
+            let mut f = f.get("value").cloned().unwrap_or(Value::Null);
+            if f.get("missing").is_some() {
+                return Err("nothing was picked at that point".into());
+            }
+            // The crop is a convenience: the facts stand without it.
+            let crop = shot.and_then(|_| crop_png(&j.page, &j.crop, &f).map_err(|e| e.to_string()));
+            let _ = std::fs::remove_file(&j.page);
+            f["screenshot"] = match crop {
+                Ok(()) => json!(j.crop.to_string_lossy()),
+                Err(e) => json!({ "error": e }),
+            };
+            f["untrusted"] = json!(["selector", "html", "text", "styles"]);
+            Ok(f)
+        });
+        for reply in j.waiters.drain(..) {
+            reply(r.clone());
+        }
+    }
+}
+
+/// Cuts the element's box (CSS px of the viewport, times devicePixelRatio) out of the page picture.
+fn crop_png(page: &Path, out: &Path, facts: &Value) -> anyhow::Result<()> {
+    let n = |k: &str| facts["box"][k].as_f64().unwrap_or(0.0);
+    let dpr = facts["dpr"].as_f64().unwrap_or(1.0);
+    let img = image::open(page)?;
+    let (w, h) = (img.width() as f64, img.height() as f64);
+    let x0 = (n("x") * dpr).clamp(0.0, w);
+    let y0 = (n("y") * dpr).clamp(0.0, h);
+    let x1 = ((n("x") + n("width")) * dpr).clamp(0.0, w);
+    let y1 = ((n("y") + n("height")) * dpr).clamp(0.0, h);
+    anyhow::ensure!(x1 - x0 >= 1.0 && y1 - y0 >= 1.0, "the element is outside the visible page");
+    img.crop_imm(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32).save(out)?;
+    Ok(())
+}
+
+/// The element at (x, y): a selector, its trimmed outerHTML (secret field values removed), box, text and key styles.
+fn pick_js(x: f32, y: f32) -> String {
+    format!(
+        r##"(() => {{
+  const e = document.elementFromPoint({x}, {y});
+  if (!e) return {{ missing: true }};
+  const secret = (c) => c.tagName === "INPUT" && (c.type === "password" || /cc-|password|one-time-code/i.test(c.autocomplete || "")
+    || /pass|secret|token|otp|cvv|cvc|ssn|card/i.test((c.name || "") + " " + (c.id || "")));
+  const sel = (n) => {{
+    const path = [];
+    for (; n && n.nodeType === 1 && n !== document.documentElement; n = n.parentElement) {{
+      if (n.id) {{ path.unshift("#" + CSS.escape(n.id)); break; }}
+      const same = [...(n.parentElement?.children ?? [])].filter((c) => c.tagName === n.tagName);
+      path.unshift(n.tagName.toLowerCase() + (same.length > 1 ? `:nth-of-type(${{same.indexOf(n) + 1}})` : ""));
+    }}
+    return path.join(" > ");
+  }};
+  const copy = e.cloneNode(true);
+  for (const c of [copy, ...copy.querySelectorAll("input")]) if (secret(c)) c.removeAttribute("value");
+  const html = copy.outerHTML.replace(/\s+/g, " ");
+  const r = e.getBoundingClientRect(), cs = getComputedStyle(e);
+  const styles = Object.fromEntries(["display", "position", "color", "background-color", "font-family", "font-size", "font-weight",
+    "line-height", "margin", "padding", "border", "border-radius", "width", "height"].map((k) => [k, cs.getPropertyValue(k)]));
+  return {{ selector: sel(e), tag: e.tagName.toLowerCase(), html: html.length > 2000 ? html.slice(0, 2000) + "…" : html,
+    text: secret(e) ? "" : (e.innerText || "").replace(/\s+/g, " ").trim().slice(0, 300),
+    box: {{ x: r.x, y: r.y, width: r.width, height: r.height }}, styles, dpr: devicePixelRatio }};
+}})()"##
+    )
 }
 
 fn now_ms() -> u128 {
@@ -628,6 +750,40 @@ mod tests {
         a.on_host(&HostToApp::EvalResult { id: "b1".into(), req: 99, ok: true, value: json!("stale") });
         assert!(a.pending.contains_key(&99));
         let _ = req;
+    }
+
+    /// A5: the person's pick reaches the waiting agent with the element's facts and a picture cropped to it.
+    #[test]
+    fn pick_waits_for_the_person_then_answers_with_a_cropped_capture() {
+        let (_d, mut a) = agent();
+        let reg = reg();
+        let pane = |_: &str| None;
+        let (got, reply) = catch();
+        assert!(matches!(a.run("browser.pick", &json!({}), &reg, &Focus { focused: Some("b1".into()), block_of_pane: &pane }, reply), Step::Pick { id } if id == "b1"));
+        a.picked(&"b1".into(), 30.0, 20.0, &reg.link);
+        let msgs = sent(&reg);
+        let (AppToHost::Eval { req: er, expr, .. }, AppToHost::Screenshot { req: sr, path, .. }) = (&msgs[0], &msgs[1]) else { panic!("{msgs:?}") };
+        assert!(expr.contains("elementFromPoint(30, 20)") && expr.contains("removeAttribute(\"value\")"));
+        // The host draws the page (200x100 px at 2x): red where the element is, white elsewhere.
+        let mut img = image::RgbImage::from_pixel(200, 100, image::Rgb([255, 255, 255]));
+        for x in 20..60 {
+            for y in 10..30 {
+                img.put_pixel(x, y, image::Rgb([255, 0, 0]));
+            }
+        }
+        img.save(path).unwrap();
+        a.on_host(&HostToApp::ScreenshotDone { id: "b1".into(), req: *sr, ok: true, error: None });
+        assert!(got.lock().unwrap().is_none(), "waits for both halves");
+        let facts = json!({ "selector": "#go", "html": "<button id=\"go\">Greet</button>", "box": { "x": 10, "y": 5, "width": 20, "height": 10 }, "dpr": 2, "styles": {}, "text": "Greet" });
+        a.on_host(&HostToApp::EvalResult { id: "b1".into(), req: *er, ok: true, value: facts });
+        let r = got.lock().unwrap().take().unwrap().unwrap();
+        assert_eq!(r["selector"], "#go");
+        assert!(r["untrusted"].as_array().unwrap().contains(&json!("html")));
+        let crop = image::open(r["screenshot"].as_str().unwrap()).unwrap().to_rgb8();
+        assert_eq!((crop.width(), crop.height()), (40, 20), "the box times devicePixelRatio");
+        assert!(crop.pixels().all(|p| p.0 == [255, 0, 0]), "exactly the element");
+        assert!(!Path::new(path).exists(), "the whole-page picture is not kept");
+        assert!(a.pick_waiters.is_empty() && a.pending.is_empty());
     }
 
     #[test]

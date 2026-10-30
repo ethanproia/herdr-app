@@ -405,6 +405,7 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
         | H::Title { id, .. }
         | H::ContextMenu { id, .. }
         | H::StylesResult { id, .. }
+        | H::PickInfoResult { id, .. }
         | H::Url { id, .. }
         | H::Loading { id, .. }
         | H::Cursor { id, .. }
@@ -1733,6 +1734,14 @@ impl Browsers {
         }
         let focus = Focus { focused: self.focused.clone().filter(|f| self.views.contains_key(f)), block_of_pane };
         agent.lock().unwrap().run(name, args, self, &focus, reply)
+    }
+
+    // HERDR: browser block (part 5). The person picked an element: the agent captures it for `browser.pick`.
+    pub fn picked(&mut self, id: &str, x: f32, y: f32) {
+        let link = self.link_arc();
+        if let Some(agent) = &self.agent {
+            agent.lock().unwrap().picked(&id.to_owned(), x, y, &*link);
+        }
     }
 
     /// Match the views to `blocks` (every browser block in every layout, as id and block):
