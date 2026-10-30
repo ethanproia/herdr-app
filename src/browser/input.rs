@@ -7,6 +7,10 @@
 //!   the entity as the window's text input handler (IME), the same way the terminal does;
 //! - host events: `set_focused` on focus change, `on_caret` for `ImeCaret`, `cursor_style` for `Cursor`.
 //!
+//! Who gets input is decided here, in one place (`Owner`): the page (browse), the pick overlay,
+//! a comment field, the markup canvas, or nobody while an agent holds the lease. Esc, Space and
+//! undo route by owner. See docs/browser-input-owner.md.
+//!
 //! Herdr keys still win: GPUI matches keybindings before any `on_key_down` listener runs, so a key
 //! bound in keys.json (global, layout or a future `browser` section) is never seen here.
 //! Printable keys send `Key` down and let the event continue, so the platform's text input
@@ -21,6 +25,83 @@ use gpui::{
 };
 use std::ops::Range;
 use std::sync::Arc;
+
+/// Who receives the user's input for this block. The owners form a stack: Esc pops one layer,
+/// `Browse` is the floor, and an agent lease sits on top until it ends or the user takes control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    /// The page gets everything (forwarded to the host as `AppToHost::Input`).
+    Browse,
+    /// Element pick: pointer events go to the pick overlay, never to the page. Space held passes
+    /// the pointer to the page (Space-to-browse); the wheel still scrolls the page.
+    Pick,
+    /// A comment field: keys, text and IME go to the field; nothing reaches the page.
+    Comment,
+    /// Markup on a screenshot: pointer events draw; undo and redo undo strokes.
+    Markup,
+    /// An agent drives the page; the user's input is refused (with a cue) until Take Control.
+    Agent,
+}
+
+/// What the overlay owners receive; their slices (pick, markup, comment UI) draw from it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OverlayEvent {
+    Pointer { owner: Owner, kind: MouseKind, x: f32, y: f32, shift: bool },
+    /// An edit chord (undo, redo, copy, ...) for an owner other than the page.
+    Edit { owner: Owner, command: EditCommand },
+    /// User input arrived while an agent holds the lease: the view shows its Take Control cue.
+    Refused,
+    /// The owner changed (the view re-renders its mode chrome).
+    Owner(Owner),
+}
+
+/// The comment field's text: committed text, an open IME composition and undo history.
+/// It lives here so a composition can never leak between the field and the page.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CommentField {
+    pub text: String,
+    pub marked: Option<String>,
+    undo: Vec<String>,
+    redo: Vec<String>,
+}
+
+impl CommentField {
+    fn commit(&mut self, text: &str) {
+        self.marked = None;
+        if text.is_empty() {
+            return;
+        }
+        self.undo.push(self.text.clone());
+        self.redo.clear();
+        self.text.push_str(text);
+    }
+
+    fn backspace(&mut self) {
+        if !self.text.is_empty() {
+            self.undo.push(self.text.clone());
+            self.redo.clear();
+            self.text.pop();
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo.pop() {
+            self.redo.push(std::mem::replace(&mut self.text, prev));
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo.pop() {
+            self.undo.push(std::mem::replace(&mut self.text, next));
+        }
+    }
+}
+
+enum Route {
+    Page,
+    Overlay(Owner),
+    Refused,
+}
 
 /// One browser block's input state: what is held, where the block is, the IME composition.
 pub struct BrowserInput {
@@ -38,11 +119,18 @@ pub struct BrowserInput {
     marked: Option<String>,
     /// The page's caret from `ImeCaret`, in DIPs from the block's top-left.
     caret: Option<Bounds<Pixels>>,
+    /// The owner stack; the last entry owns input. Never empty: `Browse` is the floor.
+    owners: Vec<Owner>,
+    /// The agent holding the lease, if any (its `Owner::Agent` is on top of the stack).
+    lease: Option<String>,
+    space_held: bool,
+    comment: CommentField,
+    overlay: Vec<OverlayEvent>,
 }
 
 impl BrowserInput {
     pub fn new(id: BrowserId, link: Arc<dyn HostLink>) -> Self {
-        Self { id, link, origin: Point::default(), focused: false, caps_lock: false, held_keys: Vec::new(), held_buttons: Vec::new(), last_pos: (0.0, 0.0), marked: None, caret: None }
+        Self { id, link, origin: Point::default(), focused: false, caps_lock: false, held_keys: Vec::new(), held_buttons: Vec::new(), last_pos: (0.0, 0.0), marked: None, caret: None, owners: vec![Owner::Browse], lease: None, space_held: false, comment: CommentField::default(), overlay: Vec::new() }
     }
 
     fn send(&self, event: InputEvent) {
@@ -57,6 +145,118 @@ impl BrowserInput {
         protocol::Modifiers { shift: m.shift, control: m.control, alt: m.alt, platform: m.platform, caps_lock: self.caps_lock }
     }
 
+    pub fn owner(&self) -> Owner {
+        *self.owners.last().unwrap_or(&Owner::Browse)
+    }
+
+    /// The agent holding the lease, for the Take Control strip.
+    pub fn lease(&self) -> Option<&str> {
+        self.lease.as_deref()
+    }
+
+    pub fn comment(&self) -> &CommentField {
+        &self.comment
+    }
+
+    /// Everything the overlay owners were sent since the last call.
+    pub fn take_overlay(&mut self) -> Vec<OverlayEvent> {
+        std::mem::take(&mut self.overlay)
+    }
+
+    /// Opens a mode on top of the current one. Allowed: Browse -> Pick or Markup; Pick or
+    /// Markup -> Comment; Pick <-> Markup. Refused while an agent holds the lease.
+    pub fn enter(&mut self, owner: Owner) -> bool {
+        let from = self.owner();
+        let ok = match (from, owner) {
+            (Owner::Agent, _) => {
+                self.overlay.push(OverlayEvent::Refused);
+                return false;
+            }
+            (Owner::Browse, Owner::Pick | Owner::Markup) | (Owner::Pick | Owner::Markup, Owner::Comment) => true,
+            (Owner::Pick, Owner::Markup) | (Owner::Markup, Owner::Pick) => {
+                self.owners.pop();
+                true
+            }
+            _ => false,
+        };
+        if ok {
+            self.leave(from);
+            self.owners.push(owner);
+            self.overlay.push(OverlayEvent::Owner(owner));
+        }
+        ok
+    }
+
+    /// Esc: the top layer closes (a comment back to pick, pick back to browse). In browse the page
+    /// gets Esc; under a lease nothing changes. Returns false when Esc belongs to the page.
+    pub fn escape(&mut self) -> bool {
+        match self.owner() {
+            Owner::Browse => false,
+            Owner::Agent => {
+                self.overlay.push(OverlayEvent::Refused);
+                true
+            }
+            top => {
+                self.leave(top);
+                self.owners.pop();
+                self.overlay.push(OverlayEvent::Owner(self.owner()));
+                true
+            }
+        }
+    }
+
+    /// An agent takes the page: the user's held keys, buttons and compositions are released first.
+    pub fn grant_lease(&mut self, agent: &str) {
+        if self.owner() != Owner::Agent {
+            let from = self.owner();
+            self.leave(from);
+            self.owners.push(Owner::Agent);
+            self.overlay.push(OverlayEvent::Owner(Owner::Agent));
+        }
+        self.lease = Some(agent.to_owned());
+    }
+
+    /// Take Control (the user) or the agent finishing: the layer under the lease owns input again.
+    pub fn end_lease(&mut self) {
+        if self.lease.take().is_some() {
+            self.owners.retain(|o| *o != Owner::Agent);
+            self.overlay.push(OverlayEvent::Owner(self.owner()));
+        }
+    }
+
+    /// Leaving an owner drops what it was holding, so nothing it started reaches the next one.
+    fn leave(&mut self, from: Owner) {
+        match from {
+            Owner::Browse => self.release_all(),
+            Owner::Comment => self.comment.marked = None,
+            _ => {}
+        }
+        if self.space_held {
+            self.space_held = false;
+            self.release_all();
+        }
+    }
+
+    fn pointer_route(&self) -> Route {
+        match self.owner() {
+            Owner::Browse => Route::Page,
+            Owner::Agent => Route::Refused,
+            Owner::Pick | Owner::Markup if self.space_held => Route::Page,
+            o => Route::Overlay(o),
+        }
+    }
+
+    /// Sends a pointer event to its owner; true when it went to the page.
+    fn pointer(&mut self, kind: MouseKind, x: f32, y: f32, shift: bool) -> bool {
+        match self.pointer_route() {
+            Route::Page => return true,
+            Route::Overlay(owner) => self.overlay.push(OverlayEvent::Pointer { owner, kind, x, y, shift }),
+            Route::Refused if matches!(kind, MouseKind::Down) => self.overlay.push(OverlayEvent::Refused),
+            Route::Refused => {}
+        }
+        false
+    }
+
     pub fn set_origin(&mut self, origin: Point<Pixels>) {
         self.origin = origin;
     }
@@ -69,7 +269,9 @@ impl BrowserInput {
         }
         self.focused = focused;
         if !focused {
+            self.space_held = false;
             self.release_all();
+            self.comment.marked = None;
         }
         self.link.send(AppToHost::Focus { id: self.id.clone(), focused });
     }
@@ -104,6 +306,9 @@ impl BrowserInput {
             });
             return;
         }
+        if !self.pointer(MouseKind::Down, x, y, ev.modifiers.shift) {
+            return;
+        }
         let button = button(ev.button);
         if !self.held_buttons.contains(&button) {
             self.held_buttons.push(button);
@@ -118,6 +323,11 @@ impl BrowserInput {
         let (x, y) = self.local(ev.position);
         self.last_pos = (x, y);
         let button = button(ev.button);
+        // An up for a press the page saw always reaches it, whoever owns input now.
+        let page_saw_down = self.held_buttons.contains(&button);
+        if !self.pointer(MouseKind::Up, x, y, ev.modifiers.shift) && !page_saw_down {
+            return;
+        }
         self.held_buttons.retain(|b| *b != button);
         self.send(InputEvent::Mouse { kind: MouseKind::Up, x, y, button, clicks: clicks(ev.click_count), mods: self.mods(&ev.modifiers) });
     }
@@ -126,12 +336,18 @@ impl BrowserInput {
     pub fn mouse_move(&mut self, ev: &MouseMoveEvent) {
         let (x, y) = self.local(ev.position);
         self.last_pos = (x, y);
+        if !self.pointer(MouseKind::Move, x, y, ev.modifiers.shift) {
+            return;
+        }
         let button = ev.pressed_button.filter(|b| !matches!(b, MouseButton::Navigate(_))).map_or(protocol::MouseButton::None, button);
         self.send(InputEvent::Mouse { kind: MouseKind::Move, x, y, button, clicks: 0, mods: self.mods(&ev.modifiers) });
     }
 
     pub fn mouse_exit(&mut self, ev: &MouseExitEvent) {
         let (x, y) = self.local(ev.position);
+        if !self.pointer(MouseKind::Leave, x, y, false) {
+            return;
+        }
         self.send(InputEvent::Mouse { kind: MouseKind::Leave, x, y, button: protocol::MouseButton::None, clicks: 0, mods: self.mods(&ev.modifiers) });
     }
 
@@ -145,6 +361,13 @@ impl BrowserInput {
         if dx == 0.0 && dy == 0.0 {
             return;
         }
+        // The wheel scrolls the page while picking too; markup draws on a still picture.
+        match self.owner() {
+            Owner::Browse | Owner::Pick => {}
+            Owner::Markup if self.space_held => {}
+            Owner::Agent => return self.overlay.push(OverlayEvent::Refused),
+            _ => return,
+        }
         self.send(InputEvent::Wheel { x, y, dx, dy, precise, mods: self.mods(&ev.modifiers) });
     }
 
@@ -156,6 +379,14 @@ impl BrowserInput {
     /// false so the platform text input sends their characters to `replace_text_in_range`.
     pub fn key_down(&mut self, ev: &KeyDownEvent) -> bool {
         let k = &ev.keystroke;
+        match self.owner() {
+            Owner::Browse => {}
+            Owner::Agent => {
+                self.overlay.push(OverlayEvent::Refused);
+                return true;
+            }
+            owner => return self.overlay_key(owner, ev),
+        }
         // While composing, the IME owns the keys; GPUI hands its results to the input handler.
         if self.marked.is_some() {
             return false;
@@ -175,12 +406,56 @@ impl BrowserInput {
 
     pub fn key_up(&mut self, ev: &KeyUpEvent) {
         let k = &ev.keystroke;
+        if k.key == "space" && self.space_held {
+            self.space_held = false;
+            // Buttons the page got while Space was held are released with it.
+            let mods = protocol::Modifiers { caps_lock: self.caps_lock, ..Default::default() };
+            let (x, y) = self.last_pos;
+            for button in std::mem::take(&mut self.held_buttons) {
+                self.send(InputEvent::Mouse { kind: MouseKind::Up, x, y, button, clicks: 1, mods });
+            }
+            return;
+        }
         let (key, code, native) = dom_key(k);
         let was_held = self.held_keys.len();
         self.held_keys.retain(|(_, c, _)| *c != code);
         // A key-up for a key the page never saw down (pressed elsewhere, or eaten by a binding) stays here.
         if self.held_keys.len() != was_held {
             self.send(InputEvent::Key { kind: KeyKind::Up, key, code, native, repeat: false, mods: self.mods(&k.modifiers) });
+        }
+    }
+
+    /// Keys while an overlay owns input: Esc closes the layer, Space (pick, markup) passes the
+    /// pointer to the page, edit chords go to the owner; the comment field takes text and Backspace.
+    /// Nothing reaches the page. Returns whether to stop propagation (false lets text input run).
+    fn overlay_key(&mut self, owner: Owner, ev: &KeyDownEvent) -> bool {
+        let k = &ev.keystroke;
+        if owner == Owner::Comment && self.comment.marked.is_some() {
+            return false;
+        }
+        if k.key == "escape" && !k.modifiers.modified() {
+            self.escape();
+            return true;
+        }
+        if let Some(command) = edit_command(k) {
+            match (owner, command) {
+                (Owner::Comment, EditCommand::Undo) => self.comment.undo(),
+                (Owner::Comment, EditCommand::Redo) => self.comment.redo(),
+                _ => self.overlay.push(OverlayEvent::Edit { owner, command }),
+            }
+            return true;
+        }
+        match owner {
+            Owner::Pick | Owner::Markup if k.key == "space" && !k.modifiers.modified() => {
+                self.space_held = true;
+                true
+            }
+            Owner::Comment if k.key == "backspace" => {
+                self.comment.backspace();
+                true
+            }
+            Owner::Comment => !types_text(k),
+            _ => true,
         }
     }
 }
@@ -366,33 +641,53 @@ fn utf16_len(s: &str) -> usize {
     s.encode_utf16().count()
 }
 
+impl BrowserInput {
+    /// The composition of whichever owner takes text: the comment field's or the page's.
+    fn marked_text(&self) -> Option<&str> {
+        match self.owner() {
+            Owner::Comment => self.comment.marked.as_deref(),
+            _ => self.marked.as_deref(),
+        }
+    }
+}
+
 /// The platform text input: typed characters become `Text`, compositions become `Ime` events.
 /// The page's own text is not mirrored here, so ranges are relative to the marked text.
 impl EntityInputHandler for BrowserInput {
     fn text_for_range(&mut self, range: Range<usize>, adjusted: &mut Option<Range<usize>>, _w: &mut Window, _cx: &mut Context<Self>) -> Option<String> {
-        let units: Vec<u16> = self.marked.as_deref().unwrap_or_default().encode_utf16().collect();
+        let units: Vec<u16> = self.marked_text().unwrap_or_default().encode_utf16().collect();
         let range = range.start.min(units.len())..range.end.min(units.len());
         *adjusted = Some(range.clone());
         Some(String::from_utf16_lossy(&units[range]))
     }
 
     fn selected_text_range(&mut self, _ignore_disabled: bool, _w: &mut Window, _cx: &mut Context<Self>) -> Option<UTF16Selection> {
-        let len = self.marked.as_deref().map_or(0, utf16_len);
+        let len = self.marked_text().map_or(0, utf16_len);
         Some(UTF16Selection { range: len..len, reversed: false })
     }
 
     fn marked_text_range(&self, _w: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked.as_deref().filter(|m| !m.is_empty()).map(|m| 0..utf16_len(m))
+        self.marked_text().filter(|m| !m.is_empty()).map(|m| 0..utf16_len(m))
     }
 
     /// The IME finished without inserting (focus change, escape): drop the composition.
     fn unmark_text(&mut self, _w: &mut Window, _cx: &mut Context<Self>) {
+        if self.owner() == Owner::Comment {
+            self.comment.marked = None;
+            return;
+        }
         if self.marked.take().is_some() {
             self.send(InputEvent::Ime(ImeEvent::Cancel));
         }
     }
 
     fn replace_text_in_range(&mut self, _range: Option<Range<usize>>, text: &str, _w: &mut Window, _cx: &mut Context<Self>) {
+        match self.owner() {
+            Owner::Browse => {}
+            Owner::Comment => return self.comment.commit(text),
+            Owner::Agent => return self.overlay.push(OverlayEvent::Refused),
+            _ => return,
+        }
         if self.marked.take().is_some() {
             self.send(InputEvent::Ime(ImeEvent::Commit { text: text.to_owned() }));
         } else if !text.is_empty() {
@@ -401,6 +696,15 @@ impl EntityInputHandler for BrowserInput {
     }
 
     fn replace_and_mark_text_in_range(&mut self, range: Option<Range<usize>>, text: &str, selected: Option<Range<usize>>, _w: &mut Window, _cx: &mut Context<Self>) {
+        match self.owner() {
+            Owner::Browse => {}
+            Owner::Comment => {
+                self.comment.marked = (!text.is_empty()).then(|| text.to_owned());
+                return;
+            }
+            Owner::Agent => return self.overlay.push(OverlayEvent::Refused),
+            _ => return,
+        }
         if text.is_empty() {
             if self.marked.take().is_some() {
                 self.send(InputEvent::Ime(ImeEvent::Cancel));
@@ -607,6 +911,151 @@ mod tests {
             InputEvent::Ime(ImeEvent::Set { text: "か".into(), sel_start: 1, sel_end: 1, replace_start: None, replace_end: None }),
             InputEvent::Ime(ImeEvent::Cancel),
         ]);
+    }
+
+    fn down(x: f32, y: f32) -> MouseDownEvent {
+        MouseDownEvent { button: MouseButton::Left, position: point(px(x), px(y)), modifiers: Modifiers::default(), click_count: 1, first_mouse: false }
+    }
+
+    fn up(x: f32, y: f32) -> MouseUpEvent {
+        MouseUpEvent { button: MouseButton::Left, position: point(px(x), px(y)), modifiers: Modifiers::default(), click_count: 1 }
+    }
+
+    fn with<R>(cx: &mut gpui::VisualTestContext, block: &Entity<Block>, f: impl FnOnce(&mut BrowserInput) -> R) -> R {
+        let input = block.read_with(cx, |b, _| b.input.clone());
+        cx.update(|_, cx| input.update(cx, |i, _| f(i)))
+    }
+
+    #[test]
+    fn owner_transitions_table() {
+        use Owner::*;
+        // (from, enter, allowed, owner after)
+        let table = [
+            (Browse, Pick, true, Pick), (Browse, Markup, true, Markup), (Browse, Comment, false, Browse), (Browse, Agent, false, Browse),
+            (Pick, Comment, true, Comment), (Pick, Markup, true, Markup), (Pick, Pick, false, Pick), (Pick, Browse, false, Pick),
+            (Markup, Comment, true, Comment), (Markup, Pick, true, Pick),
+            (Comment, Pick, false, Comment), (Comment, Markup, false, Comment), (Comment, Comment, false, Comment),
+        ];
+        for (from, to, allowed, after) in table {
+            let mut i = BrowserInput::new("b1".into(), Arc::new(Recording::default()));
+            match from {
+                Browse => {}
+                Comment => assert!(i.enter(Pick) && i.enter(Comment)),
+                o => assert!(i.enter(o)),
+            }
+            assert_eq!(i.enter(to), allowed, "{from:?} -> {to:?}");
+            assert_eq!(i.owner(), after, "{from:?} -> {to:?}");
+        }
+        // Pick <-> Markup swap in place, so one Esc still returns to browse.
+        let mut i = BrowserInput::new("b1".into(), Arc::new(Recording::default()));
+        assert!(i.enter(Pick) && i.enter(Markup) && i.escape());
+        assert_eq!(i.owner(), Browse);
+        // Every enter is refused under a lease, and the lease ends back on the layer it covered.
+        i.enter(Pick);
+        i.grant_lease("claude");
+        for o in [Pick, Markup, Comment, Browse] {
+            assert!(!i.enter(o));
+        }
+        assert!(i.escape(), "Esc under a lease is eaten, not given to the page");
+        assert_eq!((i.owner(), i.lease()), (Agent, Some("claude")));
+        i.end_lease();
+        assert_eq!((i.owner(), i.lease()), (Pick, None));
+    }
+
+    #[gpui::test]
+    fn esc_closes_one_layer_and_reaches_the_page_only_in_browse(cx: &mut TestAppContext) {
+        let (rec, block, cx) = setup(cx);
+        with(cx, &block, |i| assert!(i.enter(Owner::Pick) && i.enter(Owner::Comment)));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(with(cx, &block, |i| i.owner()), Owner::Pick);
+        cx.simulate_keystrokes("escape");
+        assert_eq!(with(cx, &block, |i| i.owner()), Owner::Browse);
+        assert!(rec.inputs().is_empty(), "the page saw neither Esc");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(rec.inputs(), vec![InputEvent::Key { kind: KeyKind::Down, key: "Escape".into(), code: "Escape".into(), native: 0x35, repeat: false, mods: mods() }]);
+    }
+
+    #[gpui::test]
+    fn picking_keeps_clicks_from_the_page_and_space_passes_them(cx: &mut TestAppContext) {
+        let (rec, block, cx) = setup(cx);
+        with(cx, &block, |i| i.enter(Owner::Pick));
+        with(cx, &block, |i| i.take_overlay());
+        cx.simulate_event(down(50., 40.));
+        cx.simulate_event(up(50., 40.));
+        cx.simulate_keystrokes("a");
+        assert!(rec.inputs().is_empty(), "no click or key reached the page while picking");
+        let got: Vec<_> = with(cx, &block, |i| i.take_overlay()).into_iter().filter(|e| !matches!(e, OverlayEvent::Pointer { kind: MouseKind::Leave, .. })).collect();
+        assert_eq!(got, vec![
+            OverlayEvent::Pointer { owner: Owner::Pick, kind: MouseKind::Down, x: 10., y: 10., shift: false },
+            OverlayEvent::Pointer { owner: Owner::Pick, kind: MouseKind::Up, x: 10., y: 10., shift: false },
+        ]);
+        // The wheel still scrolls the page.
+        cx.simulate_event(ScrollWheelEvent { position: point(px(50.), px(40.)), delta: ScrollDelta::Pixels(point(px(0.), px(-30.))), modifiers: Modifiers::default(), touch_phase: gpui::TouchPhase::Moved });
+        assert_eq!(rec.inputs(), vec![InputEvent::Wheel { x: 10., y: 10., dx: 0., dy: -30., precise: true, mods: mods() }]);
+        // Space held: the page gets the pointer; releasing Space releases the button it holds.
+        cx.simulate_event(KeyDownEvent { keystroke: Keystroke::parse("space").unwrap(), is_held: false, prefer_character_input: false });
+        cx.simulate_event(down(60., 40.));
+        cx.simulate_event(KeyUpEvent { keystroke: Keystroke::parse("space").unwrap() });
+        cx.simulate_event(down(60., 40.));
+        assert_eq!(rec.inputs(), vec![
+            InputEvent::Mouse { kind: MouseKind::Down, x: 20., y: 10., button: protocol::MouseButton::Left, clicks: 1, mods: mods() },
+            InputEvent::Mouse { kind: MouseKind::Up, x: 20., y: 10., button: protocol::MouseButton::Left, clicks: 1, mods: mods() },
+        ]);
+    }
+
+    #[gpui::test]
+    fn ime_never_leaks_between_the_comment_field_and_the_page(cx: &mut TestAppContext) {
+        let (rec, block, cx) = setup(cx);
+        let input = block.read_with(cx, |b, _| b.input.clone());
+        let ime = |cx: &mut gpui::VisualTestContext, f: &dyn Fn(&mut BrowserInput, &mut Window, &mut Context<BrowserInput>)| cx.update(|w, cx| input.update(cx, |i, cx| f(i, w, cx)));
+        // A page composition is cancelled when picking starts; nothing of it reaches the comment.
+        ime(cx, &|i, w, cx| i.replace_and_mark_text_in_range(None, "にほ", None, w, cx));
+        with(cx, &block, |i| assert!(i.enter(Owner::Pick) && i.enter(Owner::Comment)));
+        assert_eq!(rec.inputs(), vec![
+            InputEvent::Ime(ImeEvent::Set { text: "にほ".into(), sel_start: 2, sel_end: 2, replace_start: None, replace_end: None }),
+            InputEvent::Ime(ImeEvent::Cancel),
+        ]);
+        // In the comment field: typing, a composition, commit, backspace and undo stay in the field.
+        cx.simulate_keystrokes("o k");
+        ime(cx, &|i, w, cx| i.replace_and_mark_text_in_range(None, "日", None, w, cx));
+        ime(cx, &|i, w, cx| assert_eq!(i.marked_text_range(w, cx), Some(0..1)));
+        ime(cx, &|i, w, cx| i.replace_text_in_range(None, "日本", w, cx));
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(with(cx, &block, |i| i.comment().text.clone()), "ok日");
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") { "cmd-z" } else { "ctrl-z" });
+        assert_eq!(with(cx, &block, |i| i.comment().text.clone()), "ok日本");
+        // A composition open when the field closes is dropped, not committed to the page.
+        ime(cx, &|i, w, cx| i.replace_and_mark_text_in_range(None, "か", None, w, cx));
+        with(cx, &block, |i| { i.escape(); i.escape(); });
+        assert_eq!(with(cx, &block, |i| (i.owner(), i.comment().marked.clone())), (Owner::Browse, None));
+        assert!(rec.inputs().is_empty(), "nothing typed in the comment reached the page");
+        // Back in browse the page composes again.
+        ime(cx, &|i, w, cx| i.replace_text_in_range(None, "x", w, cx));
+        assert_eq!(rec.inputs(), vec![InputEvent::Text { text: "x".into() }]);
+    }
+
+    #[gpui::test]
+    fn user_input_is_refused_with_a_cue_while_an_agent_holds_the_lease(cx: &mut TestAppContext) {
+        let (rec, block, cx) = setup(cx);
+        let input = block.read_with(cx, |b, _| b.input.clone());
+        // A key held when the agent takes over is released to the page first.
+        cx.simulate_event(KeyDownEvent { keystroke: Keystroke::parse("left").unwrap(), is_held: false, prefer_character_input: false });
+        rec.take();
+        with(cx, &block, |i| { i.grant_lease("claude"); i.take_overlay() });
+        assert_eq!(rec.inputs(), vec![InputEvent::Key { kind: KeyKind::Up, key: "ArrowLeft".into(), code: "ArrowLeft".into(), native: 0x7B, repeat: false, mods: mods() }]);
+        cx.simulate_event(down(50., 40.));
+        cx.simulate_event(up(50., 40.));
+        cx.simulate_keystrokes("a escape");
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") { "cmd-v" } else { "ctrl-v" });
+        cx.simulate_event(ScrollWheelEvent { position: point(px(50.), px(40.)), delta: ScrollDelta::Lines(point(0., 1.)), modifiers: Modifiers::default(), touch_phase: gpui::TouchPhase::Moved });
+        cx.update(|w, cx| input.update(cx, |i, cx| i.replace_text_in_range(None, "typed", w, cx)));
+        assert_eq!(rec.take(), vec![], "nothing reached the host while the agent drives");
+        let cues = with(cx, &block, |i| i.take_overlay());
+        assert!(cues.len() >= 5 && cues.iter().all(|e| *e == OverlayEvent::Refused), "{cues:?}");
+        // Take Control: the user's input flows again.
+        with(cx, &block, |i| i.end_lease());
+        cx.simulate_event(down(50., 40.));
+        assert_eq!(rec.inputs(), vec![InputEvent::Mouse { kind: MouseKind::Down, x: 10., y: 10., button: protocol::MouseButton::Left, clicks: 1, mods: mods() }]);
     }
 
     #[test]

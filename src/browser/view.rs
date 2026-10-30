@@ -65,6 +65,7 @@ impl HostConfig {
 #[derive(Clone, Debug, PartialEq)]
 struct Open {
     url: Option<String>,
+    profile: Option<String>,
     size: Dips,
     scale: f32,
 }
@@ -151,8 +152,8 @@ impl HostLink for HostClient {
         {
             let mut s = self.shared.lock().unwrap();
             match &msg {
-                AppToHost::Create { id, url, size, scale, .. } => {
-                    s.open.insert(id.clone(), Open { url: url.clone(), size: *size, scale: *scale });
+                AppToHost::Create { id, url, size, scale, profile } => {
+                    s.open.insert(id.clone(), Open { url: url.clone(), profile: profile.clone(), size: *size, scale: *scale });
                 }
                 AppToHost::Resize { id, size, scale } => {
                     if let Some(o) = s.open.get_mut(id) {
@@ -218,7 +219,7 @@ impl Writer {
                         open.sort_by(|a, b| a.0.cmp(&b.0));
                         self.replayed = open.iter().map(|(id, _)| id.clone()).collect();
                         for (id, o) in open {
-                            self.write(&AppToHost::Create { id, url: o.url, size: o.size, scale: o.scale, profile: None });
+                            self.write(&AppToHost::Create { id, url: o.url, size: o.size, scale: o.scale, profile: o.profile });
                         }
                     }
                     Err(e) => {
@@ -479,7 +480,22 @@ pub struct BrowserView {
     _focus: [Subscription; 2],
     _address: Subscription,
     _visibility: Subscription,
+    probe: Option<FrameProbe>,
 }
+
+/// What a frame probe hears (`BrowserView::set_frame_probe`). `Painted` comes with every draw
+/// that shows the frame, so the first one per `seq` is its paint time.
+#[derive(Clone, Debug)]
+pub enum FrameEvent {
+    Arrived { seq: u64, surface: herdr_browser_protocol::SurfaceRef, size: herdr_browser_protocol::PixelSize },
+    Painted { seq: u64 },
+    Acked { seq: u64 },
+}
+
+pub type FrameProbe = Arc<dyn Fn(&FrameEvent) + Send + Sync>;
+
+/// Height of the bar above the page (back, forward, reload, address), in DIPs.
+pub const CHROME_HEIGHT: f32 = 28.0;
 
 impl EventEmitter<BrowserEvent> for BrowserView {}
 
@@ -551,6 +567,7 @@ impl BrowserView {
             _focus: [on, off],
             _address: typed,
             _visibility: visibility,
+            probe: None,
         }
     }
 
@@ -625,6 +642,9 @@ impl BrowserView {
                 self.state.loading = false;
             }
             H::Frame { seq, surface, size, scale, .. } => {
+                if let Some(p) = &self.probe {
+                    p(&FrameEvent::Arrived { seq, surface: surface.clone(), size });
+                }
                 // Acked once painted (`send_ack` after the draw), so the host sends at most one ahead.
                 if let Err(e) = self.frames.on_frame(seq, surface, size, scale) {
                     tracing::warn!("browser {}: frame {seq}: {e:#}", self.id);
@@ -667,7 +687,9 @@ impl BrowserView {
         match self.sized {
             None => {
                 let url = Some(self.block.url.clone()).filter(|u| !u.is_empty());
-                self.link.send(AppToHost::Create { id: self.id.clone(), url, size, scale, profile: None });
+                // The shared profile is the host's default; another one names its own cache.
+                let profile = Some(self.block.profile.clone()).filter(|p| p != "default");
+                self.link.send(AppToHost::Create { id: self.id.clone(), url, size, scale, profile });
             }
             Some((s, k)) if (s.w - size.w).abs() < 0.5 && (s.h - size.h).abs() < 0.5 && k == scale => return,
             Some(_) => {
@@ -700,7 +722,15 @@ impl BrowserView {
         if let Some(seq) = self.frames.ack().filter(|s| Some(*s) != self.acked) {
             self.acked = Some(seq);
             self.link.send(AppToHost::FrameAck { id: self.id.clone(), seq });
+            if let Some(p) = &self.probe {
+                p(&FrameEvent::Acked { seq });
+            }
         }
+    }
+
+    /// Tests and the parity harness: hear each frame arrive, paint and get acked.
+    pub fn set_frame_probe(&mut self, probe: Option<FrameProbe>) {
+        self.probe = probe;
     }
 
     /// The newest frame's sequence number, if one is shown.
@@ -725,7 +755,7 @@ impl BrowserView {
             .flex_none()
             .items_center()
             .gap_1()
-            .h(px(28.))
+            .h(px(CHROME_HEIGHT))
             .px_2()
             .text_xs()
             .bg(hsla(0., 0., 0.5, 0.08))
@@ -808,6 +838,9 @@ impl Render for BrowserView {
             );
         // The page's newest frame; before the first one, a white sheet with its url.
         let frame = if self.crashed.is_none() { self.frames.element() } else { None };
+        if let (Some(p), true, Some(seq)) = (&self.probe, frame.is_some(), self.frames.seq()) {
+            p(&FrameEvent::Painted { seq });
+        }
         if frame.is_some() {
             // Runs once GPUI has drawn and presented this scene (next vsync): only then, and only
             // in a visible window, is the frame acked (frame.rs: presentation, not receipt).

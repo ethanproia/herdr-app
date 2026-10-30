@@ -1,0 +1,8 @@
+<!doctype html><title>file</title>
+<style>body{font:18px sans-serif;margin:20px}</style>
+<input id=one type=file> <input id=many type=file multiple accept=".txt,image/*">
+<script>
+// window.files(id): the chosen file names.
+window.files=id=>[...document.getElementById(id).files].map(f=>f.name);
+function rect(id){const r=document.getElementById(id).getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}}
+</script>

@@ -1,0 +1,9 @@
+<!doctype html><title>login</title>
+<style>body{font:18px sans-serif;margin:20px} input,button{display:block;margin:8px 0}</style>
+<form method=post action=/login><input id=user name=user autocomplete=username><input id=pass name=pass type=password autocomplete=current-password><button id=go>Sign in</button></form>
+<p>Signed in as: <b id=who></b></p>
+<script>
+// window.who: the server's view of the session cookie; also document.cookie.
+fetch('/whoami').then(r=>r.text()).then(t=>{window.who=t;document.getElementById('who').textContent=t||'(nobody)'});
+function rect(id){const r=document.getElementById(id).getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}}
+</script>
