@@ -24,6 +24,12 @@ mod settings {
         Settings { search_engine: SearchEngine::Google }
     }
 }
+/// The app's control.rs needs the whole app; the block only asks whether the window is headless (it is).
+mod control {
+    pub fn headless() -> bool {
+        true
+    }
+}
 mod mods {
     pub fn app_dir() -> std::path::PathBuf {
         std::env::temp_dir()
@@ -47,20 +53,65 @@ const PAGE: &str = r#"<!doctype html><meta charset=utf-8><body style='margin:0;f
 <div id=cur style='position:absolute;left:10px;top:150px'></div>
 <div style='height:5000px'></div>
 <script>
-window.log=[];
+window.log=[];window.downs=0;window.wheels=0;
+addEventListener('mousedown',()=>downs++,true);addEventListener('wheel',()=>wheels++,true);
 for (const t of ['keydown','keyup','compositionstart','compositionupdate','compositionend'])
   addEventListener(t, e => log.push([t, e.key ?? '', e.code ?? '', e.repeat ?? false, e.shiftKey ?? false, e.data ?? '']), true);
 const names=['pointer','text','grab','grabbing','ew-resize','ns-resize','nesw-resize','nwse-resize','not-allowed','crosshair','copy','alias','context-menu','vertical-text','default'];
 names.forEach((c,i)=>{const d=document.createElement('div');d.id='c-'+c;d.style.cssText=`position:absolute;left:${i*20}px;top:0;width:20px;height:20px;cursor:${c}`;cur.append(d)});
 </script>"#;
 
+/// Overlays as `Window::render_overlays` builds them (src/window.rs): a dialog is a dimming scrim
+/// over the whole window with a centred body; a popup (palette, menu) is a body at a point. Both
+/// bodies `occlude()`, stop mouse-down and hold the keyboard while open.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Over {
+    /// O1 the command palette (popup at the top, 620 wide in the app; scaled to this window).
+    Palette,
+    /// O2 a menu (popup at a point).
+    Menu,
+    /// O3 terminal peek (a dialog with content).
+    Peek,
+    /// O4 a confirm dialog.
+    Dialog,
+}
+
+const OVER: u32 = 0x00c853;
+
+impl Over {
+    fn dialog(self) -> bool {
+        matches!(self, Over::Peek | Over::Dialog)
+    }
+    /// The body's rect in window px.
+    fn body(self) -> Bounds<Pixels> {
+        let (x, y, w, h) = match self {
+            Over::Palette => (140., 40., 340., 200.),
+            Over::Menu => (300., 120., 160., 120.),
+            Over::Peek => (110., 60., 300., 240.),
+            Over::Dialog => (170., 120., 180., 120.),
+        };
+        Bounds::new(point(px(x), px(y)), size(px(w), px(h)))
+    }
+}
+
 struct Scene {
     browsers: Browsers,
+    over: Option<(Over, FocusHandle)>,
 }
 
 impl Render for Scene {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().flex().bg(rgb(0x1e1e1e)).child(div().w(px(100.))).child(div().flex_1().h_full().children(self.browsers.view("web").cloned()))
+        let base = div().size_full().relative().flex().bg(rgb(0x1e1e1e)).child(div().w(px(100.))).child(div().flex_1().h_full().children(self.browsers.view("web").cloned()));
+        let Some((kind, focus)) = self.over.clone() else { return base };
+        let b = kind.body();
+        let body = div().id("ov").track_focus(&focus).key_context("Overlay").w(b.size.width).h(b.size.height).bg(rgb(OVER)).occlude().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let layer = if kind.dialog() {
+            // Centred by hand at `body()` so the test knows where it is.
+            div().absolute().inset_0().bg(hsla(0.0, 0.0, 0.0, 0.35)).occlude().child(body.absolute().left(b.origin.x).top(b.origin.y))
+        } else {
+            div().absolute().left(b.origin.x).top(b.origin.y).child(body)
+        };
+        base.child(layer)
     }
 }
 
@@ -187,7 +238,7 @@ fn open(program: std::path::PathBuf) -> S {
             cx.new(|cx| {
                 let mut browsers = Browsers::with_link(link.clone());
                 browsers.sync(vec![("web".into(), block)], window, cx, |_: &mut Scene, _, _, _, _| {});
-                Scene { browsers }
+                Scene { browsers, over: None }
             })
         })
         .unwrap();
@@ -293,6 +344,202 @@ fn i3_i4(s: &mut S) {
     s.check("I4", "drag selects what it crosses", &v, &json!("alpha beta gamma"));
 }
 
+fn wheel(s: &mut S, x: f32, y: f32, delta: ScrollDelta, phase: TouchPhase) {
+    let p = s.at(x, y);
+    s.event(PlatformInput::ScrollWheel(ScrollWheelEvent { position: p, delta, modifiers: Modifiers::default(), touch_phase: phase }));
+}
+
+/// I6: a trackpad gesture with momentum lands exactly where its deltas add up to; a wheel scrolls
+/// by lines; at the page end there is no overshoot and the first reverse scroll moves at once.
+fn i6(s: &mut S) {
+    s.eval("scrollTo(0,0);1");
+    s.until("scrollY", &json!(0));
+    let gesture: [(f32, TouchPhase); 11] = [
+        (-20., TouchPhase::Started), (-40., TouchPhase::Moved), (-60., TouchPhase::Moved), (-80., TouchPhase::Moved), (0., TouchPhase::Ended),
+        // Momentum (macOS sends it after the fingers lift, decaying).
+        (-120., TouchPhase::Moved), (-100., TouchPhase::Moved), (-80., TouchPhase::Moved), (-50., TouchPhase::Moved), (-30., TouchPhase::Moved), (-20., TouchPhase::Moved),
+    ];
+    let start = Instant::now();
+    for (dy, phase) in gesture {
+        wheel(s, 200., 200., ScrollDelta::Pixels(point(px(0.), px(dy))), phase);
+    }
+    let (v, _) = s.until("scrollY", &json!(600));
+    metric("I6.trackpad_momentum_error", (v.as_f64().unwrap_or(0.) - 600.).abs(), "px", "0");
+    metric("I6.trackpad_settle", start.elapsed().as_millis(), "ms", "<= 300");
+    s.check("I6", "trackpad deltas with momentum add up", &v, &json!(600));
+    s.eval("scrollTo(0,0);1");
+    s.until("scrollY", &json!(0));
+    wheel(s, 200., 200., ScrollDelta::Lines(point(0., -3.)), TouchPhase::Moved);
+    let (v, _) = s.until("scrollY", &json!(120));
+    metric("I6.wheel_3_lines", &v, "px", "120");
+    s.check("I6", "a 3-line wheel step", &v, &json!(120));
+    let max = s.eval("document.documentElement.scrollHeight-innerHeight").as_f64().unwrap();
+    s.eval(&format!("scrollTo(0,{});1", max - 100.));
+    s.until("scrollY", &json!(max - 100.));
+    wheel(s, 200., 200., ScrollDelta::Pixels(point(px(0.), px(-500.))), TouchPhase::Moved);
+    let (v, _) = s.until("scrollY", &json!(max));
+    s.check("I6", "no overshoot past the page end", &v, &json!(max));
+    let start = Instant::now();
+    wheel(s, 200., 200., ScrollDelta::Pixels(point(px(0.), px(50.))), TouchPhase::Moved);
+    let (v, _) = s.until("scrollY", &json!(max - 50.));
+    metric("I6.reverse_at_end", start.elapsed().as_millis(), "ms", "<= 100, no dead scroll");
+    s.check("I6", "the first reverse scroll at the end moves", &v, &json!(max - 50.));
+    s.eval("scrollTo(0,0);1");
+    s.until("scrollY", &json!(0));
+}
+
+/// I7: every CSS cursor the page sets comes back from the host and maps to the GPUI cursor.
+fn i7(s: &mut S) {
+    let table: [(&str, CursorStyle); 15] = [
+        ("pointer", CursorStyle::PointingHand), ("text", CursorStyle::IBeam), ("grab", CursorStyle::OpenHand), ("grabbing", CursorStyle::ClosedHand),
+        ("ew-resize", CursorStyle::ResizeLeftRight), ("ns-resize", CursorStyle::ResizeUpDown), ("nesw-resize", CursorStyle::ResizeUpRightDownLeft),
+        ("nwse-resize", CursorStyle::ResizeUpLeftDownRight), ("not-allowed", CursorStyle::OperationNotAllowed), ("crosshair", CursorStyle::Crosshair),
+        ("copy", CursorStyle::DragCopy), ("alias", CursorStyle::DragLink), ("context-menu", CursorStyle::ContextualMenu),
+        ("vertical-text", CursorStyle::IBeamCursorForVerticalLayout), ("default", CursorStyle::Arrow),
+    ];
+    let mut worst = Duration::ZERO;
+    for (i, (css, want)) in table.iter().enumerate() {
+        let p = s.at(i as f32 * 20. + 10., 160.);
+        let start = Instant::now();
+        s.event(PlatformInput::MouseMove(MouseMoveEvent { position: p, pressed_button: None, modifiers: Modifiers::default() }));
+        let got = loop {
+            s.pump();
+            let name = s.cx.update(|cx| s.browser.read(cx).state.cursor.clone());
+            if input::cursor_style(&name) == *want || start.elapsed() > Duration::from_secs(2) {
+                break name;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        worst = worst.max(start.elapsed());
+        let ok = input::cursor_style(&got) == *want;
+        s.check("I7", &format!("cursor:{css}"), &json!(format!("{got} -> {:?}", input::cursor_style(&got))), &json!(if ok { format!("{got} -> {:?}", input::cursor_style(&got)) } else { format!("? -> {want:?}") }));
+    }
+    metric("I7.cursor_change_worst", worst.as_millis(), "ms", "<= 50");
+}
+
+fn pbpaste() -> String {
+    String::from_utf8_lossy(&std::process::Command::new("pbpaste").output().map(|o| o.stdout).unwrap_or_default()).into_owned()
+}
+
+fn pbcopy(text: &str) {
+    use std::io::Write as _;
+    let mut c = std::process::Command::new("pbcopy").stdin(std::process::Stdio::piped()).spawn().unwrap();
+    c.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+    c.wait().unwrap();
+}
+
+/// I8: copy, cut, paste, select-all, undo and redo through the real macOS clipboard; key repeat
+/// and modifiers as the page sees them. The user's clipboard is put back afterwards.
+fn i8(s: &mut S) {
+    let saved = pbpaste();
+    let cmd = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+    s.click(20., 20., 1);
+    s.eval("f.value='';1");
+    s.keys("c o p y space m e");
+    s.until("f.value", &json!("copy me"));
+    s.keys(&format!("{cmd}-a {cmd}-c"));
+    let start = Instant::now();
+    let mut clip = pbpaste();
+    while clip != "copy me" && start.elapsed() < Duration::from_secs(2) {
+        s.settle(20);
+        clip = pbpaste();
+    }
+    metric("I8.copy_to_clipboard", start.elapsed().as_millis(), "ms", "<= 100");
+    s.check("I8", "select-all + copy reaches pbpaste", &json!(clip), &json!("copy me"));
+    s.keys(&format!("{cmd}-x"));
+    let (v, _) = s.until("f.value", &json!(""));
+    s.check("I8", "cut empties the field", &v, &json!(""));
+    s.check("I8", "cut text is on the clipboard", &json!(pbpaste()), &json!("copy me"));
+    s.keys(&format!("{cmd}-v"));
+    let (v, _) = s.until("f.value", &json!("copy me"));
+    s.check("I8", "paste", &v, &json!("copy me"));
+    pbcopy("from mac");
+    s.keys(&format!("{cmd}-a {cmd}-v"));
+    let (v, _) = s.until("f.value", &json!("from mac"));
+    s.check("I8", "paste from pbcopy", &v, &json!("from mac"));
+    s.keys(&format!("{cmd}-z"));
+    let (v, _) = s.until("f.value", &json!("copy me"));
+    s.check("I8", "undo", &v, &json!("copy me"));
+    s.keys(&format!("{cmd}-shift-z"));
+    let (v, _) = s.until("f.value", &json!("from mac"));
+    s.check("I8", "redo", &v, &json!("from mac"));
+    pbcopy(&saved);
+    // Key repeat and modifiers.
+    s.eval("log=[];1");
+    let left = Keystroke::parse("left").unwrap();
+    for held in [false, true, true, true] {
+        s.event(PlatformInput::KeyDown(KeyDownEvent { keystroke: left.clone(), is_held: held, prefer_character_input: false }));
+    }
+    s.event(PlatformInput::KeyUp(KeyUpEvent { keystroke: left }));
+    s.keys("shift-left");
+    s.settle(100);
+    let v = s.eval("log.filter(e=>e[0]=='keydown').map(e=>e[1]+(e[3]?'+repeat':'')+(e[4]?'+shift':''))");
+    s.check("I8", "repeat and shift as the page sees them", &v, &json!(["ArrowLeft", "ArrowLeft+repeat", "ArrowLeft+repeat", "ArrowLeft+repeat", "ArrowLeft+shift"]));
+}
+
+/// O1 to O4: palette, menu, peek and dialog draw over the live page (pixels) and take input first:
+/// clicks, wheel and keys on them never reach the page; after closing, the page gets input again.
+fn overlays(s: &mut S) {
+    s.click(20., 20., 1);
+    s.eval("f.value='';scrollTo(0,0);1");
+    for kind in [Over::Palette, Over::Menu, Over::Peek, Over::Dialog] {
+        let id = match kind { Over::Palette => "O1", Over::Menu => "O2", Over::Peek => "O3", Over::Dialog => "O4" };
+        s.eval("downs=0;wheels=0;1");
+        s.window
+            .update(&mut s.cx, |sc, window, cx| {
+                let f = cx.focus_handle();
+                window.focus(&f, cx);
+                sc.over = Some((kind, f));
+                cx.notify();
+            })
+            .unwrap();
+        s.settle(60);
+        let b = kind.body();
+        let image = s.cx.capture_screenshot(s.window.into()).unwrap();
+        let scale = image.width() as f32 / 520.0;
+        let at = |x: f32, y: f32| image.get_pixel((x * scale) as u32, (y * scale) as u32).0;
+        let (x0, y0, x1, y1) = (f32::from(b.origin.x), f32::from(b.origin.y), f32::from(b.origin.x + b.size.width), f32::from(b.origin.y + b.size.height));
+        let mut over_px = 0;
+        let mut n = 0;
+        for i in 0..10 {
+            for j in 0..10 {
+                let p = at(x0 + 2. + (x1 - x0 - 4.) * i as f32 / 9., y0 + 2. + (y1 - y0 - 4.) * j as f32 / 9.);
+                n += 1;
+                if p[0] < 8 && (0xc0..0xd0).contains(&p[1]) && (0x4c..0x5c).contains(&p[2]) {
+                    over_px += 1;
+                }
+            }
+        }
+        metric(&format!("{id}.overlay_pixels"), format!("{over_px}/{n}"), "samples", "100/100");
+        s.check(id, "overlay drawn over the page", &json!(over_px), &json!(n));
+        if kind.dialog() {
+            // The scrim dims the page outside the body: white page reads about 0xa5.
+            let p = at(x1 + 20., y1 + 20.);
+            s.check(id, "scrim dims the page around the dialog", &json!(p[0] < 0xc0 && p[0] > 0x80), &json!(true));
+        }
+        let c = point(b.origin.x + px(20.), b.origin.y + px(20.));
+        s.event(PlatformInput::MouseDown(MouseDownEvent { button: MouseButton::Left, position: c, modifiers: Modifiers::default(), click_count: 1, first_mouse: false }));
+        s.event(PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position: c, modifiers: Modifiers::default(), click_count: 1 }));
+        s.event(PlatformInput::ScrollWheel(ScrollWheelEvent { position: c, delta: ScrollDelta::Pixels(point(px(0.), px(-80.))), modifiers: Modifiers::default(), touch_phase: TouchPhase::Moved }));
+        s.keys("x y z");
+        s.settle(150);
+        let v = s.eval("[downs,wheels,scrollY,f.value]");
+        s.check(id, "click, wheel and keys stay with the overlay", &v, &json!([0, 0, 0, ""]));
+        s.window
+            .update(&mut s.cx, |sc, window, cx| {
+                sc.over = None;
+                let f = sc.browsers.view("web").unwrap().read(cx).focus_handle().clone();
+                window.focus(&f, cx);
+                cx.notify();
+            })
+            .unwrap();
+        s.settle(60);
+        s.click(20., 20., 1);
+        let (v, _) = s.until("downs", &json!(1));
+        s.check(id, "after closing, the page gets clicks again", &v, &json!(1));
+    }
+}
+
 fn main() {
     let Some(program) = std::env::var_os("HERDR_BROWSER_CEF_HOST") else {
         println!("HERDR_BROWSER_CEF_HOST unset: interaction parity skipped");
@@ -310,7 +557,18 @@ fn main() {
     if run("I3") {
         i3_i4(&mut s);
     }
-    let _ = input::cursor_style;
+    if run("I6") {
+        i6(&mut s);
+    }
+    if run("I7") {
+        i7(&mut s);
+    }
+    if run("I8") {
+        i8(&mut s);
+    }
+    if run("O") {
+        overlays(&mut s);
+    }
     metric("I.fails", s.fails.len(), "count", "0");
     s.cx.update_window(s.window.into(), |_, window, _| window.remove_window()).unwrap();
     s.cx.run_until_parked();
