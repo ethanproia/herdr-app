@@ -57,7 +57,7 @@ const site = `http://127.0.0.1:${web.address().port}/`;
 try {
   const o = (await json("open", T, `url=${site}`));
   T = o.tab ?? T;
-  check(o.ok && o.url === site, `open starts the daemon and loads the page (${o.url})`);
+  check(o.ok && o.url === site, `open starts the daemon and loads the page (${o.url ?? JSON.stringify(o)})`);
   check((await json("tabs")).tabs?.some((t) => t.tab === T && t.controllable && t.agentOpened), "tabs lists the agent tab as controllable");
   // SEC2b: the page has password and card fields, so reading or picturing it needs the person's capture grant.
   check(/needs the person's capture grant/.test(await cli("eval", T, "expression=1")) && /needs the person's capture grant/.test(await cli("screenshot", T)), "X3 eval and screenshot refused on a sensitive page without a grant");
@@ -111,7 +111,7 @@ try {
   check((await json("browser_lock", T, "action=lock")).locked === true && (await json("tabs")).ok, "lock sets the lock flag");
   (await json("browser_lock", T, "action=unlock"));
   const tl = await json("browser_tabs", "action=list");
-  check(tl.tabs?.[0]?.tab === T && tl.tabs[0].selected, "tabs list marks the selected tab");
+  check(tl.tabs?.find((t) => t.tab === T)?.selected && tl.tabs.filter((t) => t.selected).length === 1, "tabs list marks the selected tab");
   check((await cli("browser_text")).includes("Hello"), "commands default to the selected tab");
   const aft = await json("browser_click", T, "x=3", "y=3", "take_screenshot_afterwards=true");
   check(/\.png$/.test(aft.screenshot ?? ""), "take_screenshot_afterwards returns a PNG path");

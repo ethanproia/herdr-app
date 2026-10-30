@@ -14,7 +14,7 @@ run() { "$here/scripts/fork-run.sh" "$name" "$@"; }
 trap 'run down >/dev/null 2>&1 || true' EXIT
 run down >/dev/null 2>&1 || true
 run up
-run do space.new '{"name":"agent"}' >/dev/null
+run do space.new '{"name":"agent"}' >/dev/null || true # the fork's home keeps spaces between runs
 # `herdr-app do` for this fork, for the daemon and the test.
 printf '#!/bin/sh\nexec %q %q "$@"\n' "$here/scripts/fork-run.sh" "$name" >"$root/bin/herdr-app-fork"
 chmod +x "$root/bin/herdr-app-fork"
