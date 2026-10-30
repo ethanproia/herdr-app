@@ -39,15 +39,14 @@ pub enum Op {
     Ready { generation: u64 },
 }
 
-/// The readiness probe: answers once the page has presented its first paint (a `paint`
-/// performance entry), or after 5 s for pages that never paint content (under heavy CPU load a
-/// first paint took over 1 s). Until that paint Chromium
-/// holds commits and drops input, which is what lost early clicks under CPU load.
+/// The readiness probe: answers once a trusted mouse move has reached the page (the host keeps
+/// sending harmless moves until then, see `super::nudge_waiting`), or 0 after 5 s. Measured: a
+/// first-paint entry was not enough; under CPU load Chromium still dropped clicks sent after it,
+/// so this proves the input path itself before held input is replayed.
 pub fn ready_message(id: &str, generation: u64) -> Vec<u8> {
-    const FIRST_PAINT: &str = "new Promise(r=>{const ok=()=>performance.getEntriesByType('paint').length>0;\
-        if(ok())return r(1);const o=new PerformanceObserver(()=>{if(ok()){o.disconnect();r(1)}});\
-        o.observe({type:'paint',buffered:true});setTimeout(()=>r(0),5000)})";
-    evaluate(id, 0, Op::Ready { generation }, FIRST_PAINT)
+    const INPUT_LIVE: &str = "new Promise(r=>{const f=e=>{if(e.isTrusted){removeEventListener('mousemove',f,true);r(1)}};\
+        addEventListener('mousemove',f,true);setTimeout(()=>{removeEventListener('mousemove',f,true);r(0)},5000)})";
+    evaluate(id, 0, Op::Ready { generation }, INPUT_LIVE)
 }
 
 /// Overlay geometry, measured by a privileged DevTools evaluate (the page cannot answer for it).
@@ -754,7 +753,7 @@ wrap_dev_tools_message_observer! {
                             send(HostToApp::PickInfoResult { id, req, ok, selector: text("selector"), label: text("label"), rect });
                         }
                         Op::Ready { generation } => {
-                            super::debug(format_args!("{id}: first paint seen: {value}"));
+                            super::debug(format_args!("{id}: input path live: {value}"));
                             super::input_live(&id, generation)
                         }
                         Op::Overlay { epoch } => {
