@@ -30,8 +30,14 @@ pub(crate) struct Entry {
     size: Size,
     scale: f32,
     pool: FramePool,
-    /// The newest frame sent, kept for `Screenshot`.
+    /// The newest completed frame (blitted, sent or not), kept for `Screenshot`.
     last: Option<Surface>,
+    /// The app said the block is not visible: CEF is told `was_hidden`, nothing is sent.
+    hidden: bool,
+    /// Screenshots asked for while hidden: answered from the next paint (shown just for it).
+    shots: Vec<(u64, String)>,
+    /// When the last `Resize` arrived, until the first paint at that size (stats only).
+    resized: Option<std::time::Instant>,
     /// Keeps the DevTools observer that reports the CDP target id alive.
     _devtools: Option<Registration>,
     /// Input waits here until the page can take it: Chromium drops events sent between the first
@@ -50,6 +56,48 @@ pub(crate) struct Host {
     dialogs: HashMap<u64, JsdialogCallback>,
     choosers: HashMap<u64, FileDialogCallback>,
     quit: bool,
+    /// `HERDR_BROWSER_STATS=1`: blit cost, appended to `<browser dir>/host-stats.log`.
+    stats: Option<BlitStats>,
+}
+
+/// Per-frame copy cost (review A4: `waitUntilCompleted` runs on CEF's UI thread).
+pub(crate) struct BlitStats {
+    out: std::fs::File,
+    since: std::time::Instant,
+    ms: Vec<f64>,
+    hidden: u32,
+}
+
+impl BlitStats {
+    fn open(dir: &Path) -> Option<Self> {
+        std::env::var_os("HERDR_BROWSER_STATS").filter(|v| !v.is_empty() && v != "0")?;
+        let out = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("host-stats.log")).ok()?;
+        Some(Self { out, since: std::time::Instant::now(), ms: Vec::new(), hidden: 0 })
+    }
+
+    fn record(&mut self, ms: f64, hidden: bool) {
+        self.ms.push(ms);
+        self.hidden += hidden as u32;
+        let span = self.since.elapsed();
+        if span < Duration::from_secs(2) {
+            return;
+        }
+        self.ms.sort_by(f64::total_cmp);
+        let p = |q: f64| self.ms[((self.ms.len() - 1) as f64 * q).round() as usize];
+        let _ = writeln!(
+            self.out,
+            "blit count={} per_s={:.1} p50_ms={:.2} p95_ms={:.2} max_ms={:.2} hidden={}",
+            self.ms.len(),
+            self.ms.len() as f64 / span.as_secs_f64(),
+            p(0.5),
+            p(0.95),
+            p(1.0),
+            self.hidden
+        );
+        self.ms.clear();
+        self.hidden = 0;
+        self.since = std::time::Instant::now();
+    }
 }
 
 thread_local! {
@@ -113,21 +161,54 @@ pub(crate) fn keep_chooser(req: u64, cb: FileDialogCallback) {
     with_host(|h| h.choosers.insert(req, cb));
 }
 
+enum Painted {
+    Out(Option<(u64, Surface, f32)>),
+    Shots(Vec<(u64, String)>, Surface),
+}
+use Painted::{Out, Shots};
+
 /// A painted CEF surface arrived: blit it into a pool surface and send it if nothing is in flight.
 pub(crate) fn on_frame(id: &str, src: *mut std::ffi::c_void, w: u32, h: u32) {
     let px = PixelSize { w, h };
     let ready = with_host(|host| {
         let entry = host.browsers.get_mut(id)?;
         let blitter = host.blitter.as_ref()?;
+        // Hidden and no screenshot waiting: CEF should not paint, and if it does, skip the copy.
+        if entry.hidden && entry.shots.is_empty() {
+            return None;
+        }
         let dst = match entry.pool.acquire(px) {
             Ok(s) => s,
             Err(e) => return Some(Err(format!("surface: {e}"))),
         };
+        let t = std::time::Instant::now();
         if let Err(e) = blitter.copy(src, dst.as_ptr(), w as usize, h as usize) {
             return Some(Err(e));
         }
+        let hidden = entry.hidden;
+        let want = ((entry.size.w * entry.scale).ceil() as u32, (entry.size.h * entry.scale).ceil() as u32);
+        let resized = entry.resized.filter(|_| (w, h) == want);
+        if resized.is_some() {
+            entry.resized = None;
+        }
+        if let Some(stats) = host.stats.as_mut() {
+            stats.record(t.elapsed().as_secs_f64() * 1e3, hidden);
+            if let Some(r) = resized {
+                let _ = writeln!(stats.out, "resize_to_paint_ms={:.1} size={w}x{h}", r.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        let entry = host.browsers.get_mut(id)?;
+        entry.last = Some(dst.clone());
+        if hidden {
+            // Painted only for screenshots: answer them, hide again, send nothing.
+            let shots = std::mem::take(&mut entry.shots);
+            if let Some(b) = entry.browser.as_ref().and_then(|b| b.host()) {
+                b.was_hidden(1);
+            }
+            return Some(Ok(Shots(shots, dst)));
+        }
         let frame = entry.pool.submit(dst).map(|f| (f.seq, f.surface.clone()));
-        Some(Ok(frame.map(|(seq, s)| (seq, s, entry.scale))))
+        Some(Ok(Out(frame.map(|(seq, s)| (seq, s, entry.scale)))))
     })
     .flatten();
     let woke = with_host(|h| h.browsers.get_mut(id).filter(|e| e.loaded && !e.input_ready).map(|e| {
@@ -138,7 +219,13 @@ pub(crate) fn on_frame(id: &str, src: *mut std::ffi::c_void, w: u32, h: u32) {
         replay(id, events);
     }
     match ready {
-        Some(Ok(Some((seq, s, scale)))) => send_frame(id, seq, s, scale),
+        Some(Ok(Out(Some((seq, s, scale))))) => send_frame(id, seq, s, scale),
+        Some(Ok(Shots(shots, s))) => {
+            for (req, path) in shots {
+                let res = write_png(&s, Path::new(&path));
+                send(HostToApp::ScreenshotDone { id: id.into(), req, ok: res.is_ok(), error: res.err() });
+            }
+        }
         Some(Err(e)) => send(HostToApp::Error { id: Some(id.into()), message: format!("frame: {e}") }),
         _ => {}
     }
@@ -162,7 +249,6 @@ fn send_frame(id: &str, seq: u64, mut s: Surface, scale: f32) {
     match s.export(Transport::GlobalId) {
         Ok(surface) => {
             let size = s.size();
-            with_host(|h| h.browsers.get_mut(id).map(|e| e.last = Some(s)));
             send(HostToApp::Frame { id: id.into(), seq, surface, size, scale });
         }
         Err(e) => send(HostToApp::Error { id: Some(id.into()), message: format!("export: {e}") }),
@@ -269,6 +355,7 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
             dialogs: HashMap::new(),
             choosers: HashMap::new(),
             quit: false,
+            stats: BlitStats::open(profile_dir.parent().unwrap_or(&profile_dir)),
         })
     });
     if with_host(|h| h.blitter.is_none()).unwrap_or(true) {
@@ -381,7 +468,7 @@ fn handle(m: AppToHost) {
                 send(HostToApp::Error { id: Some(id.clone()), message: format!("browser {id} exists") });
                 return;
             }
-            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false }));
+            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, hidden: false, shots: Vec::new(), resized: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false }));
             let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
             let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
             let mut client = handlers::client(&id);
@@ -443,6 +530,16 @@ fn handle(m: AppToHost) {
             }
         }
         M::Screenshot { id, req, path } => {
+            // Hidden: CEF is not painting, so the last pixels may be stale. Show the page to CEF
+            // until its next paint, which answers (see `on_frame`).
+            let hidden = with_host(|h| h.browsers.get_mut(&id).filter(|e| e.hidden).map(|e| e.shots.push((req, path.clone())))).flatten();
+            if hidden.is_some() {
+                if let Some(b) = browser(&id).and_then(|b| b.host()) {
+                    b.was_hidden(0);
+                    b.invalidate(PaintElementType::default());
+                }
+                return;
+            }
             let Some(last) = with_host(|h| h.browsers.get(&id).map(|e| e.last.clone())).flatten() else { return unknown(&id) };
             let res = match last {
                 Some(s) => write_png(&s, Path::new(&path)),
@@ -459,7 +556,7 @@ fn browser_msg(m: AppToHost) {
     let id = match &m {
         M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. } | M::Stop { id } | M::Resize { id, .. }
         | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Input { id, .. } | M::Edit { id, .. } | M::Find { id, .. } | M::StopFind { id, .. }
-        | M::DevTools { id, .. } | M::Eval { id, .. } => id.clone(),
+        | M::DevTools { id, .. } | M::Eval { id, .. } | M::SetVisible { id, .. } => id.clone(),
         _ => return,
     };
     let Some(b) = browser(&id) else { return unknown(&id) };
@@ -486,6 +583,7 @@ fn browser_msg(m: AppToHost) {
                     let changed = e.scale != scale;
                     e.size = size;
                     e.scale = scale;
+                    e.resized = Some(std::time::Instant::now());
                     changed
                 })
             })
@@ -497,6 +595,24 @@ fn browser_msg(m: AppToHost) {
             host.was_resized();
         }
         M::Focus { focused, .. } => host.set_focus(focused as i32),
+        M::SetVisible { visible, .. } => {
+            let changed = with_host(|h| {
+                h.browsers.get_mut(&id).filter(|e| e.hidden == visible).map(|e| {
+                    e.hidden = !visible;
+                    if !visible {
+                        e.pool.drop_pending();
+                    }
+                })
+            })
+            .flatten();
+            if changed.is_some() {
+                host.was_hidden(!visible as i32);
+                if visible {
+                    // A fresh full frame on resume.
+                    host.invalidate(PaintElementType::default());
+                }
+            }
+        }
         M::SetZoom { level, .. } => host.set_zoom_level(level),
         M::Input { event, .. } => {
             let queued = with_host(|h| {

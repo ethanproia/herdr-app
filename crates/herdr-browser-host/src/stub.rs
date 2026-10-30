@@ -155,11 +155,11 @@ impl<A: SurfaceAlloc> StubHost<A> {
                 }
             }
             M::Focus { focused, .. } => out.push(echo(&id, format!("focus {focused}"))),
+            M::SetVisible { visible, .. } => out.push(echo(&id, format!("visible {visible}"))),
             M::Input { event, .. } => out.push(echo(&id, encode(&event))),
             // The stub knows no page: an overlay query answers with no rects, echoing req and epoch.
             M::Overlay { req, epoch, .. } => out.push(HostToApp::OverlayRects { id: id.clone(), req, epoch, rects: vec![], frames: vec![] }),
             // The stub paints nothing real; visibility changes are only echoed.
-            M::SetVisible { visible, .. } => out.push(echo(&id, format!("visible {visible}"))),
             M::MenuResult { command, .. } => out.push(echo(&id, format!("menu {command:?}"))),
             M::Edit { command, .. } => out.push(echo(&id, format!("edit {}", encode(&command).trim_matches('"')))),
             M::Eval { req, expr, .. } => {

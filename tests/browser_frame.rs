@@ -82,8 +82,29 @@ fn main() {
     view(&mut cx, &mut |v| v.on_frame(1, ref_a.clone(), a.size(), 2.0).unwrap());
     shoot(&mut cx, "frame 1", &[(5., 5., BLACK), (15., 20., RED), (45., 20., BLUE), (55., 35., BLACK)]);
     view(&mut cx, &mut |v| {
+        assert_eq!(v.ack(), None, "drawn into a scene is not presented");
+        v.presented(false);
+        assert_eq!(v.ack(), None, "presented while the window is not visible: no ack");
+    });
+    shoot(&mut cx, "frame 1 again", &[(15., 20., RED)]);
+    view(&mut cx, &mut |v| {
+        v.presented(true);
         assert_eq!(v.ack(), Some(1));
         assert_eq!(v.ack(), None, "ack is taken once");
+        // Hidden: undelivered acks are forgotten and nothing acks until visible again.
+        assert!(v.set_visible(false));
+        assert!(!v.set_visible(false), "no change, nothing to send");
+    });
+    shoot(&mut cx, "hidden (last frame kept)", &[(15., 20., RED)]);
+    view(&mut cx, &mut |v| {
+        v.presented(true);
+        assert_eq!(v.ack(), None, "a hidden block never acks");
+        assert!(v.set_visible(true));
+    });
+    shoot(&mut cx, "visible again", &[(15., 20., RED)]);
+    view(&mut cx, &mut |v| {
+        v.presented(true);
+        assert_eq!(v.ack(), Some(1), "acks resume");
     });
     assert!(a.in_use(), "app holds frame 1");
 
@@ -104,5 +125,26 @@ fn main() {
     shoot(&mut cx, "cleared", &[(30., 20., BLACK)]);
     assert!(!b.in_use(), "frame 2 released after clear");
     let _ = (&mut a, &mut b);
+    // Stats mode: a paint line per new frame, the host's coalesced seqs counted as dropped.
+    let home = std::env::temp_dir().join(format!("herdr-frame-stats-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    unsafe {
+        std::env::set_var("HERDR_APP_HOME", &home);
+        std::env::set_var("HERDR_BROWSER_STATS", "1");
+    }
+    let mut v = FrameView::new();
+    for seq in [1, 2, 5] {
+        v.on_frame(seq, ref_a.clone(), a.size(), 2.0).unwrap();
+        assert!(v.element().is_some());
+        v.presented(true);
+        assert!(v.element().is_some());
+        v.presented(true); // a repaint of the same frame is not counted
+    }
+    let log = std::fs::read_to_string(home.join("browser/stats.log")).unwrap();
+    let paints: Vec<_> = log.lines().filter(|l| l.contains(" paint ")).collect();
+    assert_eq!(paints.len(), 3, "{log}");
+    assert!(paints[2].contains("seq=5") && paints[2].ends_with("dropped=2"), "{log}");
+    let _ = std::fs::remove_dir_all(&home);
+    println!("stats: {} paint lines ok", paints.len());
     println!("browser frame test passed");
 }
