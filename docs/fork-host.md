@@ -49,6 +49,7 @@ herdr-browser-host.app/Contents/
 - Build the bundle: `scripts/fork-host-bundle.sh` (builds into `$CARGO_TARGET_DIR`, default `~/work.noindex/herdr-fork/target`) prints the bundle's executable. It is LSUIElement with the accessory activation policy: no window, no Dock icon, no focus change. Measured: the test runs never opened a window.
 - Run the tests against it: `HERDR_BROWSER_HOST=<that path> cargo test -p herdr-browser-host --test protocol --test cef -- --test-threads=1`. Unset, the same protocol suite runs against `--stub`.
 - Confirmed in that run: real frames via OnAcceleratedPaint (one Metal blit into a pool surface), pixel checks on local pages, resize, mouse/keys/text/IME/wheel reaching the page, eval, confirm dialog, screenshot PNG, CDP port, CdpTarget, and a cookie surviving a host restart.
-- Known flake: Chromium's own "Teardown watchdog" sometimes kills the host during `Shutdown` (exit 2) when the Mac is heavily loaded (2 of about 30 shutdowns, during parallel full-app builds). Cookies are flushed to disk before teardown, so logins survive it.
+- Shutdown: CEF's own teardown takes 0.3 to 4 s under load and Chromium's teardown watchdog used to kill it (exit 2). The host now closes every browser (waits for OnBeforeClose), flushes cookies (waits for the callback), then gives CefShutdown 2 s before exiting 0 itself. Measured: 22 of 22 clean exits during a parallel release build (15 by CEF, 7 by the fallback), cookie test passing.
+- Early input: Chromium drops input sent before the first frame painted after the first load finishes; the host queues it until then and replays it.
 - Wheel sign: CEF's convention, a negative `dy` scrolls the page down.
 - DevTools has no window here: `DevTools` answers an Error pointing at the CDP port.
