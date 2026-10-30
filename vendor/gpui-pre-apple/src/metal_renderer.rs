@@ -14,6 +14,7 @@ use core_foundation::base::TCFType;
 use core_video::{
     metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
     pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    pixel_buffer::kCVPixelFormatType_32BGRA, // HERDR: BGRA surfaces (browser block frames)
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
@@ -123,6 +124,11 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    bgra_surfaces_pipeline_state: metal::RenderPipelineState, // HERDR: BGRA surfaces
+    // HERDR: CVMetalTextures made this frame. Lifetime rule: a CVMetalTexture (and the
+    // CVPixelBuffer/IOSurface behind it) must outlive the GPU work that samples it, so these move
+    // into the command buffer's completion handler and are released only when the GPU is done.
+    surface_textures: Vec<core_video::metal_texture::CVMetalTexture>,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -358,6 +364,15 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        // HERDR: one-texture pipeline for 32BGRA surfaces (same vertex stage).
+        let bgra_surfaces_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "bgra_surfaces",
+            "surface_vertex",
+            "surface_bgra_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
@@ -381,6 +396,8 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            bgra_surfaces_pipeline_state, // HERDR
+            surface_textures: Vec::new(), // HERDR
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -547,10 +564,12 @@ impl MetalRenderer {
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
+        let surface_textures = Cell::new(Some(mem::take(&mut self.surface_textures))); // HERDR
         let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
             }
+            drop(surface_textures.take()); // HERDR: GPU done, release CVMetalTextures
         });
         // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
         unsafe {
@@ -1190,6 +1209,41 @@ impl MetalRenderer {
                 DevicePixels::from(surface.image_buffer.get_height() as i32),
             );
 
+            // HERDR: 32BGRA (browser frames from a shared IOSurface): one texture, no copy.
+            if surface.image_buffer.get_pixel_format() == kCVPixelFormatType_32BGRA {
+                let Ok(bgra) = self.core_video_texture_cache.create_texture_from_image(
+                    surface.image_buffer.as_concrete_TypeRef(),
+                    None,
+                    MTLPixelFormat::BGRA8Unorm,
+                    surface.image_buffer.get_width(),
+                    surface.image_buffer.get_height(),
+                    0,
+                ) else {
+                    log::error!("CVMetalTextureCache rejected a BGRA surface");
+                    continue;
+                };
+                command_encoder.set_render_pipeline_state(&self.bgra_surfaces_pipeline_state);
+                command_encoder.set_vertex_bytes(
+                    SurfaceInputIndex::TextureSize as u64,
+                    mem::size_of_val(&texture_size) as u64,
+                    &texture_size as *const Size<DevicePixels> as *const _,
+                );
+                command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
+                    let texture = CVMetalTextureGetTexture(bgra.as_concrete_TypeRef());
+                    Some(metal::TextureRef::from_ptr(texture as *mut _))
+                });
+                command_encoder.draw_primitives_instanced_base_instance(
+                    metal::MTLPrimitiveType::Triangle,
+                    0,
+                    6,
+                    1,
+                    (first_surface + index) as u64,
+                );
+                command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+                self.surface_textures.push(bgra);
+                continue;
+            }
+
             assert_eq!(
                 surface.image_buffer.get_pixel_format(),
                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
@@ -1240,6 +1294,7 @@ impl MetalRenderer {
                 1,
                 (first_surface + index) as u64,
             );
+            self.surface_textures.extend([y_texture, cb_cr_texture]); // HERDR: keep until GPU done
         }
     }
 }
