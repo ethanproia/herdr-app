@@ -9,13 +9,15 @@
 use super::agent::{Agent, Focus, Reply, Step};
 use super::geometry::{Change, Epoch, Geometry, HoverSend, OverlayAnswer, OverlayState, Pt, Rect, zoom_factor};
 use super::input::{self, BrowserInput, OverlayEvent, Owner};
+use super::dialogs::{DialogsEvent, Downloads, PageDialogs};
 use super::markup::{self, Markup, Tool};
+use super::zoom;
 use super::{BrowserRegistry, BrowserState, FrameSink, FrameView, HostLink};
 use crate::layout::BrowserBlock;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_base::input::{Input, InputEvent, InputState};
-use herdr_browser_protocol::{self as protocol, MouseKind, OverlayQuery, AppToHost, BrowserId, HostToApp, PixelSize, Size as Dips};
+use herdr_browser_protocol::{self as protocol, DownloadState, MouseKind, OverlayQuery, AppToHost, BrowserId, HostToApp, PixelSize, Size as Dips};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -403,6 +405,7 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
         | H::Title { id, .. }
         | H::ContextMenu { id, .. }
         | H::StylesResult { id, .. }
+        | H::PickInfoResult { id, .. }
         | H::Url { id, .. }
         | H::Loading { id, .. }
         | H::Cursor { id, .. }
@@ -422,7 +425,7 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
     }
 }
 
-actions!(browser, [FocusAddress, OpenFind]);
+actions!(browser, [FocusAddress, OpenFind, ZoomIn, ZoomOut, ZoomReset]);
 
 /// What was typed into the address bar, as a page to open: a url as it is, a bare host
 /// (`example.com/x`, `localhost:3000`) over https, anything else searched. None: nothing typed.
@@ -460,6 +463,8 @@ pub enum BrowserEvent {
     NewWindow(String),
     /// Pick mode: the user clicked an element at (x, y) page DIPs (its highlight is the overlay).
     Picked { x: f32, y: f32 },
+    /// Show a toast (a download finished or failed): `{"title","body","level"}`.
+    Notice(serde_json::Value),
 }
 
 /// One browser block on screen.
@@ -492,8 +497,10 @@ pub struct BrowserView {
     probe: Option<FrameProbe>,
     /// Page overlays (highlight, pick, find matches): epochs and hover coalescing (geometry.rs).
     overlay: OverlayState,
-    /// Chrome zoom level the page reported (`Viewport`).
+    /// Chrome zoom level: the one set here, or the page reported (`Viewport`).
     zoom_level: f64,
+    /// Zoom per host (shared by every block through `Browsers`).
+    zoom_prefs: Arc<Mutex<zoom::ZoomPrefs>>,
     /// The page's scroll offset the host last reported (CSS px).
     scroll: (f32, f32),
     /// The open context menu (the host asked; the app draws it).
@@ -506,6 +513,12 @@ pub struct BrowserView {
     refused_at: Option<std::time::Instant>,
     /// Whether the mode strip (markup tools, the agent lease) was drawn last render.
     strip_shown: bool,
+    /// JS dialogs, the file chooser and download notices (dialogs.rs, fork-host's).
+    dialogs: Entity<PageDialogs>,
+    /// The app's downloads (shared by every block); the bar's ⬇ opens the list.
+    downloads: Downloads,
+    downloads_open: bool,
+    _dialogs: Subscription,
 }
 
 /// The find bar: its input, what was last searched and the host's "active of count".
@@ -631,6 +644,8 @@ impl BrowserView {
         });
         let off = cx.on_blur(&focus, window, |v, _, cx| v.input.update(cx, |i, _| i.set_focused(false)));
         bind_keys(cx);
+        let downloads = Downloads::default();
+        let (dialogs, dialogs_sub) = Self::make_dialogs(id, &link, downloads.clone(), cx);
         let address = cx.new(|cx| InputState::new(window, cx).placeholder("Search or enter address"));
         let typed = cx.subscribe_in(&address, window, |v, input, ev: &InputEvent, window, cx| match ev {
             InputEvent::PressEnter { .. } => {
@@ -683,12 +698,17 @@ impl BrowserView {
             probe: None,
             overlay: OverlayState::default(),
             zoom_level: 0.0,
+            zoom_prefs: Default::default(),
             scroll: (0.0, 0.0),
             menu: None,
             find: None,
             markup: cx.new(|_| Markup::default()),
             refused_at: None,
             strip_shown: false,
+            dialogs,
+            downloads,
+            downloads_open: false,
+            _dialogs: dialogs_sub,
         }
     }
 
@@ -740,10 +760,23 @@ impl BrowserView {
 
     pub fn on_host(&mut self, msg: HostToApp, cx: &mut Context<Self>) {
         use HostToApp as H;
+        // Dialogs, the file chooser and downloads are the dialogs entity's (a crash also clears it).
+        let dialog = self.dialogs.update(cx, |d, cx| d.on_host(&msg, cx));
+        if dialog {
+            cx.notify();
+            return;
+        }
         match msg {
             H::Url { url, .. } => {
                 if url != self.state.url {
                     self.overlay.changed(Change::Navigate);
+                    // Another host: its remembered zoom (Chrome keeps zoom per host the same way).
+                    if zoom::host_of(&url) != zoom::host_of(&self.state.url) {
+                        let level = self.zoom_prefs.lock().unwrap().level_for(&url);
+                        if (level - self.zoom_level).abs() > 1e-6 {
+                            self.apply_zoom(level);
+                        }
+                    }
                 }
                 if url != self.state.url {
                     self.state.url = url.clone();
@@ -921,6 +954,83 @@ impl BrowserView {
     /// Overlay rects to draw now, in page DIPs (empty while stale).
     pub fn overlay_rects(&self) -> &[Rect] {
         self.overlay.shown()
+    }
+
+    fn make_dialogs(id: &str, link: &Arc<HostClient>, downloads: Downloads, cx: &mut Context<Self>) -> (Entity<PageDialogs>, Subscription) {
+        let link = link.clone() as Arc<dyn HostLink>;
+        let dialogs = cx.new(|cx| PageDialogs::new(id, link, downloads, cx));
+        let sub = cx.subscribe(&dialogs, |_, _, ev: &DialogsEvent, cx| match ev {
+            DialogsEvent::Notice(n) => cx.emit(BrowserEvent::Notice(n.clone())),
+        });
+        (dialogs, sub)
+    }
+
+    /// Share the app's download list (Browsers hands every block the same one).
+    pub fn use_downloads(&mut self, downloads: Downloads, cx: &mut Context<Self>) {
+        let (dialogs, sub) = Self::make_dialogs(&self.id.clone(), &self.link, downloads.clone(), cx);
+        (self.dialogs, self._dialogs, self.downloads) = (dialogs, sub, downloads);
+    }
+
+    /// The page's dialogs (a JS dialog on screen, tests answer it).
+    pub fn dialogs(&self) -> &Entity<PageDialogs> {
+        &self.dialogs
+    }
+
+    pub fn toggle_downloads(&mut self, cx: &mut Context<Self>) {
+        self.downloads_open = !self.downloads_open;
+        cx.notify();
+    }
+
+    pub fn downloads_open(&self) -> bool {
+        self.downloads_open
+    }
+
+    fn downloads_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.downloads_open {
+            return None;
+        }
+        let list = self.downloads.list();
+        let rows = list.iter().rev().take(12).map(|d| {
+            let state = match d.state {
+                DownloadState::Started => "starting".to_string(),
+                DownloadState::Progress => match d.total {
+                    Some(t) if t > 0 => format!("{} %", d.received * 100 / t),
+                    _ => format!("{} KB", d.received / 1024),
+                },
+                DownloadState::Done => "done".into(),
+                DownloadState::Failed => "failed".into(),
+            };
+            div()
+                .flex()
+                .flex_col()
+                .px_2()
+                .py_1()
+                .child(div().text_sm().child(d.name.clone()))
+                .child(div().text_xs().opacity(0.6).child(format!("{state} · {}", d.path.clone().unwrap_or_else(|| d.url.clone()))))
+        });
+        Some(
+            div()
+                .id("downloads-panel")
+                .absolute()
+                .top(px(4.))
+                .right(px(8.))
+                .w(px(320.))
+                .py_1()
+                .bg(rgb(0xffffff))
+                .text_color(rgb(0x1a1a1a))
+                .border_1()
+                .border_color(rgb(0xc8c8c8))
+                .rounded_md()
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down_out(cx.listener(|v, _, _, cx| {
+                    v.downloads_open = false;
+                    cx.notify();
+                }))
+                .child(div().px_2().text_xs().opacity(0.6).child(if list.is_empty() { "No downloads yet" } else { "Downloads" }))
+                .children(rows)
+                .into_any_element(),
+        )
     }
 
     /// Drain what `BrowserInput` routed away from the page (part 4's owners): markup draws,
@@ -1249,6 +1359,30 @@ impl BrowserView {
         )
     }
 
+    /// Set the page zoom (Chrome level) and remember it for this host.
+    pub fn set_zoom(&mut self, level: f64, cx: &mut Context<Self>) {
+        self.apply_zoom(level);
+        self.zoom_prefs.lock().unwrap().set(&self.state.url, level);
+        cx.notify();
+    }
+
+    fn apply_zoom(&mut self, level: f64) {
+        self.zoom_level = level;
+        self.overlay.changed(Change::Zoom);
+        self.link.send(AppToHost::SetZoom { id: self.id.clone(), level });
+    }
+
+    /// cmd-plus / cmd-minus: Chrome's next preset in or out.
+    pub fn zoom_step(&mut self, zoom_in: bool, cx: &mut Context<Self>) {
+        let level = zoom::step(self.zoom_level, zoom_in);
+        self.set_zoom(level, cx);
+    }
+
+    /// Share the app's per-host zoom levels.
+    pub fn use_zoom_prefs(&mut self, prefs: Arc<Mutex<zoom::ZoomPrefs>>) {
+        self.zoom_prefs = prefs;
+    }
+
     /// The page zoom level (Chrome's: 0 is 100 %).
     pub fn zoom_level(&self) -> f64 {
         self.zoom_level
@@ -1305,6 +1439,11 @@ impl BrowserView {
             // Modes (part 4's owners): pick an element, mark up the page.
             .child(button("⌖", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx))))
             .child(button("✎", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Markup, cx))))
+            // The zoom label shows only off 100 %; a click resets it.
+            .when(self.zoom_level.abs() > 1e-6, |d| {
+                d.child(div().id("zoom-label").px_1().rounded_sm().cursor_pointer().bg(hsla(0., 0., 0.5, 0.15)).child(zoom::percent(self.zoom_level)).on_click(cx.listener(|v, _, _, cx| v.set_zoom(0.0, cx))))
+            })
+            .child(button("⬇", true).on_click(cx.listener(|v, _, _, cx| v.toggle_downloads(cx))))
     }
 
     fn shown_url(&self) -> String {
@@ -1338,8 +1477,7 @@ impl Render for BrowserView {
         let page = div()
             .id("page")
             .relative()
-            .flex_1()
-            .min_h_0()
+            .size_full()
             .track_focus(&self.focus)
             .cursor(input::cursor_style(&self.state.cursor))
             // A click focuses the page, in the capture phase: part 4's listeners stop the event.
@@ -1425,6 +1563,15 @@ impl Render for BrowserView {
         // The context menu over everything in the page; it takes the mouse first (occlude).
         let menu = self.menu_element(cx);
         let page = page.children(menu);
+        // A JS dialog and the downloads list sit beside the page element, over it: keys and clicks in
+        // them must not bubble into the page's input listeners.
+        let page = div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(page)
+            .child(self.dialogs.clone())
+            .children(self.downloads_panel(cx));
         let strip = self.mode_strip(cx);
         self.strip_shown = strip.is_some();
         // After any input event, drain what BrowserInput routed away from the page (its own
@@ -1462,6 +1609,9 @@ impl Render for BrowserView {
                 }
             }))
             .on_action(cx.listener(|v, _: &OpenFind, window, cx| v.open_find(window, cx)))
+            .on_action(cx.listener(|v, _: &ZoomIn, _, cx| v.zoom_step(true, cx)))
+            .on_action(cx.listener(|v, _: &ZoomOut, _, cx| v.zoom_step(false, cx)))
+            .on_action(cx.listener(|v, _: &ZoomReset, _, cx| v.set_zoom(0.0, cx)))
             .on_action(cx.listener(|v, _: &FocusAddress, window, cx| {
                 v.address.update(cx, |a, cx| {
                     a.focus(window, cx);
@@ -1487,6 +1637,10 @@ fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new(&format!("{cmd}-l"), FocusAddress, Some("Browser")),
         KeyBinding::new(&format!("{cmd}-f"), OpenFind, Some("Browser")),
+        KeyBinding::new(&format!("{cmd}-="), ZoomIn, Some("Browser")),
+        KeyBinding::new(&format!("{cmd}-+"), ZoomIn, Some("Browser")),
+        KeyBinding::new(&format!("{cmd}--"), ZoomOut, Some("Browser")),
+        KeyBinding::new(&format!("{cmd}-0"), ZoomReset, Some("Browser")),
     ]);
 }
 
@@ -1501,6 +1655,10 @@ pub struct Browsers {
     agent: Option<Arc<Mutex<Agent>>>,
     /// The browser that last took the keyboard: agent commands' default target.
     pub focused: Option<BrowserId>,
+    /// Zoom per host, `$HERDR_APP_HOME/browser/zoom.json`, loaded with the first block.
+    zoom: Option<Arc<Mutex<zoom::ZoomPrefs>>>,
+    /// Every download this run, shared by all blocks (`browser.downloads` reads it).
+    pub downloads: Downloads,
 }
 
 impl Browsers {
@@ -1543,6 +1701,14 @@ impl Browsers {
         agent.lock().unwrap().run(name, args, self, &focus, reply)
     }
 
+    // HERDR: browser block (part 5). The person picked an element: the agent captures it for `browser.pick`.
+    pub fn picked(&mut self, id: &str, x: f32, y: f32) {
+        let link = self.link_arc();
+        if let Some(agent) = &self.agent {
+            agent.lock().unwrap().picked(&id.to_owned(), x, y, &*link);
+        }
+    }
+
     /// Match the views to `blocks` (every browser block in every layout, as id and block):
     /// new blocks get a view (`on_event` hears its url changes), gone ones close their page.
     pub fn sync<W: 'static>(
@@ -1569,7 +1735,15 @@ impl Browsers {
                 continue;
             }
             let (link, states) = (self.link_arc(), self.states.clone());
-            let view = cx.new(|cx| BrowserView::new(&id, block, link, states, window, cx));
+            let downloads = self.downloads.clone();
+            let dir = link.config().dir.clone();
+            let prefs = self.zoom.get_or_insert_with(|| Arc::new(Mutex::new(zoom::ZoomPrefs::load(dir.join("zoom.json"))))).clone();
+            let view = cx.new(|cx| {
+                let mut v = BrowserView::new(&id, block, link, states, window, cx);
+                v.use_downloads(downloads, cx);
+                v.use_zoom_prefs(prefs);
+                v
+            });
             let key = id.clone();
             let on = on_event.clone();
             let sub = cx.subscribe_in(&view, window, move |w, _, ev, window, cx| on(w, &key, ev, window, cx));
