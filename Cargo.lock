@@ -3707,6 +3707,7 @@ dependencies = [
  "gpui-pre-platform",
  "gpui-pre-windows",
  "gpui-shell",
+ "herdr-browser-protocol",
  "image",
  "libc",
  "notify",
