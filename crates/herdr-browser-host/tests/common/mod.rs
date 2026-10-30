@@ -14,6 +14,11 @@ use std::process::{Child, Command};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+thread_local! {
+    /// The newest non-frame lines, for timeout reports.
+    static RECENT: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub fn real_host() -> Option<PathBuf> {
     std::env::var_os("HERDR_BROWSER_HOST").filter(|v| !v.is_empty()).map(PathBuf::from)
 }
@@ -81,6 +86,14 @@ impl Host {
     /// The next message, or None after `wait`.
     pub fn next(&mut self, wait: Duration) -> Option<HostToApp> {
         let line = self.rx.recv_timeout(wait).ok()?;
+        if !line.contains("\"type\":\"frame\"") {
+            RECENT.with_borrow_mut(|r| {
+                if r.len() == 8 {
+                    r.remove(0);
+                }
+                r.push(line.chars().take(160).collect());
+            });
+        }
         if std::env::var_os("HERDR_TEST_TRACE").is_some() {
             eprintln!("<- {line}");
         }
@@ -93,7 +106,10 @@ impl Host {
         let end = Instant::now() + wait;
         loop {
             let left = end.saturating_duration_since(Instant::now());
-            let Some(m) = self.next(left) else { panic!("timed out after {wait:?}") };
+            let Some(m) = self.next(left) else {
+                let recent = RECENT.with_borrow(|r| r.join("\n  "));
+                panic!("timed out after {wait:?}; last non-frame messages:\n  {recent}")
+            };
             if f(&m) {
                 return m;
             }
@@ -179,22 +195,32 @@ impl Pages {
     pub fn start(pages: Vec<(&'static str, String)>) -> Pages {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let pages = std::sync::Arc::new(pages);
         std::thread::spawn(move || {
+            // One thread per connection: Chrome opens speculative preconnects that send nothing,
+            // and a blocking read on one of them stalled every later request (cold-start flakes).
             for conn in listener.incoming() {
                 let Ok(mut conn) = conn else { continue };
-                let mut buf = [0u8; 4096];
-                let n = conn.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
-                let path = req.split_whitespace().nth(1).unwrap_or("/").trim_start_matches('/').to_string();
-                let (status, body) = match pages.iter().find(|(p, _)| *p == path) {
-                    Some((_, body)) => ("200 OK", body.clone()),
-                    None => ("404 Not Found", "not found".to_string()),
-                };
-                let _ = write!(
-                    conn,
-                    "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
+                let pages = pages.clone();
+                std::thread::spawn(move || {
+                    let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
+                    let mut buf = [0u8; 4096];
+                    let n = conn.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").trim_start_matches('/').to_string();
+                    let (status, body) = match pages.iter().find(|(p, _)| *p == path) {
+                        Some((_, body)) => ("200 OK", body.clone()),
+                        None => ("404 Not Found", "not found".to_string()),
+                    };
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
             }
         });
         Pages { port }

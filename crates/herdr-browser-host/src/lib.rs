@@ -11,6 +11,7 @@ use std::io;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 
+pub mod downloads;
 mod stub;
 #[cfg(all(feature = "cef", target_os = "macos"))]
 pub mod cef;
