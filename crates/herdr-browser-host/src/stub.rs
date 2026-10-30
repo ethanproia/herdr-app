@@ -81,7 +81,13 @@ impl<A: SurfaceAlloc> StubHost<A> {
         let mut out = Vec::new();
         match msg {
             M::Hello { .. } => out.push(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: "stub".into(), cdp_port: None, cdp_pipe: false }),
-            M::Create { id, url, size, scale, .. } => {
+            M::Create { id, url, size, scale, profile } => {
+                if let Some(p) = profile.as_deref().filter(|p| !p.is_empty() && *p != "default")
+                    && !crate::downloads::is_profile_name(p)
+                {
+                    out.push(HostToApp::Error { id: Some(id), message: format!("bad profile name {p:?}: use letters, digits, - and _") });
+                    return out;
+                }
                 let url = url.unwrap_or_else(|| "about:blank".into());
                 let b = Browser { px: pixels(size, scale), scale, seq: 0, in_flight: None, pending: false, history: vec![url.clone()], pos: 0 };
                 self.browsers.insert(id.clone(), b);
@@ -95,7 +101,13 @@ impl<A: SurfaceAlloc> StubHost<A> {
                 }
             }
             M::Shutdown => {}
-            M::SetColorScheme { .. } => {}
+            // No pages to recolour: say so, so tests see the message was handled, not dropped.
+            M::SetColorScheme { dark } => {
+                let scheme = if dark { "dark" } else { "light" };
+                for id in self.browsers.keys() {
+                    out.push(echo(id, format!("color-scheme {scheme}")));
+                }
+            }
             other => {
                 let id = browser_id(&other).to_string();
                 if !self.browsers.contains_key(&id) {
@@ -159,6 +171,8 @@ impl<A: SurfaceAlloc> StubHost<A> {
             M::Input { event, .. } => out.push(echo(&id, encode(&event))),
             // The stub knows no page: an overlay query answers with no rects, echoing req and epoch.
             M::Overlay { req, epoch, .. } => out.push(HostToApp::OverlayRects { id: id.clone(), req, epoch, rects: vec![], frames: vec![] }),
+            // The stub knows no page: style requests answer "no such element".
+            M::Styles { req, .. } | M::SetStyle { req, .. } | M::RevertStyle { req, .. } => out.push(HostToApp::StylesResult { id: id.clone(), req, ok: false, rows: vec![] }),
             // The stub paints nothing real; visibility changes are only echoed.
             M::MenuResult { command, .. } => out.push(echo(&id, format!("menu {command:?}"))),
             M::Edit { command, .. } => out.push(echo(&id, format!("edit {}", encode(&command).trim_matches('"')))),
@@ -216,7 +230,7 @@ fn browser_id(m: &AppToHost) -> &str {
     use AppToHost as M;
     match m {
         M::Create { id, .. } | M::Close { id } | M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. }
-        | M::Stop { id } | M::Resize { id, .. } | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Overlay { id, .. } | M::SetVisible { id, .. } | M::MenuResult { id, .. } | M::Input { id, .. } | M::Edit { id, .. }
+        | M::Stop { id } | M::Resize { id, .. } | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Overlay { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } | M::MenuResult { id, .. } | M::Input { id, .. } | M::Edit { id, .. }
         | M::FrameAck { id, .. } | M::Find { id, .. } | M::StopFind { id, .. } | M::DevTools { id, .. } | M::Eval { id, .. }
         | M::Screenshot { id, .. } | M::FileChooserResult { id, .. } | M::DialogResult { id, .. } => id,
         M::Hello { .. } | M::SetColorScheme { .. } | M::Shutdown => "",

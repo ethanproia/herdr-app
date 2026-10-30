@@ -26,20 +26,31 @@ fn frames_have_the_block_size_times_scale() {
 }
 
 #[test]
-fn one_frame_in_flight_until_ack() {
+fn at_most_two_frames_in_flight_until_ack() {
+    // Contract (FrameAck): at most two unacked frames per browser; newer paints wait as one
+    // pending frame. The stub sends one at a time, which also satisfies it.
     let p = pages();
     let mut h = Host::start("flow");
     create(&mut h, "b1", &p.url("a"), 100.0, 50.0, 1.0);
-    let (seq, _, _) = h.frame("b1");
-    // Without an ack nothing more may arrive, even across a resize.
-    h.send(AppToHost::Resize { id: "b1".into(), size: Size { w: 120.0, h: 60.0 }, scale: 1.0 });
+    let mut unacked = vec![h.frame("b1").0];
+    // Two resizes give the host two more paints; without acks it may send only one more frame.
+    for w in [120.0, 140.0] {
+        h.send(AppToHost::Resize { id: "b1".into(), size: Size { w, h: 60.0 }, scale: 1.0 });
+        std::thread::sleep(SEC / 2);
+    }
     let end = std::time::Instant::now() + 2 * SEC;
     while let Some(m) = h.next(end.saturating_duration_since(std::time::Instant::now())) {
-        assert!(!matches!(m, HostToApp::Frame { .. }), "frame sent while {seq} was in flight: {m:?}");
+        if let HostToApp::Frame { seq, .. } = m {
+            unacked.push(seq);
+        }
     }
-    h.send(AppToHost::FrameAck { id: "b1".into(), seq });
-    let (_, surface) = h.frame_of_size("b1", PixelSize { w: 120, h: 60 });
-    assert_eq!(herdr_browser_surface::import(&surface).unwrap().size(), PixelSize { w: 120, h: 60 });
+    assert!(unacked.len() <= 2, "{} frames unacked at once: {unacked:?}", unacked.len());
+    // Ack what we have: the newest size arrives.
+    for seq in unacked {
+        h.send(AppToHost::FrameAck { id: "b1".into(), seq });
+    }
+    let (_, surface) = h.frame_of_size("b1", PixelSize { w: 140, h: 60 });
+    assert_eq!(herdr_browser_surface::import(&surface).unwrap().size(), PixelSize { w: 140, h: 60 });
     h.shutdown();
 }
 
@@ -99,5 +110,17 @@ fn create_reports_a_cdp_target_and_edit_is_accepted() {
     h.send(AppToHost::Edit { id: "b1".into(), command: EditCommand::SelectAll });
     // Edit has no reply of its own; a following eval proves the host is still serving.
     assert!(h.eval("b1", 2, "1").0);
+    h.shutdown();
+}
+
+#[test]
+fn bad_profile_names_are_rejected() {
+    let p = pages();
+    let mut h = Host::start("bad-profile");
+    h.send(AppToHost::Create { id: "b1".into(), url: Some(p.url("a")), size: Size { w: 10.0, h: 10.0 }, scale: 1.0, profile: Some("../escape".into()) });
+    match h.next(10 * SEC) {
+        Some(HostToApp::Error { id: Some(i), message }) => assert!(i == "b1" && message.contains("profile"), "{message}"),
+        m => panic!("expected a profile error, got {m:?}"),
+    }
     h.shutdown();
 }

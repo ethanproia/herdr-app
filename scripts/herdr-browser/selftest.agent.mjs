@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 import { startStandin } from "./standin-chrome.mjs";
+import { readPng } from "./png.mjs";
 const onApp = process.env.HERDR_BROWSER_SELFTEST === "app";
 const dir = onApp ? process.env.HERDR_BROWSER_DIR : mkdtempSync(join(tmpdir(), "browser-agenttest-"));
 const env = { ...process.env, HERDR_BROWSER_DIR: dir, HERDR_BROWSER_BACKEND: onApp ? "app" : "standin" };
@@ -92,6 +93,25 @@ try {
   const bb = await json("browser_get_bounding_box", T, `ref=${sel}`);
   check(bb.width > 10 && bb.height > 5, `get_bounding_box (${bb.width}x${bb.height})`);
   check((await json("browser_highlight", T, `ref=${sel}`, "durationMs=100")).ok, "highlight");
+  // A3: a screenshot is full resolution: PNG pixels = CSS viewport x devicePixelRatio, on the agent path and,
+  // on the app, on `herdr-app do browser.screenshot` (the host's own capture).
+  const [vw, vh, dpr] = (await json("eval", T, "expression=([innerWidth, innerHeight, devicePixelRatio])")).value ?? [];
+  const full = readPng(await cli("screenshot", T, `path=${join(dir, "a3.png")}`));
+  check(vw > 0 && full.width === Math.round(vw * dpr) && full.height === Math.round(vh * dpr), `A3 agent screenshot is full resolution (${full.width}x${full.height} for ${vw}x${vh} at ${dpr}x)`);
+  if (onApp) {
+    const hostShot = (await appDo("browser.screenshot", { id: T, path: join(dir, "a3-host.png") })).path;
+    const h = hostShot ? readPng(hostShot) : { width: 0, height: 0 };
+    check(h.width === Math.round(vw * dpr) && h.height === Math.round(vh * dpr), `A3 herdr-app do browser.screenshot is full resolution (${h.width}x${h.height})`);
+  }
+  // A4: the highlight is drawn in the page: the pixel just outside the element's left edge turns magenta, then clears.
+  const greet = r2(/button "Greet"/), gb = await json("browser_get_bounding_box", T, `ref=${greet}`);
+  const edge = (png) => png.pixel((gb.x - 1.5) * dpr, (gb.y + gb.height / 2) * dpr);
+  const magenta = ([r, g, b]) => r > 200 && g < 90 && b > 120;
+  await json("browser_highlight", T, `ref=${greet}`, "durationMs=1500");
+  const lit = readPng(await cli("screenshot", T, `path=${join(dir, "a4-on.png")}`));
+  await new Promise((r) => setTimeout(r, 1800));
+  const off = readPng(await cli("screenshot", T, `path=${join(dir, "a4-off.png")}`));
+  check(magenta(edge(lit)) && !magenta(edge(off)), `A4 highlight is visible in the pixels, then gone (on ${edge(lit)}, off ${edge(off)})`);
   check((await json("browser_mouse_click_xy", T, "x=3", "y=3")).ok, "mouse_click_xy");
   check((await json("browser_drag", T, `sourceRef=${r2(/text "drag"/)}`, `targetRef=${r2(/text "drop"/)}`)).to?.x > 0, "drag between refs");
   check((await json("browser_press_key", T, "key=Tab")).ok, "press_key");
@@ -144,6 +164,8 @@ try {
   await new Promise((r) => setTimeout(r, 800));
   check(/DevTools is open/.test((await cli("text", T))), "refuses while DevTools is open for the tab");
   await fetch(`${cdpHttp()}/json/close/${dt.id}`);
+  // Closing is asynchronous: wait until the inspector target has left the list, not a fixed time.
+  for (let i = 0; i < 100 && (await (await fetch(`${cdpHttp()}/json/list`)).json()).some((t) => t.id === dt.id); i++) await new Promise((r) => setTimeout(r, 50));
   check((await cli("text", T)).includes("Hello"), "works again after DevTools closes");
 
   // X5: the agent daemon answers only token holders and never a web page.
