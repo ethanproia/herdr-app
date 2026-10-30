@@ -900,13 +900,14 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
 }
 
 // HERDR: 32BGRA surfaces (browser block frames). The texture view is BGRA8Unorm, so sampling
-// already returns RGBA. Blending is straight alpha like the other pipelines (CEF frames are
-// premultiplied; identical for opaque pages, which is the common case).
+// returns RGBA. CEF frames are premultiplied but the shared pipeline blend is straight alpha
+// (SourceAlpha, OneMinusSourceAlpha), so un-premultiply here.
 fragment float4 surface_bgra_fragment(SurfaceFragmentInput input [[stage_in]],
                                       texture2d<float> bgra_texture
                                       [[texture(SurfaceInputIndex_YTexture)]]) {
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
-  return bgra_texture.sample(texture_sampler, input.texture_position);
+  float4 c = bgra_texture.sample(texture_sampler, input.texture_position);
+  return c.a > 0.0 ? float4(c.rgb / c.a, c.a) : float4(0.0);
 }
 
 float4 hsla_to_rgba(Hsla hsla) {

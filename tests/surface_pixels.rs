@@ -22,14 +22,29 @@ mod imp {
         fn CVPixelBufferCreateWithIOSurface(a: *const c_void, s: *const c_void, attrs: *const c_void, out: *mut CVPixelBufferRef) -> i32;
     }
 
-    struct Scene(CVPixelBuffer);
+    struct Scene(CVPixelBuffer, u32);
     impl Render for Scene {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().bg(rgb(0x000000)).child(
+            div().size_full().bg(rgb(self.1)).child(
                 div().absolute().left(px(10.)).top(px(10.)).w(px(40.)).h(px(20.))
                     .child(surface(self.0.clone()).size_full().object_fit(ObjectFit::Fill)),
             )
         }
+    }
+
+    /// Premultiplied white at 50% alpha, the way CEF hands frames over.
+    fn half_white() -> (herdr_browser_surface::Surface, CVPixelBuffer) {
+        let s = herdr_browser_surface::create_pixels(PixelSize { w: 80, h: 40 }).unwrap();
+        s.fill([128, 128, 128, 128]).unwrap();
+        let b = wrap(&s);
+        (s, b)
+    }
+
+    fn wrap(s: &herdr_browser_surface::Surface) -> CVPixelBuffer {
+        let mut out: CVPixelBufferRef = std::ptr::null_mut();
+        let k = unsafe { CVPixelBufferCreateWithIOSurface(std::ptr::null(), s.as_ptr(), std::ptr::null(), &mut out) };
+        assert_eq!(k, 0, "CVPixelBufferCreateWithIOSurface");
+        unsafe { CVPixelBuffer::wrap_under_create_rule(out) }
     }
 
     /// Left half red, right half blue, 80x40 px (40x20 DIPs at 2x).
@@ -42,10 +57,8 @@ mod imp {
             }
         }
         s.write_bgra(&px).unwrap();
-        let mut out: CVPixelBufferRef = std::ptr::null_mut();
-        let k = unsafe { CVPixelBufferCreateWithIOSurface(std::ptr::null(), s.as_ptr(), std::ptr::null(), &mut out) };
-        assert_eq!(k, 0, "CVPixelBufferCreateWithIOSurface");
-        (s, unsafe { CVPixelBuffer::wrap_under_create_rule(out) })
+        let b = wrap(&s);
+        (s, b)
     }
 
     /// 420f buffer: Y=255, CbCr=128 everywhere -> white.
@@ -66,13 +79,13 @@ mod imp {
         b
     }
 
-    fn shoot(buf: CVPixelBuffer, expect: &[(f32, f32, [u8; 4])], label: &str) {
+    fn shoot(buf: CVPixelBuffer, bg: u32, expect: &[(f32, f32, [u8; 4])], label: &str) {
         let mut cx = HeadlessAppContext::with_platform(
             gpui_platform::current_platform(true).text_system(),
             std::sync::Arc::new(()),
             gpui_platform::current_headless_renderer,
         );
-        let window = cx.open_window(size(px(60.), px(40.)), |_, cx| cx.new(|_| Scene(buf))).unwrap();
+        let window = cx.open_window(size(px(60.), px(40.)), |_, cx| cx.new(|_| Scene(buf, bg))).unwrap();
         cx.update_window(window.into(), |_, window, cx| {
             let _ = window.draw(cx);
             let image = window.render_to_image().expect("headless render");
@@ -89,9 +102,13 @@ mod imp {
 
     pub fn run() {
         let (surface, buf) = bgra_buffer();
-        shoot(buf, &[(5., 5., [0, 0, 0, 255]), (15., 20., [255, 0, 0, 255]), (45., 20., [0, 0, 255, 255]), (55., 35., [0, 0, 0, 255])], "bgra");
+        shoot(buf, 0x000000, &[(5., 5., [0, 0, 0, 255]), (15., 20., [255, 0, 0, 255]), (45., 20., [0, 0, 255, 255]), (55., 35., [0, 0, 0, 255])], "bgra");
         drop(surface);
-        shoot(yuv_buffer(), &[(5., 5., [0, 0, 0, 255]), (30., 20., [255, 255, 255, 255])], "yuv420f");
+        let (half, buf) = half_white();
+        // Over red: 0.5 * white + 0.5 * red. Straight-alpha handling of premultiplied input gives ~(191, 64, 64).
+        shoot(buf, 0xff0000, &[(5., 5., [255, 0, 0, 255]), (30., 20., [255, 128, 128, 255])], "bgra-premultiplied");
+        drop(half);
+        shoot(yuv_buffer(), 0x000000, &[(5., 5., [0, 0, 0, 255]), (30., 20., [255, 255, 255, 255])], "yuv420f");
         println!("surface pixel test passed");
     }
 }
