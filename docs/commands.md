@@ -410,6 +410,105 @@ Close an overlay (default: the top dialog or popup).
 |---|---|
 | `id` | no |
 
+## `browser.open`
+
+Open a browser block at url (place "tab", default, or "right"/"down" of the focused pane); answers its id.
+
+| Argument | Required |
+|---|---|
+| `url` | no |
+| `place` | no |
+
+## `browser.navigate`
+
+Load url in a browser (id, or the one in pane; default: the focused browser).
+
+| Argument | Required |
+|---|---|
+| `url` | yes |
+| `id` | no |
+| `pane` | no |
+
+## `browser.back`
+
+Go back in a browser's history.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+
+## `browser.forward`
+
+Go forward in a browser's history.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+
+## `browser.reload`
+
+Reload a browser's page (ignore_cache: true skips the cache).
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+| `ignore_cache` | no |
+
+## `browser.stop`
+
+Stop loading a browser's page.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+
+## `browser.screenshot`
+
+Save a full-resolution PNG of a browser's page to path (default: browser/shots/ in the app's home); answers the path.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+| `path` | no |
+
+## `browser.eval`
+
+Run JavaScript in a browser's page; answers its value.
+
+| Argument | Required |
+|---|---|
+| `expr` | yes |
+| `id` | no |
+| `pane` | no |
+
+## `browser.find`
+
+Find text in a browser's page (answers the match count); no text ends the find.
+
+| Argument | Required |
+|---|---|
+| `text` | no |
+| `id` | no |
+| `pane` | no |
+| `forward` | no |
+| `match_case` | no |
+| `next` | no |
+
+## `browser.devtools`
+
+Open a browser's DevTools (open: false closes them).
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+| `open` | no |
+
 ## `app.help`
 
 Show the keys.
