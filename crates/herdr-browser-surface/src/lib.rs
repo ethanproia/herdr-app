@@ -167,6 +167,16 @@ impl Surface {
         false
     }
 
+    /// Hold the kernel-wide use count until the guard drops (what CVPixelBuffer and Metal do
+    /// implicitly); a host `FramePool` will not reuse the surface meanwhile.
+    pub fn use_guard(&self) -> UseGuard {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            sys::IOSurfaceIncrementUseCount(self.raw);
+        }
+        UseGuard(self.clone())
+    }
+
     /// Write tightly packed BGRA rows (`w * 4` bytes each) into the surface. For the stub host and tests.
     pub fn write_bgra(&self, pixels: &[u8]) -> Result<()> {
         self.with_lock(false, |base, stride| {
@@ -261,5 +271,17 @@ impl Drop for Surface {
 impl fmt::Debug for Surface {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Surface(id={}, {}x{})", self.id(), self.size.w, self.size.h)
+    }
+}
+
+/// See [`Surface::use_guard`].
+pub struct UseGuard(Surface);
+
+impl Drop for UseGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            sys::IOSurfaceDecrementUseCount(self.0.raw);
+        }
     }
 }

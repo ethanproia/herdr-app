@@ -195,22 +195,32 @@ impl Pages {
     pub fn start(pages: Vec<(&'static str, String)>) -> Pages {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let pages = std::sync::Arc::new(pages);
         std::thread::spawn(move || {
+            // One thread per connection: Chrome opens speculative preconnects that send nothing,
+            // and a blocking read on one of them stalled every later request (cold-start flakes).
             for conn in listener.incoming() {
                 let Ok(mut conn) = conn else { continue };
-                let mut buf = [0u8; 4096];
-                let n = conn.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
-                let path = req.split_whitespace().nth(1).unwrap_or("/").trim_start_matches('/').to_string();
-                let (status, body) = match pages.iter().find(|(p, _)| *p == path) {
-                    Some((_, body)) => ("200 OK", body.clone()),
-                    None => ("404 Not Found", "not found".to_string()),
-                };
-                let _ = write!(
-                    conn,
-                    "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
+                let pages = pages.clone();
+                std::thread::spawn(move || {
+                    let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
+                    let mut buf = [0u8; 4096];
+                    let n = conn.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").trim_start_matches('/').to_string();
+                    let (status, body) = match pages.iter().find(|(p, _)| *p == path) {
+                        Some((_, body)) => ("200 OK", body.clone()),
+                        None => ("404 Not Found", "not found".to_string()),
+                    };
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
             }
         });
         Pages { port }
