@@ -3844,6 +3844,8 @@ impl AppWindow {
                     this.browser_new_window(id, url, window, cx);
                     return;
                 }
+                // Pick results go to the agent tools (part 5) through the view; nothing for the layout.
+                crate::browser::view::BrowserEvent::Picked { .. } => return,
             };
             let tab = this.model.tabs().find(|t| crate::layout::browser_blocks(&t.root).iter().any(|(b, _)| b == id)).map(|t| t.id.clone());
             let changed = match tab.and_then(|t| this.model.tab_mut(&t)) {
