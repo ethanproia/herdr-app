@@ -151,7 +151,7 @@ impl HostLink for HostClient {
         {
             let mut s = self.shared.lock().unwrap();
             match &msg {
-                AppToHost::Create { id, url, size, scale } => {
+                AppToHost::Create { id, url, size, scale, .. } => {
                     s.open.insert(id.clone(), Open { url: url.clone(), size: *size, scale: *scale });
                 }
                 AppToHost::Resize { id, size, scale } => {
@@ -218,7 +218,7 @@ impl Writer {
                         open.sort_by(|a, b| a.0.cmp(&b.0));
                         self.replayed = open.iter().map(|(id, _)| id.clone()).collect();
                         for (id, o) in open {
-                            self.write(&AppToHost::Create { id, url: o.url, size: o.size, scale: o.scale });
+                            self.write(&AppToHost::Create { id, url: o.url, size: o.size, scale: o.scale, profile: None });
                         }
                     }
                     Err(e) => {
@@ -649,7 +649,7 @@ impl BrowserView {
         match self.sized {
             None => {
                 let url = Some(self.block.url.clone()).filter(|u| !u.is_empty());
-                self.link.send(AppToHost::Create { id: self.id.clone(), url, size, scale });
+                self.link.send(AppToHost::Create { id: self.id.clone(), url, size, scale, profile: None });
             }
             Some((s, k)) if (s.w - size.w).abs() < 0.5 && (s.h - size.h).abs() < 0.5 && k == scale => return,
             Some(_) => {
@@ -1052,8 +1052,8 @@ mod tests {
         let (seen, _kill) = fake_host(socket_of(&dir));
         let link = HostClient::new(HostConfig { dir: dir.clone(), program: "/nonexistent".into(), args: vec![], cdp_port: None });
         let (a, b) = (link.subscribe("a"), link.subscribe("b"));
-        link.send(AppToHost::Create { id: "a".into(), url: Some("https://a.test".into()), size: size(), scale: 2.0 });
-        link.send(AppToHost::Create { id: "b".into(), url: Some("https://b.test".into()), size: size(), scale: 2.0 });
+        link.send(AppToHost::Create { id: "a".into(), url: Some("https://a.test".into()), size: size(), scale: 2.0, profile: None });
+        link.send(AppToHost::Create { id: "b".into(), url: Some("https://b.test".into()), size: size(), scale: 2.0, profile: None });
         assert_eq!(recv(&a, |m| matches!(m, HostToApp::Url { .. })), HostToApp::Url { id: "a".into(), url: "https://a.test".into() });
         assert_eq!(recv(&b, |m| matches!(m, HostToApp::Url { .. })), HostToApp::Url { id: "b".into(), url: "https://b.test".into() });
         assert!(a.try_recv().is_err(), "a hears only its own events");
@@ -1069,7 +1069,7 @@ mod tests {
         let (seen, _kill) = fake_host(socket_of(&dir));
         let link = HostClient::new(HostConfig { dir, program: "/nonexistent".into(), args: vec![], cdp_port: None });
         let a = link.subscribe("a");
-        link.send(AppToHost::Create { id: "a".into(), url: Some("https://a.test".into()), size: size(), scale: 1.0 });
+        link.send(AppToHost::Create { id: "a".into(), url: Some("https://a.test".into()), size: size(), scale: 1.0, profile: None });
         recv(&a, |m| matches!(m, HostToApp::Url { .. }));
         link.close("a");
         link.close("a"); // twice: one Close
@@ -1089,7 +1089,7 @@ mod tests {
         let (_seen, kill) = fake_host(socket_of(&dir));
         let link = HostClient::new(HostConfig { dir: dir.clone(), program: "/nonexistent".into(), args: vec![], cdp_port: None });
         let a = link.subscribe("a");
-        link.send(AppToHost::Create { id: "a".into(), url: Some("https://a.test".into()), size: size(), scale: 2.0 });
+        link.send(AppToHost::Create { id: "a".into(), url: Some("https://a.test".into()), size: size(), scale: 2.0, profile: None });
         link.send(AppToHost::Navigate { id: "a".into(), url: "https://a.test/2".into() });
         recv(&a, |m| matches!(m, HostToApp::Url { url, .. } if url.ends_with("/2")));
         kill.send(()).unwrap();
@@ -1110,7 +1110,7 @@ mod tests {
         let dir = tmp("nohost");
         let link = HostClient::new(HostConfig { dir, program: "/nonexistent/herdr-browser-host".into(), args: vec![], cdp_port: None });
         let a = link.subscribe("a");
-        link.send(AppToHost::Create { id: "a".into(), url: None, size: size(), scale: 1.0 });
+        link.send(AppToHost::Create { id: "a".into(), url: None, size: size(), scale: 1.0, profile: None });
         let m = recv(&a, |m| matches!(m, HostToApp::Crashed { .. }));
         assert!(matches!(m, HostToApp::Crashed { reason, .. } if reason.contains("can't start")));
     }
@@ -1127,7 +1127,7 @@ mod tests {
         let link = HostClient::new(HostConfig { dir: dir.clone(), program, args: vec!["--stub".into()], cdp_port: None });
         let a = link.subscribe("a");
         assert!(UnixStream::connect(socket_of(&dir)).is_err(), "no host before the first send");
-        link.send(AppToHost::Create { id: "a".into(), url: Some("https://example.com".into()), size: size(), scale: 2.0 });
+        link.send(AppToHost::Create { id: "a".into(), url: Some("https://example.com".into()), size: size(), scale: 2.0, profile: None });
         recv(&a, |m| matches!(m, HostToApp::Url { url, .. } if url == "https://example.com"));
         let frame = recv(&a, |m| matches!(m, HostToApp::Frame { .. }));
         assert!(matches!(frame, HostToApp::Frame { size: PixelSize { w: 800, h: 600 }, .. }), "{frame:?}");
