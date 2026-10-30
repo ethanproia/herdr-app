@@ -90,6 +90,8 @@ fn main() {
     if let Some(c) = clip {
         assert_eq!(c, "http://127.0.0.1/y.html");
     }
+    // The stub echoes asynchronously: wait for the last None.
+    p.wait(Duration::from_secs(5), |p| p.console().iter().filter(|l| *l == "menu None").count() >= 4);
     let nones = p.console().iter().filter(|l| *l == "menu None").count();
     assert!(nones >= 4, "app rows close the host's menu with None: {nones}");
     println!("menu passed: drawn over the page, host command 102 sent, disabled row inert, Escape and click-outside dismiss, open-link and copy-link run in the app");

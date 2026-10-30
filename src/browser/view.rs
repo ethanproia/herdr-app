@@ -12,6 +12,7 @@ use super::input::{self, BrowserInput, OverlayEvent, Owner};
 use super::dialogs::{DialogsEvent, Downloads, PageDialogs};
 use super::markup::{self, Markup, Tool};
 use super::zoom;
+use super::styles::StylePanelView;
 use super::{annotate, region};
 
 /// Request ids the view uses for its own `PickInfo` questions (agents count from 1; style
@@ -23,6 +24,8 @@ pub const VIEW_REQ_BASE: u64 = 1 << 41;
 enum PageAsk {
     /// The element under a pick click, for the comment field (S7).
     CommentTarget,
+    /// The element under a pick click, for the style panel (S10).
+    StyleTarget,
     /// The element under a region's corner, to anchor it (S6).
     RegionAnchor(region::Rect),
 }
@@ -545,6 +548,10 @@ pub struct BrowserView {
     /// Page questions in flight (view-owned PickInfo reqs >= VIEW_REQ_BASE).
     asks: HashMap<u64, PageAsk>,
     next_ask: u64,
+    /// S10: the style panel on the picked element (beside the page); its answers wait for render.
+    styles_on_pick: bool,
+    style_panel: Option<Entity<StylePanelView>>,
+    style_results: Vec<(u64, bool, Vec<herdr_browser_protocol::StyleRow>)>,
     /// JS dialogs, the file chooser and download notices (dialogs.rs, fork-host's).
     dialogs: Entity<PageDialogs>,
     /// The app's downloads (shared by every block); the bar's ⬇ opens the list.
@@ -756,6 +763,9 @@ impl BrowserView {
             comment_target: None,
             asks: HashMap::new(),
             next_ask: 0,
+            styles_on_pick: false,
+            style_panel: None,
+            style_results: Vec::new(),
             dialogs,
             downloads,
             downloads_open: false,
@@ -933,6 +943,12 @@ impl BrowserView {
             H::ImeCaret { x, y, w, h, .. } => {
                 self.input.update(cx, |i, _| i.on_caret(x, y, w, h));
                 return;
+            }
+            // The style panel's answers (its reqs start at 1 << 40); applied in render (needs the window).
+            H::StylesResult { req, ok, rows, .. } => {
+                if self.style_panel.as_ref().is_some_and(|p| p.read(cx).owns(req)) {
+                    self.style_results.push((req, ok, rows));
+                }
             }
             H::PickInfoResult { req, ok, selector, label, rect, .. } if req >= VIEW_REQ_BASE => {
                 if let Some(ask) = self.asks.remove(&req) {
@@ -1132,6 +1148,11 @@ impl BrowserView {
                         self.hover_overlay(Pt { x: cx_, y: cy });
                         if self.comment_on_pick {
                             self.ask_target(PageAsk::CommentTarget, cx_, cy);
+                        } else if self.styles_on_pick {
+                            self.ask_target(PageAsk::StyleTarget, cx_, cy);
+                            self.input.update(cx, |i, _| {
+                                i.escape();
+                            });
                         } else {
                             self.input.update(cx, |i, _| {
                                 i.escape();
@@ -1195,8 +1216,23 @@ impl BrowserView {
                 let scroll = geo.viewport_to_page(Pt { x: self.scroll.0, y: self.scroll.1 });
                 self.regions.push(region::Region::new(r, anchor, (scroll.x, scroll.y)));
             }
+            PageAsk::StyleTarget => {
+                // Another pick replaces the open panel; nothing there closes it.
+                self.style_panel = target.map(|t| {
+                    let link = self.link.clone() as Arc<dyn HostLink>;
+                    let id = self.id.clone();
+                    cx.new(|_| StylePanelView::new(id, link, &t.selector))
+                });
+            }
             PageAsk::CommentTarget => match target {
                 Some(t) => {
+                    // With the style panel on too, the same element opens it beside the comment.
+                    if self.styles_on_pick {
+                        let link = self.link.clone() as Arc<dyn HostLink>;
+                        let id = self.id.clone();
+                        let sel = t.selector.clone();
+                        self.style_panel = Some(cx.new(|_| StylePanelView::new(id, link, &sel)));
+                    }
                     let entered = self.input.update(cx, |i, _| i.enter(Owner::Comment));
                     if entered {
                         self.comment_target = Some(t);
@@ -1230,6 +1266,24 @@ impl BrowserView {
         let mut v: Vec<u64> = self.asks.keys().copied().collect();
         v.sort();
         v
+    }
+
+    /// Styles-on-pick: a picked element opens the style panel (S10).
+    pub fn set_styles_on_pick(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.styles_on_pick = on;
+        if !on {
+            self.style_panel = None;
+        }
+        cx.notify();
+    }
+
+    pub fn style_panel(&self) -> Option<&Entity<StylePanelView>> {
+        self.style_panel.as_ref()
+    }
+
+    pub fn close_style_panel(&mut self, cx: &mut Context<Self>) {
+        self.style_panel = None;
+        cx.notify();
     }
 
     /// Comment-on-pick: a picked element opens a comment field (S7).
@@ -1674,6 +1728,10 @@ impl BrowserView {
             // Modes (part 4's owners): pick an element, mark up the page.
             .child(button("⌖", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx))))
             .child(button("✎", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Markup, cx))))
+            .child(button("🎨", true).when(self.styles_on_pick, |d| d.bg(hsla(0., 0., 0.5, 0.3))).on_click(cx.listener(|v, _, _, cx| {
+                let on = !v.styles_on_pick;
+                v.set_styles_on_pick(on, cx);
+            })))
             .child(button("💬", true).when(self.comment_on_pick, |d| d.bg(hsla(0., 0., 0.5, 0.3))).on_click(cx.listener(|v, _, _, cx| {
                 let on = !v.comment_on_pick;
                 v.set_comment_on_pick(on, cx);
@@ -1814,10 +1872,24 @@ impl Render for BrowserView {
         let page = div()
             .relative()
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .child(page)
             .child(self.dialogs.clone())
             .children(self.downloads_panel(cx));
+        // S10: the style panel in its own column beside the page.
+        if let Some(panel) = self.style_panel.clone() {
+            for (req, ok, rows) in std::mem::take(&mut self.style_results) {
+                panel.update(cx, |p, cx| p.on_result(req, ok, rows, window, cx));
+            }
+        }
+        let page = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .child(page)
+            .when_some(self.style_panel.clone(), |d, p| d.child(div().id("style-panel").flex_none().h_full().overflow_y_scroll().child(p)));
         let strip = self.mode_strip(cx);
         self.strip_shown = strip.is_some();
         // After any input event, drain what BrowserInput routed away from the page (its own
@@ -1855,6 +1927,9 @@ impl Render for BrowserView {
                 if v.menu.is_some() {
                     cx.stop_propagation();
                     v.choose_menu(None, cx);
+                } else if v.style_panel.is_some() && v.owner(cx) == Owner::Browse && v.find.is_none() {
+                    cx.stop_propagation();
+                    v.close_style_panel(cx);
                 } else if v.find.is_some() {
                     cx.stop_propagation();
                     v.close_find(window, cx);

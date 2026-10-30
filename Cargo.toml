@@ -113,6 +113,11 @@ path = "tests/browser_annotate.rs"
 harness = false
 
 [[test]]
+name = "browser_styles"
+path = "tests/browser_styles.rs"
+harness = false
+
+[[test]]
 name = "browser_pick_cef"
 path = "tests/browser_pick_cef.rs"
 harness = false
