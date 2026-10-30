@@ -1,0 +1,9 @@
+<!doctype html><title>raf</title>
+<style>body{margin:0;font:48px monospace} #n{padding:40px}</style><div id=n>0</div>
+<script>
+// window.rafCount: requestAnimationFrame callbacks so far; window.rafTimes: their timestamps (last 600).
+window.rafCount=0;window.rafTimes=[];const n=document.getElementById('n');
+function tick(t){window.rafCount++;window.rafTimes.push(t);if(window.rafTimes.length>600)window.rafTimes.shift();
+n.textContent=window.rafCount;n.style.background=`hsl(${window.rafCount*7%360} 70% 70%)`;requestAnimationFrame(tick)}
+requestAnimationFrame(tick);
+</script>

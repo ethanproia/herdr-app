@@ -1,0 +1,15 @@
+<!doctype html><title>form</title>
+<style>body{font:16px sans-serif;margin:16px} input,textarea,select,[contenteditable]{display:block;margin:8px 0;width:400px;font:16px sans-serif}
+textarea{height:80px} [contenteditable]{border:1px solid #888;min-height:40px}</style>
+<!-- positions are fixed so tests can click them: text at y~20, textarea ~60, select ~160, editable ~200 -->
+<input id=text autocomplete=off>
+<textarea id=area></textarea>
+<select id=sel><option>alpha</option><option>beta</option><option>gamma</option></select>
+<div id=edit contenteditable></div>
+<input id=pw type=password>
+<script>
+// window.log: every key/input/composition event as "type:key:data".
+window.log=[];for(const ev of ['keydown','keyup','input','compositionstart','compositionupdate','compositionend','beforeinput'])
+document.addEventListener(ev,e=>window.log.push(ev+':'+(e.key??'')+':'+(e.data??'')),true);
+function rect(id){const r=document.getElementById(id).getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}}
+</script>
