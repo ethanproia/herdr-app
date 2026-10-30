@@ -10,6 +10,8 @@
 #![allow(dead_code)]
 
 pub mod agent;
+// HERDR: part 5, the CDP broker (docs/browser-cdp-pipe.md).
+pub mod broker;
 pub mod cdp;
 // HERDR: part 4, design slice S7.
 pub mod annotate;

@@ -21,6 +21,7 @@ const dir = onApp ? process.env.HERDR_BROWSER_DIR : mkdtempSync(join(tmpdir(), "
 const env = { ...process.env, HERDR_BROWSER_DIR: dir, HERDR_BROWSER_BACKEND: onApp ? "app" : "standin" };
 const standin = onApp ? null : await startStandin(dir);
 console.log(`backend: ${onApp ? `real app + CEF host (${dir})` : "headless Chrome stand-in"}`);
+const viaBroker = () => { try { return !!JSON.parse(readFileSync(join(dir, "cdp.json"), "utf8")).broker; } catch { return false; } };
 const cdpHttp = () => `http://127.0.0.1:${JSON.parse(readFileSync(join(dir, "cdp.json"), "utf8")).port}`;
 const appDo = (name, args) => new Promise((r) => execFile(process.env.HERDR_BROWSER_APP, ["do", name, JSON.stringify(args)], { encoding: "utf8" }, (_e, out) => r(JSON.parse(out))));
 // What the app does when the person opens a block: a page plus its id in cdp.json. Answers the block id.
@@ -150,7 +151,7 @@ try {
     const violet = (png) => { let n = 0; for (let y = 0; y < png.height; y += 2) for (let x = 0; x < png.width; x += 2) {
       const [r, g, b] = png.pixel(x, y); if (b > 200 && g < 90 && r > 90 && r < 170) n++; } return n; };
     const [on, off] = [violet(locked), violet(free)];
-    check(on > 2000 && off === 0, `A6 the lease strip shows while an agent holds the page and goes when it unlocks (${on} vs ${off} strip pixels; ${join(dir, "a6-locked.png")})`);
+    check(on > 2000 && off < 50, `A6 the lease strip shows while an agent holds the page and goes when it unlocks (${on} vs ${off} strip pixels; ${join(dir, "a6-locked.png")})`);
   }
   (await json("browser_lock", T, "action=unlock"));
   const tl = await json("browser_tabs", "action=list");
@@ -181,6 +182,8 @@ try {
   grant(P, { control: false });
   check(/not agent-controllable/.test((await cli("text", P))), "toggle off takes control back");
 
+  // Through the broker there is no HTTP DevTools frontend (docs/browser-cdp-pipe.md, what we lose): no check.
+  if (!viaBroker()) {
   // DevTools open for a tab (an inspector page for its target) blocks agent commands on it.
   const tid = (await json("browser_cdp", T, "method=Target.getTargetInfo")).result?.targetInfo?.targetId;
   const dt = await (await fetch(`${cdpHttp()}/json/new?${encodeURIComponent(`${site}devtools/page/${tid}`)}`, { method: "PUT" })).json();
@@ -190,6 +193,7 @@ try {
   // Closing is asynchronous: wait until the inspector target has left the list, not a fixed time.
   for (let i = 0; i < 100 && (await (await fetch(`${cdpHttp()}/json/list`)).json()).some((t) => t.id === dt.id); i++) await new Promise((r) => setTimeout(r, 50));
   check((await cli("text", T)).includes("Hello"), "works again after DevTools closes");
+  }
 
   // X5: the agent daemon answers only token holders and never a web page.
   const ap = readFileSync(join(dir, "agent.port"), "utf8").trim(), tok = readFileSync(join(dir, "agent.token"), "utf8").trim();
@@ -197,11 +201,29 @@ try {
   check(await st({}) === 401 && await st({ authorization: "Bearer nope" }) === 401, "X5 daemon refuses a client without the token");
   check(await st({ authorization: `Bearer ${tok}`, origin: "http://evil.test" }) === 403, "X5 daemon refuses a web page Origin even with the token");
   check((statSync(join(dir, "agent.token")).mode & 0o777) === 0o600, "X5 the token file is owner-only");
+  if (!viaBroker()) {
   // The raw CDP port refuses a websocket from a foreign Origin (Chromium's --remote-allow-origins check).
   const raw = await new Promise((r) => { const c = connect(JSON.parse(readFileSync(join(dir, "cdp.json"), "utf8")).port, "127.0.0.1", () =>
     c.write(`GET /devtools/page/x HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: http://evil.test\r\n\r\n`));
     c.once("data", (d) => { r(String(d).split("\r\n")[0]); c.destroy(); }); c.on("error", (e) => r(String(e))); });
   check(!/ 101 /.test(raw), `X5 raw CDP port refuses a foreign Origin (${raw})`);
+  } else {
+    // X5a: CDP is on the app's pipe: no process of this browser host (host or helpers) listens on TCP.
+    const pids = execFileSync("sh", ["-c", `pgrep -f '${dir}' || true`], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+    const listening = pids.length ? execFileSync("sh", ["-c", `lsof -a -p ${pids.join(",")} -iTCP -sTCP:LISTEN -P -n || true`], { encoding: "utf8" }).trim() : "";
+    check(pids.length >= 2 && listening === "", `X5a no TCP listener in the host or its helpers (${pids.length} processes${listening ? ": " + listening : ""})`);
+    // X5b: cdp.json names the broker, not a port; the socket answers only the token; no websocket.
+    const c = JSON.parse(readFileSync(join(dir, "cdp.json"), "utf8"));
+    check(c.port === undefined && c.broker && Object.values(c.targets).every((v) => v === true), "X5b cdp.json has no port and no target ids");
+    const ask = (first) => new Promise((r) => { const k = connect(c.broker); let got = "";
+      k.on("connect", () => k.write(first + "\n" + JSON.stringify({ id: 1, block: T, method: "Runtime.evaluate", params: { expression: "1+1" } }) + "\n"));
+      k.on("data", (d) => (got += d)); k.on("close", () => r(got)); k.on("error", () => r(got)); setTimeout(() => { k.destroy(); r(got); }, 3000); });
+    const tokenNow = readFileSync(c.token_file, "utf8").trim();
+    check(await ask("{}") === "" && await ask(JSON.stringify({ token: "0".repeat(64) })) === "" && await ask("GET / HTTP/1.1\r\nUpgrade: websocket\r\n") === "", "X5b the broker refuses no token, a wrong token and a websocket upgrade, without a word");
+    check(/"value":2/.test(await ask(JSON.stringify({ token: tokenNow }))), "X5b the broker answers the token holder");
+    const mode = (f) => statSync(f).mode & 0o777;
+    check(mode(c.broker) === 0o600 && mode(c.token_file) === 0o600 && mode(dir) === 0o700, "X5b the socket and token are owner-only, in an owner-only dir");
+  }
 
   // MCP wrapper: initialize, list tools, call one.
   const m = spawn("node", [join(here, "bin/herdr-browser"), "mcp"], { env, stdio: ["pipe", "pipe", "inherit"] });

@@ -7,6 +7,7 @@
 // HERDR_BROWSER_BACKEND=standin: a plain headless Chrome stands in for the CEF host (tests); open and close
 // make targets over CDP HTTP and this daemon writes their ids into cdp.json itself.
 import { createServer } from "node:http";
+import { createConnection } from "node:net";
 import { execFile } from "node:child_process";
 import { readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, chmodSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -27,9 +28,37 @@ const events = new Map(); // CDP method -> [fn(params, session)]
 const openHooks = [];
 const routes = new Map();
 
+// One CDP connection to a block, either way the app publishes it in cdp.json: through the broker (agent.sock, a
+// token, the block's name; CDP on the app's pipe) or a page WebSocket on a TCP port (the stand-in; dev only on the app).
+// Both look like a WebSocket here: send, readyState, onopen/onmessage/onerror/onclose, close.
+function connectTo(id, targetId) {
+  const c = readCdp();
+  if (!c?.broker) return new WebSocket(`ws://${endpoint()}/devtools/page/${targetId}`);
+  const t = { readyState: 0, close: () => sock.destroy() };
+  const sock = createConnection(c.broker);
+  let buf = "";
+  sock.on("connect", () => {
+    sock.write(JSON.stringify({ token: readFileSync(c.token_file, "utf8").trim() }) + "\n");
+    t.readyState = WebSocket.OPEN; t.onopen?.();
+  });
+  sock.on("data", (d) => {
+    buf += d; let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const m = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
+      // The broker answers errors as text and tags events with the block; the WebSocket shape has neither.
+      const msg = m.id ? (m.error !== undefined ? { id: m.id, error: { message: m.error } } : { id: m.id, result: m.result }) : { method: m.method, params: m.params };
+      t.onmessage?.({ data: JSON.stringify(msg) });
+    }
+  });
+  sock.on("error", () => t.onerror?.());
+  sock.on("close", () => { t.readyState = 3; t.onclose?.(); });
+  t.send = (line) => { const m = JSON.parse(line); sock.write(JSON.stringify({ ...m, block: id }) + "\n"); };
+  return t;
+}
+
 function attach(id, targetId) {
   const p = new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://${endpoint()}/devtools/page/${targetId}`);
+    const ws = connectTo(id, targetId);
     let n = 0; const waiting = new Map();
     const s = { id, targetId, ws, state: { url: "", title: "", loading: false }, view: null };
     s.call = (method, params = {}) => new Promise((ok, fail) => {
@@ -75,7 +104,8 @@ async function sync() {
 // Not HERDR_APP_BIN: fork-run.sh reads that as the app binary, so a wrapper there runs itself forever.
 const app = (name, args) => new Promise((ok) => execFile(process.env.HERDR_BROWSER_APP || "herdr-app", ["do", name, JSON.stringify(args)],
   { encoding: "utf8", timeout: 30000 }, (e, out) => { try { ok(JSON.parse(out)); } catch { ok({ error: String(e?.message ?? out) }); } }));
-const targets = async () => (await (await fetch(`http://${endpoint()}/json/list`)).json());
+// Every target (for the DevTools check). Through the broker there is no target list and no HTTP DevTools frontend.
+const targets = async () => (readCdp()?.broker ? [] : (await (await fetch(`http://${endpoint()}/json/list`)).json()));
 
 async function openTab(id, place = "tab") {
   if (standin) {
