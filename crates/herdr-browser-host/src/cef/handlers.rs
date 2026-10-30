@@ -226,6 +226,10 @@ wrap_app! {
             for sw in ["use-mock-keychain", "no-startup-window", "noerrdialogs", "hide-crash-restore-bubble", "disable-features=MacAppCodeSignClone"] {
                 cl.append_switch(Some(&sw.into()));
             }
+            // CDP on fds 3 (in) and 4 (out), NUL-framed JSON; no TCP port (docs/browser-cdp-pipe.md).
+            if super::CDP_PIPE.load(std::sync::atomic::Ordering::SeqCst) {
+                cl.append_switch(Some(&"remote-debugging-pipe".into()));
+            }
         }
     }
 }
