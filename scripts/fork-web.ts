@@ -193,6 +193,15 @@ result.console_errors = [...new Set(consoleErrors)].slice(0, 10);
 result.console_error_count = consoleErrors.length;
 result.checks = checks;
 result.pass = !result.error && Object.values(checks).length > 0 && Object.values(checks).every(Boolean);
+// The harness's METRIC lines (docs/browser-parity-harness.md), then the full JSON.
+const metric = (id: string, v: any, unit: string, target: string) => v != null && console.log(`METRIC web_${scenario.toLowerCase()}_${id} ${v} ${unit} (target ${target})`);
+metric("pass", result.pass ? 1 : 0, "bool", "1");
+metric("load", result.load_ms, "ms", "<3000");
+metric("scroll_fps", result.scroll?.fps, "fps", ">=55");
+metric("play_fps", result.playback?.fps, "fps", ">=55");
+metric("dropped", result.playback?.dropped, "frames", "0");
+metric("results", result.results_ms, "ms", "<3000");
+metric("console_errors", result.console_error_count, "count", "0 own");
 console.log(JSON.stringify(result, null, 1));
 ws.close();
 process.exit(0);

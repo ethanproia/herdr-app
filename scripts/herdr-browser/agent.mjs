@@ -1,9 +1,11 @@
 // Agent control: agents drive and screenshot the browser blocks the person sees, over the host's CDP port.
 // Ported from the browser mod (server/agent.mjs); core.mjs now finds pages through $HERDR_APP_HOME/browser/cdp.json.
 // HTTP: POST /_agent {"cmd": name, "tab": id, ...args} -> JSON {ok, ...result} or {ok:false, error}. A tab is a block id.
-// Agents may act only on tabs they opened (cmd "open") or that the person marked controllable (cmd "allow" on=true).
+// Agents may act only on tabs they opened (cmd "open") or that the person granted "control" in the block. Grants are
+// app-owned: <dir>/grants.json = { "<block id>": { "control": bool, "cdp": bool, "capture": bool } }, written by the app
+// (src/browser/agent.rs Grants) from the person's UI; nothing an agent can call here writes it.
 // state.agent = true when the tab is agent-controllable; state.agentOpened = true when an agent opened it.
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const KEYS = { Enter: 13, Backspace: 8, Tab: 9, Escape: 27, Delete: 46, ArrowLeft: 37, ArrowRight: 39, ArrowUp: 38, ArrowDown: 40,
@@ -25,7 +27,9 @@ const SNAPSHOT = (o) => `(() => {
       if (r || (own && !O.interactive)) {
         const ref = "e" + (++n); c.setAttribute("data-hb-ref", ref);
         const name = (c.getAttribute("aria-label") || c.alt || c.placeholder || (r ? c.innerText : own) || "").replace(/\\s+/g, " ").trim().slice(0, 80);
-        const val = c.value !== undefined && c.tagName !== "BUTTON" && c.value !== "" ? " value=" + JSON.stringify(String(c.value).slice(0, 80)) : "";
+        // Never hand an agent a secret: passwords, card numbers, one-time codes and anything named like a credential.
+        const secret = c.type === "password" || /cc-|password|one-time-code/i.test(c.autocomplete || "") || /pass|secret|token|otp|cvv|cvc|ssn|card/i.test((c.name || "") + " " + (c.id || ""));
+        const val = c.value !== undefined && c.tagName !== "BUTTON" && c.value !== "" ? (secret ? " value=<hidden>" : " value=" + JSON.stringify(String(c.value).slice(0, 80))) : "";
         out.push("  ".repeat(d) + "- " + (r || "text") + (name ? " " + JSON.stringify(name) : "") + val + (c.href ? " href=" + c.getAttribute("href") : "") + " [ref=" + ref + "]");
         walk(c, d + 1);
       } else walk(c, d);
@@ -38,8 +42,15 @@ const SNAPSHOT = (o) => `(() => {
   return out.join("\\n");
 })()`;
 
+// Raw CDP an agent may send once the person grants "cdp": page inspection and rendering only; nothing that reaches
+// other tabs, the profile (cookies, storage), downloads, the browser process or the file system.
+export const CDP_ALLOWED = /^(DOM|CSS|Accessibility|Overlay|DOMSnapshot|Animation|Performance|Log|Debugger)\.|^(Runtime\.(evaluate|callFunctionOn|getProperties|releaseObject)|Page\.(captureScreenshot|getLayoutMetrics|getFrameTree|reload)|Emulation\.(setDeviceMetricsOverride|clearDeviceMetricsOverride|setEmulatedMedia)|Target\.getTargetInfo|Input\.dispatch(Mouse|Key|Touch)Event)$/;
+
 export default function register({ sessions, onEvent, onOpen, route, dir, openTab, closeTab, targets }) {
   const opened = new Set(); // tab ids an agent opened
+  const grants = () => { try { return JSON.parse(readFileSync(join(dir, "grants.json"), "utf8")); } catch { return {}; } };
+  const granted = (id, cap) => grants()[id]?.[cap] === true;
+  const controllable = (s) => (s.state.agent = opened.has(s.id) || granted(s.id, "control"));
   const shots = join(dir, "shots");
 
   onOpen((s) => {
@@ -91,7 +102,7 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
   // Map values can be the open() promise even after the page is ready (core keeps it), so await them all.
   const pages = async () => (await Promise.all([...sessions.values()])).filter((s) => s?.state);
   const tabs = async () => (await pages()).map((s) => ({ tab: s.id, url: s.state.url, title: s.state.title,
-    loading: s.state.loading, controllable: !!s.state.agent, agentOpened: !!s.state.agentOpened }));
+    loading: s.state.loading, controllable: controllable(s), agentOpened: !!s.state.agentOpened }));
 
   // Each fn(s, args) acts on one tab; the helper checks the tab exists and is controllable first.
   const acts = {
@@ -142,7 +153,11 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
     highlight: async (s, { ref, durationMs = 2000 }) => { await onEl(s, ref, `const o = e.style.outline; e.style.outline = "3px solid #f0a";
       setTimeout(() => { e.style.outline = o; }, ${Number(durationMs) | 0}); return {};`); return {}; },
     lock: (s, { action = "lock" }) => { s.state.agentLock = action === "lock"; return { locked: s.state.agentLock }; },
-    cdp: async (s, { method, params }) => ({ result: await s.call(method, typeof params === "string" ? JSON.parse(params) : params ?? {}) }),
+    cdp: async (s, { method, params }) => {
+      if (!granted(s.id, "cdp")) throw new Error(`raw CDP on tab ${s.id} needs the person's cdp grant`);
+      if (!CDP_ALLOWED.test(String(method))) throw new Error(`CDP method ${method} is not allowed for agents`);
+      return { result: await s.call(method, typeof params === "string" ? JSON.parse(params) : params ?? {}) };
+    },
     press: async (s, { key: k }) => { await key(s, k); return {}; },
     press_key: (s, a) => acts.press(s, a),
     scroll: async (s, { dx, dy, deltaX, deltaY, direction, amount = 300, ref, scrollIntoView, x, y }) => {
@@ -179,13 +194,6 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
   const run = async ({ cmd, tab, viewId, take_screenshot_afterwards, ...args }) => {
     cmd = String(cmd ?? "").replace(/^browser_/, "");
     tab = tab ?? viewId;
-    // The person's toggle (the block's agent switch): agent-opened tabs stay controllable.
-    if (cmd === "allow") {
-      const s = sessions.get(String(tab)) && await sessions.get(String(tab));
-      if (!s) throw new Error(`no tab ${tab}; list them with cmd tabs`);
-      s.state.agent = !!args.on || opened.has(s.id);
-      return { tab: s.id, controllable: s.state.agent };
-    }
     if (cmd === "tabs") {
       const list = await tabs(), action = args.action ?? "list", pick = args.index !== undefined ? list[args.index]?.tab : tab;
       if (action === "list") return { tabs: list.map((t, index) => ({ index, ...t, selected: t.tab === selected })) };
@@ -210,7 +218,7 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
     if (!acts[cmd]) throw new Error(`unknown cmd ${cmd}; try: tabs, open, ${Object.keys(acts).join(", ")}`);
     const s = sessions.get(String(tab)) && await sessions.get(String(tab));
     if (!s) throw new Error(`no tab ${tab}; list them with cmd tabs`);
-    if (!s.state.agent) throw new Error(`tab ${tab} is not agent-controllable; open your own tab or ask Ethan to turn on the agent toggle`);
+    if (!controllable(s)) throw new Error(`tab ${tab} is not agent-controllable; open your own tab or ask the person to allow agents in that block`);
     if (await devtoolsOpen(s)) throw new Error(`DevTools is open for tab ${tab}; close it before driving the page`);
     const r = await acts[cmd](s, args);
     if (take_screenshot_afterwards && cmd !== "close") r.screenshot = (await acts.screenshot(s, {})).path;

@@ -131,13 +131,54 @@ pub enum EditCommand {
     Redo,
 }
 
+/// One entry of a context menu the host built from CEF's model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MenuItem {
+    /// The host's command id to send back; 0 for a separator.
+    pub command: i32,
+    pub label: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub checked: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submenu: Vec<MenuItem>,
+}
+
+/// A rectangle in CSS pixels (an element box, a selection, a hit-test result).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CssRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// A point in CSS pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CssPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// What an overlay request asks the page. Coordinates: viewport CSS px.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OverlayQuery {
+    HitTest { x: f32, y: f32 },
+    Selector { selector: String },
+    Selection,
+}
+
 /// App to host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppToHost {
     /// First message. `profile_dir` is the shared CEF root cache (logins live here).
     Hello { version: u32, profile_dir: String, cdp_port: Option<u16> },
-    Create { id: BrowserId, url: Option<String>, size: Size, scale: f32 },
+    /// `profile`: the block's profile name (D4); None or "default" is the shared default profile.
+    /// Each name gets its own cookies and storage under `<profile_dir>/<name>`.
+    Create { id: BrowserId, url: Option<String>, size: Size, scale: f32, #[serde(default)] profile: Option<String> },
     Close { id: BrowserId },
     Navigate { id: BrowserId, url: String },
     Back { id: BrowserId },
@@ -148,11 +189,25 @@ pub enum AppToHost {
     Focus { id: BrowserId, focused: bool },
     /// Zoom level as Chrome counts it: 0.0 is 100%, each step is about 20%.
     SetZoom { id: BrowserId, level: f64 },
+    /// The app's appearance changed (or Hello was just sent): every page's prefers-color-scheme
+    /// follows it, live. Applies to browsers created later too.
+    SetColorScheme { dark: bool },
+    /// Rects for an overlay; answered by `OverlayRects` with the same `req` and `epoch`.
+    Overlay { id: BrowserId, req: u64, epoch: u64, query: OverlayQuery },
     Input { id: BrowserId, event: InputEvent },
     /// Run an editing command (copy, paste, ...) in the focused frame.
     Edit { id: BrowserId, command: EditCommand },
-    /// The app has taken frame `seq`; the host may recycle that surface and send the next.
+    /// Frame `seq` (and every older one) was presented in a visible window: the host may send more
+    /// (at most two unacked). Paces delivery only; a surface is reused only once its IOSurface use
+    /// count is released.
     FrameAck { id: BrowserId, seq: u64 },
+    /// The block's window is occluded or minimized, or its tab is not shown (`false`), or shown again
+    /// (`true`). Hidden: the host stops painting and drops pending frames; shown: it sends a fresh
+    /// full frame. `Screenshot` still works while hidden.
+    SetVisible { id: BrowserId, visible: bool },
+    /// The chosen command for menu `req`, or None if dismissed. The host runs it via CEF's
+    /// RunContextMenuCallback (Back, Forward, Reload, Copy, Cut, Paste, Select All, Inspect ...).
+    MenuResult { id: BrowserId, req: u64, command: Option<i32> },
     Find { id: BrowserId, text: String, forward: bool, match_case: bool, find_next: bool },
     StopFind { id: BrowserId, clear_selection: bool },
     DevTools { id: BrowserId, open: bool },
@@ -190,6 +245,16 @@ pub enum HostToApp {
     Console { id: BrowserId, level: String, message: String, source: String, line: u32 },
     /// The CDP target id for this browser, so agents can attach to the right page via the CDP port.
     CdpTarget { id: BrowserId, target_id: String },
+    /// Rects in the answering frame's CSS px; `frames`: enclosing iframe content-box offsets, outermost first. `epoch` echoed.
+    OverlayRects { id: BrowserId, req: u64, epoch: u64, rects: Vec<CssRect>, frames: Vec<CssPoint> },
+    /// The page asked for a context menu at (x, y) page DIPs; `kind` flags what is under the pointer:
+    /// "link", "image", "selection", "editable", "media", "page" (several may apply).
+    /// `link_url`, `src_url`: for Open/Copy link and Save image. The app shows `items` and answers with `MenuResult`.
+    /// Commands >= 26500 (CEF's MENU_ID_USER_FIRST) are app-handled extras; the app does them itself,
+    /// then answers `MenuResult` with None to close the CEF callback.
+    ContextMenu { id: BrowserId, req: u64, x: f32, y: f32, kind: Vec<String>, link_url: Option<String>, src_url: Option<String>, selection: Option<String>, items: Vec<MenuItem> },
+    /// Scroll or zoom changed (at most one per frame); the app bumps its overlay epoch.
+    Viewport { id: BrowserId, scroll_x: f32, scroll_y: f32, zoom_level: f64 },
     EvalResult { id: BrowserId, req: u64, ok: bool, value: serde_json::Value },
     ScreenshotDone { id: BrowserId, req: u64, ok: bool, error: Option<String> },
     Crashed { id: Option<BrowserId>, reason: String },
@@ -226,7 +291,7 @@ mod tests {
     fn app_messages_roundtrip() {
         let mods = Modifiers { platform: true, ..Default::default() };
         roundtrip_app(AppToHost::Hello { version: PROTOCOL_VERSION, profile_dir: "/tmp/p".into(), cdp_port: Some(9222) });
-        roundtrip_app(AppToHost::Create { id: "b1".into(), url: Some("https://example.com".into()), size: Size { w: 800.0, h: 600.0 }, scale: 2.0 });
+        roundtrip_app(AppToHost::Create { id: "b1".into(), url: Some("https://example.com".into()), size: Size { w: 800.0, h: 600.0 }, scale: 2.0, profile: None });
         roundtrip_app(AppToHost::Resize { id: "b1".into(), size: Size { w: 400.0, h: 300.0 }, scale: 2.0 });
         roundtrip_app(AppToHost::FrameAck { id: "b1".into(), seq: 7 });
         roundtrip_app(AppToHost::Input { id: "b1".into(), event: InputEvent::Mouse { kind: MouseKind::Down, x: 1.5, y: 2.5, button: MouseButton::Left, clicks: 2, mods } });
@@ -238,6 +303,14 @@ mod tests {
         roundtrip_app(AppToHost::Input { id: "b1".into(), event: InputEvent::Ime(ImeEvent::Cancel) });
         roundtrip_app(AppToHost::Eval { id: "b1".into(), req: 1, expr: "1+1".into() });
         roundtrip_app(AppToHost::Edit { id: "b1".into(), command: EditCommand::SelectAll });
+        roundtrip_app(AppToHost::SetColorScheme { dark: true });
+        roundtrip_app(AppToHost::Create { id: "b2".into(), url: None, size: Size { w: 10.0, h: 10.0 }, scale: 1.0, profile: Some("work".into()) });
+        roundtrip_app(AppToHost::Overlay { id: "b1".into(), req: 3, epoch: 9, query: OverlayQuery::HitTest { x: 1.5, y: 2.5 } });
+        roundtrip_app(AppToHost::Overlay { id: "b1".into(), req: 4, epoch: 9, query: OverlayQuery::Selector { selector: "#a > b".into() } });
+        roundtrip_app(AppToHost::Overlay { id: "b1".into(), req: 5, epoch: 9, query: OverlayQuery::Selection });
+        roundtrip_app(AppToHost::SetVisible { id: "b1".into(), visible: false });
+        roundtrip_app(AppToHost::MenuResult { id: "b1".into(), req: 7, command: Some(26500) });
+        roundtrip_app(AppToHost::MenuResult { id: "b1".into(), req: 8, command: None });
         roundtrip_app(AppToHost::Shutdown);
     }
 
@@ -250,6 +323,9 @@ mod tests {
         roundtrip_host(HostToApp::ImeCaret { id: "b1".into(), x: 1.0, y: 2.0, w: 1.0, h: 16.0 });
         roundtrip_host(HostToApp::EvalResult { id: "b1".into(), req: 1, ok: true, value: serde_json::json!({"n": 2}) });
         roundtrip_host(HostToApp::CdpTarget { id: "b1".into(), target_id: "T1".into() });
+        roundtrip_host(HostToApp::ContextMenu { id: "b1".into(), req: 7, x: 4.0, y: 5.0, kind: vec!["link".into()], link_url: Some("https://a.test/".into()), src_url: None, selection: None, items: vec![MenuItem { command: 100, label: "Back".into(), enabled: true, checked: false, submenu: vec![] }, MenuItem { command: 0, label: String::new(), enabled: false, checked: false, submenu: vec![] }] });
+        roundtrip_host(HostToApp::OverlayRects { id: "b1".into(), req: 3, epoch: 9, rects: vec![CssRect { x: 1.0, y: 2.0, w: 30.0, h: 40.0 }], frames: vec![CssPoint { x: 5.0, y: 6.0 }] });
+        roundtrip_host(HostToApp::Viewport { id: "b1".into(), scroll_x: 0.0, scroll_y: 120.5, zoom_level: 1.0 });
         roundtrip_host(HostToApp::Crashed { id: None, reason: "gpu".into() });
     }
 
@@ -259,6 +335,8 @@ mod tests {
         assert_eq!(line, r#"{"type":"navigate","id":"b1","url":"https://x.test"}"#);
         let line = encode(&AppToHost::Edit { id: "b1".into(), command: EditCommand::SelectAll });
         assert_eq!(line, r#"{"type":"edit","id":"b1","command":"select_all"}"#);
+        let line = encode(&AppToHost::SetColorScheme { dark: true });
+        assert_eq!(line, r#"{"type":"set_color_scheme","dark":true}"#);
         let line = encode(&HostToApp::Cursor { id: "b1".into(), name: "pointer".into() });
         assert_eq!(line, r#"{"type":"cursor","id":"b1","name":"pointer"}"#);
     }

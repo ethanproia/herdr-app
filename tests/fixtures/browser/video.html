@@ -1,0 +1,12 @@
+<!doctype html><title>video</title>
+<style>body{margin:0;background:#000}</style>
+<video id=v muted autoplay loop playsinline width=640 height=360></video>
+<script>
+// ?src=<name under /video/>. window.videoStats(): decoded frames, dropped, time, ready state, error.
+const name=new URLSearchParams(location.search).get('src')||'test-30-vp9.webm';const v=document.getElementById('v');
+v.src='/video/'+name;window.videoError=null;v.addEventListener('error',()=>window.videoError=(v.error&&v.error.code)||'error');
+window.canPlay=t=>v.canPlayType(t);
+window.videoStats=()=>{const q=v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():{};
+return {decoded:q.totalVideoFrames??null,dropped:q.droppedVideoFrames??null,time:v.currentTime,ready:v.readyState,paused:v.paused,error:window.videoError}};
+v.play().catch(e=>window.videoError=String(e));
+</script>
