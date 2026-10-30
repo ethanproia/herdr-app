@@ -665,3 +665,138 @@ fn pick_info_describes_the_element_under_a_point() {
     println!("shadow DOM: {deep:?}");
     h.shutdown();
 }
+
+/// Probe (docs/browser-cdp-pipe.md step 1): the host bundle, given fds 3/4 and Hello.cdp_pipe,
+/// answers CDP Browser.getVersion over the pipe (NUL-framed JSON) and listens on no TCP port.
+#[test]
+fn cdp_over_fds_3_and_4() {
+    use std::os::fd::{FromRawFd, RawFd};
+    use std::os::unix::process::CommandExt;
+    let Some(exe) = real_host() else { return };
+    let dir = scratch("cef-pipe");
+    let sock = dir.join("host.sock");
+    let pipe = || {
+        let mut fds = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
+    };
+    let (to_host_r, to_host_w) = pipe(); // app writes CDP, Chromium reads fd 3
+    let (from_host_r, from_host_w) = pipe(); // Chromium writes fd 4, app reads
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--socket").arg(&sock);
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(to_host_r, 3) < 0 || libc::dup2(from_host_w, 4) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for fd in [to_host_r, to_host_w, from_host_r, from_host_w] {
+                if fd > 4 {
+                    libc::close(fd);
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    unsafe {
+        libc::close(to_host_r);
+        libc::close(from_host_w);
+    }
+    let mut cdp_in = unsafe { std::fs::File::from_raw_fd(to_host_w) };
+    let mut cdp_out = unsafe { std::fs::File::from_raw_fd(from_host_r) };
+
+    let start = std::time::Instant::now();
+    let out = loop {
+        if let Ok(s) = std::os::unix::net::UnixStream::connect(&sock) {
+            break s;
+        }
+        assert!(start.elapsed() < 20 * SEC, "host never listened");
+        std::thread::sleep(SEC / 40);
+    };
+    let mut w = out.try_clone().unwrap();
+    let mut lines = std::io::BufReader::new(out);
+    writeln!(w, "{}", encode(&AppToHost::Hello { version: PROTOCOL_VERSION, profile_dir: dir.join("profile").display().to_string(), cdp_port: None, cdp_pipe: true })).unwrap();
+    let mut line = String::new();
+    use std::io::BufRead;
+    lines.read_line(&mut line).unwrap();
+    let ready: HostToApp = decode(&line).unwrap();
+    println!("ready: {ready:?}");
+    assert!(matches!(ready, HostToApp::Ready { cdp_port: None, cdp_pipe: true, .. }), "{ready:?}");
+
+    cdp_in.write_all(b"{\"id\":1,\"method\":\"Browser.getVersion\"}\0").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while cdp_out.read(&mut byte).unwrap_or(0) == 1 && byte[0] != 0 {
+            buf.push(byte[0]);
+        }
+        let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+    });
+    let reply = rx.recv_timeout(20 * SEC).expect("no CDP reply on fd 4 within 20 s");
+    println!("fd 4 reply: {reply}");
+    let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(v["id"], 1);
+    assert!(v["result"]["product"].as_str().unwrap_or("").contains("Chrome"), "{v}");
+
+    // X5a: no TCP listener in the host or any of its CEF helper processes.
+    let mut pids = vec![child.id().to_string()];
+    let mut i = 0;
+    while i < pids.len() {
+        let kids = std::process::Command::new("pgrep").args(["-P", &pids[i]]).output().unwrap();
+        pids.extend(String::from_utf8_lossy(&kids.stdout).split_whitespace().map(str::to_string));
+        i += 1;
+    }
+    for pid in &pids {
+        let lsof = std::process::Command::new("lsof").args(["-a", "-p", pid, "-iTCP", "-sTCP:LISTEN"]).output().unwrap();
+        let listening = String::from_utf8_lossy(&lsof.stdout).into_owned();
+        assert!(listening.trim().is_empty(), "pid {pid} listens on TCP with the pipe: {listening}");
+    }
+    println!("X5a: no TCP listener in the host or its {} helper processes", pids.len() - 1);
+
+    writeln!(w, "{}", encode(&AppToHost::Shutdown)).unwrap();
+    let _ = child.wait();
+}
+
+/// Hello asks for the pipe but fds 3/4 are not open: the host says so and runs without CDP.
+#[test]
+fn cdp_pipe_without_fds_is_refused() {
+    if real_host().is_none() {
+        return;
+    }
+    let dir = scratch("cef-pipe-nofds");
+    let sock = dir.join("host.sock");
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(real_host().unwrap());
+    cmd.arg("--socket").arg(&sock);
+    // The test runner may leave its own fds 3/4 open: close them, as a launcher without the pipe would.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::close(3);
+            libc::close(4);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    let start = std::time::Instant::now();
+    let out = loop {
+        if let Ok(s) = std::os::unix::net::UnixStream::connect(&sock) {
+            break s;
+        }
+        assert!(start.elapsed() < 20 * SEC, "host never listened");
+        std::thread::sleep(SEC / 40);
+    };
+    let mut w = out.try_clone().unwrap();
+    let mut lines = std::io::BufReader::new(out);
+    writeln!(w, "{}", encode(&AppToHost::Hello { version: PROTOCOL_VERSION, profile_dir: dir.join("profile").display().to_string(), cdp_port: None, cdp_pipe: true })).unwrap();
+    use std::io::BufRead;
+    let mut first = String::new();
+    lines.read_line(&mut first).unwrap();
+    assert!(matches!(decode::<HostToApp>(&first).unwrap(), HostToApp::Error { .. }), "{first}");
+    let mut second = String::new();
+    lines.read_line(&mut second).unwrap();
+    assert!(matches!(decode::<HostToApp>(&second).unwrap(), HostToApp::Ready { cdp_port: None, cdp_pipe: false, .. }), "{second}");
+    println!("no fds 3/4: {} then {}", first.trim(), second.trim());
+    writeln!(w, "{}", encode(&AppToHost::Shutdown)).unwrap();
+    let _ = child.wait();
+}
