@@ -440,6 +440,8 @@ pub enum BrowserEvent {
     Url(String),
     /// The page took the keyboard: it is the browser agent commands act on by default.
     Focused,
+    /// A link or script asked for a new window or tab: the window opens a block beside this one.
+    NewWindow(String),
 }
 
 /// One browser block on screen.
@@ -614,6 +616,10 @@ impl BrowserView {
                     self.console.pop_front();
                 }
                 self.console.push_back(message);
+                return;
+            }
+            H::NewWindow { url, .. } => {
+                cx.emit(BrowserEvent::NewWindow(url));
                 return;
             }
             H::ImeCaret { x, y, w, h, .. } => {
@@ -886,7 +892,7 @@ impl Browsers {
         blocks: Vec<(String, BrowserBlock)>,
         window: &mut Window,
         cx: &mut Context<W>,
-        on_event: impl Fn(&mut W, &str, &BrowserEvent, &mut Context<W>) + Clone + 'static,
+        on_event: impl Fn(&mut W, &str, &BrowserEvent, &mut Window, &mut Context<W>) + Clone + 'static,
     ) {
         let keep: HashSet<&str> = blocks.iter().map(|(id, _)| id.as_str()).collect();
         let gone: Vec<BrowserId> = self.views.keys().filter(|id| !keep.contains(id.as_str())).cloned().collect();
@@ -908,7 +914,7 @@ impl Browsers {
             let view = cx.new(|cx| BrowserView::new(&id, block, link, states, window, cx));
             let key = id.clone();
             let on = on_event.clone();
-            let sub = cx.subscribe(&view, move |w, _, ev, cx| on(w, &key, ev, cx));
+            let sub = cx.subscribe_in(&view, window, move |w, _, ev, window, cx| on(w, &key, ev, window, cx));
             self.views.insert(id, (view, sub));
         }
     }

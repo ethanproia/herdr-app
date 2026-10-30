@@ -246,6 +246,8 @@ fn stub_input() {
 /// A window holding `Browsers` the way the app's window does (one block, "web").
 struct Agents {
     browsers: browser::view::Browsers,
+    /// Events the block sent its window.
+    events: Vec<browser::view::BrowserEvent>,
 }
 
 impl Render for Agents {
@@ -269,8 +271,8 @@ fn agent(program: std::path::PathBuf, args: Vec<String>, url: &str, real: bool) 
         .open_window(size(px(480.), px(300.)), |window, cx| {
             cx.new(|cx| {
                 let mut browsers = browser::view::Browsers::with_link(link.clone());
-                browsers.sync(vec![("web".into(), block)], window, cx, |_: &mut Agents, _, _, _| {});
-                Agents { browsers }
+                browsers.sync(vec![("web".into(), block)], window, cx, |a: &mut Agents, _, ev, _, _| a.events.push(ev.clone()));
+                Agents { browsers, events: vec![] }
             })
         })
         .unwrap();
@@ -332,6 +334,16 @@ fn agent(program: std::path::PathBuf, args: Vec<String>, url: &str, real: bool) 
         let shot_r = shot_r.unwrap();
         let png = std::fs::read(&shot).expect("the screenshot was written");
         assert!(png.starts_with(b"\x89PNG"), "a PNG at {}", shot.display());
+        // A link to a new window: the host asks, the block tells its window (which splits).
+        let js = "let a=document.createElement('a');a.href='data:text/html,popup';a.target='_blank';document.body.append(a);a.click();true";
+        run(&mut cx, "browser.eval", serde_json::json!({ "id": "web", "expr": js })).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !window.update(&mut cx, |a, _, _| a.events.iter().any(|e| matches!(e, browser::view::BrowserEvent::NewWindow(u) if u == "data:text/html,popup"))).unwrap() {
+            assert!(Instant::now() < deadline, "no NewWindow: {:?}", window.update(&mut cx, |a, _, _| a.events.clone()).unwrap());
+            pump(&mut cx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        println!("agent passed (real CEF): target=_blank link reached the window as NewWindow");
         println!("agent passed (real CEF): typed text read back by browser.eval; browser.screenshot wrote {} ({} bytes) {shot_r}", shot.display(), png.len());
     } else {
         let v = run(&mut cx, "browser.eval", serde_json::json!({ "id": "web", "expr": "1+1" })).unwrap();
@@ -343,10 +355,15 @@ fn agent(program: std::path::PathBuf, args: Vec<String>, url: &str, real: bool) 
         let e = run(&mut cx, "browser.reload", serde_json::json!({})).unwrap_err();
         assert!(e.contains("focused"), "{e}");
         assert!(run(&mut cx, "browser.reload", id.clone()).is_ok());
+        // A new-window request from the host reaches the window as an event.
+        cx.update(|cx| browser.update(cx, |v, cx| v.on_host(HostToApp::NewWindow { id: "web".into(), url: "https://x.test/".into(), disposition: "new_foreground_tab".into() }, cx)));
+        cx.run_until_parked();
+        let evs = window.update(&mut cx, |a, _, _| a.events.clone()).unwrap();
+        assert!(evs.iter().any(|e| matches!(e, browser::view::BrowserEvent::NewWindow(u) if u == "https://x.test/")), "{evs:?}");
         println!("agent passed (stub): eval answered, screenshot error relayed, unknown and unfocused targets refused");
     }
     // The block goes: the agent's cdp.json forgets it.
-    window.update(&mut cx, |w, window, cx| w.browsers.sync(vec![], window, cx, |_: &mut Agents, _, _, _| {})).unwrap();
+    window.update(&mut cx, |w, window, cx| w.browsers.sync(vec![], window, cx, |_: &mut Agents, _, _, _, _| {})).unwrap();
     drop(browser);
     cx.update_window(window.into(), |_, window, _| window.remove_window()).unwrap();
     cx.run_until_parked();

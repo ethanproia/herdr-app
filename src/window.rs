@@ -3821,11 +3821,15 @@ impl AppWindow {
         for l in self.overlays.iter().filter_map(|o| o.layout.as_ref()) {
             blocks.extend(crate::layout::browser_blocks(l));
         }
-        self.browsers.sync(blocks, window, cx, |this, id, ev, cx| {
+        self.browsers.sync(blocks, window, cx, |this, id, ev, window, cx| {
             let url = match ev {
                 crate::browser::view::BrowserEvent::Url(url) => url,
                 crate::browser::view::BrowserEvent::Focused => {
                     this.browsers.focused = Some(id.to_owned());
+                    return;
+                }
+                crate::browser::view::BrowserEvent::NewWindow(url) => {
+                    this.browser_new_window(id, url, window, cx);
                     return;
                 }
             };
@@ -3873,6 +3877,29 @@ impl AppWindow {
             self.flush_documents(false, window, cx);
             self.sync(window, cx);
             cx.notify();
+        }
+    }
+
+    // HERDR: browser block. A page asked for a new window: a browser beside it (a split in its
+    // tab); a layout block's page opens a new tab.
+    fn browser_new_window(&mut self, from: &str, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let block = crate::layout::BrowserBlock { url: url.to_owned(), profile: "default".into() };
+        let r = if self.model.tab_of(from).is_some() {
+            let machine = self.model.space_of(from).and_then(|s| s.machine.clone());
+            let pane = self.model.fresh_id_on("p", machine.as_deref());
+            self.model.split_with(from, Axis::Row, Node::block(pane.clone(), Content::Browser { browser: block }));
+            self.model.focus_pane(&pane);
+            Ok(json!({ "id": pane }))
+        } else {
+            self.open_browser(block, Some("tab"))
+        };
+        match r {
+            Ok(_) => {
+                self.flush_documents(false, window, cx);
+                self.sync(window, cx);
+                cx.notify();
+            }
+            Err(e) => tracing::warn!("browser {from}: new window for {url}: {e}"),
         }
     }
 

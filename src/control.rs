@@ -43,7 +43,15 @@ fn serve(stream: UnixStream, tx: async_channel::Sender<Request>) {
     }
     let reply = match serde_json::from_str::<Value>(&line) {
         Ok(cmd) => {
-            let timeout = Duration::from_secs(if cmd.get("shot").is_some() { 30 } else { 5 });
+            // HERDR: browser block. Commands the browser host answers wait on it: a page
+            // screenshot or script gets the 30 s a window shot gets; a new page's first load 15 s.
+            let browser = cmd.get("do").and_then(Value::as_str).filter(|n| n.starts_with("browser."));
+            let timeout = Duration::from_secs(match browser {
+                Some("browser.screenshot" | "browser.eval") => 30,
+                Some("browser.find" | "browser.open") => 15,
+                _ if cmd.get("shot").is_some() => 30,
+                _ => 5,
+            });
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
             let _ = tx.send_blocking(Request::Control { cmd, reply: reply_tx });
             reply_rx.recv_timeout(timeout).unwrap_or_else(|_| json!({ "error": "the window did not answer" }))
