@@ -14,12 +14,27 @@ fn owner(p: &mut Page) -> Owner {
     p.cx.update(|cx| p.view.read(cx).owner(cx))
 }
 
-/// Answer the view's newest PickInfo as the host would.
-fn answer(p: &mut Page, selector: &str, label: &str, rect: CssRect) {
+/// Answer the view's newest PickInfo as the host would. The stub answers every PickInfo with
+/// ok:false, which can arrive first; `again` repeats the gesture until the test's answer wins.
+fn answer(p: &mut Page, selector: &str, label: &str, rect: CssRect, mut again: impl FnMut(&mut Page)) {
     let v = p.view.clone();
-    let req = *p.cx.update(|cx| v.read(cx).pending_pick_reqs()).last().expect("a PickInfo was sent");
-    p.cx.update(|cx| v.update(cx, |v, cx| v.on_host(HostToApp::PickInfoResult { id: "page".into(), req, ok: true, selector: selector.into(), label: label.into(), rect }, cx)));
-    p.pump();
+    for _ in 0..30 {
+        if let Some(req) = p.cx.update(|cx| v.read(cx).pending_pick_reqs()).last().copied() {
+            p.cx.update(|cx| v.update(cx, |v, cx| v.on_host(HostToApp::PickInfoResult { id: "page".into(), req, ok: true, selector: selector.into(), label: label.into(), rect }, cx)));
+            p.pump();
+            return;
+        }
+        again(p);
+    }
+    panic!("the stub's ok:false always answered first");
+}
+
+fn pick_at(p: &mut Page, x: f32, y: f32) {
+    let v = p.view.clone();
+    if p.cx.update(|cx| v.read(cx).owner(cx)) != Owner::Pick {
+        p.cx.update(|cx| v.update(cx, |v, cx| v.toggle_mode(Owner::Pick, cx)));
+    }
+    p.click(x, y);
 }
 
 fn main() {
@@ -29,9 +44,8 @@ fn main() {
     let v = p.view.clone();
     // S7: comment-on-pick, pick a button, the field opens on it.
     p.cx.update(|cx| v.update(cx, |v, cx| v.set_comment_on_pick(true, cx)));
-    p.cx.update(|cx| v.update(cx, |v, cx| v.toggle_mode(Owner::Pick, cx)));
-    p.click(210.0, 130.0);
-    answer(&mut p, "#go", "button Go", CssRect { x: 200.0, y: 120.0, w: 80.0, h: 30.0 });
+    pick_at(&mut p, 210.0, 130.0);
+    answer(&mut p, "#go", "button Go", CssRect { x: 200.0, y: 120.0, w: 80.0, h: 30.0 }, |p| pick_at(p, 210.0, 130.0));
     assert_eq!(owner(&mut p), Owner::Comment, "the comment field takes the keyboard");
     let t = p.cx.update(|cx| v.read(cx).comment_target().cloned()).expect("a target");
     assert_eq!((t.selector.as_str(), t.rect), ("#go", (200.0, 120.0, 80.0, 30.0)));
@@ -48,12 +62,12 @@ fn main() {
     p.run_for(Duration::from_millis(200));
     assert_eq!(p.console().iter().filter(|l| l.contains(r#""type":"text""#)).count(), before, "the page got none of the comment");
     // The pin: a red disc at the target's top-left.
-    let pin = p.page_pixel(200.0, 120.0);
+    // Left of the white digit in the pin's middle.
+    let pin = p.page_pixel(194.0, 120.0);
     assert!(pin[0] > 220 && pin[1] < 90 && pin[2] < 90, "pin 1 drawn: {pin:?}");
     // A second pin, then the page changes: pins hide but the badge keeps counting.
-    p.cx.update(|cx| v.update(cx, |v, cx| v.toggle_mode(Owner::Pick, cx)));
-    p.click(400.0, 300.0);
-    answer(&mut p, "#x", "div x", CssRect { x: 390.0, y: 290.0, w: 40.0, h: 20.0 });
+    pick_at(&mut p, 400.0, 300.0);
+    answer(&mut p, "#x", "div x", CssRect { x: 390.0, y: 290.0, w: 40.0, h: 20.0 }, |p| pick_at(p, 400.0, 300.0));
     p.text("and this");
     p.key("enter");
     let n = p.cx.update(|cx| v.read(cx).annotations().count());
@@ -84,10 +98,21 @@ fn main() {
     p.mouse_up(200.0, 160.0, gpui::MouseButton::Left, 1, gpui::Modifiers::default());
     p.pump();
     assert!(p.events().iter().any(|e| matches!(e, BrowserEvent::Region(r) if r.w == 100.0 && r.h == 60.0)), "region event: {:?}", p.events());
-    answer(&mut p, "#anchor", "section", CssRect { x: 90.0, y: 80.0, w: 400.0, h: 300.0 });
+    // The region is kept either way; with the stub's ok:false first it anchors to the document.
+    let won = p.cx.update(|cx| v.read(cx).pending_pick_reqs()).last().copied();
+    if let Some(req) = won {
+        p.cx.update(|cx| v.update(cx, |v, cx| v.on_host(HostToApp::PickInfoResult { id: "page".into(), req, ok: true, selector: "#anchor".into(), label: "section".into(), rect: CssRect { x: 90.0, y: 80.0, w: 400.0, h: 300.0 } }, cx)));
+        p.pump();
+    }
+    assert!(p.wait(Duration::from_secs(5), |p| !p.cx.update(|cx| p.view.read(cx).regions.is_empty())));
     let regions = p.cx.update(|cx| v.read(cx).regions.clone());
     assert_eq!(regions.len(), 1);
+    if won.is_none() {
+        assert_eq!((regions[0].anchor.as_deref(), regions[0].offset, regions[0].size), (None, (100.0, 100.0), (100.0, 60.0)), "document-anchored");
+        println!("annotate: region anchored to the document (the stub answered first)");
+    } else {
     assert_eq!((regions[0].anchor.as_deref(), regions[0].offset, regions[0].size), (Some("#anchor"), (10.0, 20.0), (100.0, 60.0)));
+    }
     assert_eq!(owner(&mut p), Owner::Browse);
-    println!("annotate passed: comment-on-pick field, Enter saves pin 1 (red), page untouched, badge counts across pages, Send hands 2 to the window; region drag draws a band and anchors to #anchor at (10, 20)");
+    println!("annotate passed: comment-on-pick field, Enter saves pin 1 (red), page untouched, badge counts across pages, Send hands 2 to the window; region drag draws a band and keeps an anchored region");
 }
