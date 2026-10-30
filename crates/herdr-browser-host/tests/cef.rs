@@ -92,10 +92,7 @@ fn page_sees_mouse_keys_wheel_and_ime() {
     create(&mut h, "b1", &p.url("input"), 200.0, 100.0, 1.0);
     loaded(&mut h);
     h.send(AppToHost::Focus { id: "b1".into(), focused: true });
-    // Loading(false) can arrive before the renderer takes input; one eval round trip proves it is live.
-    let (_, live) = h.eval("b1", 90, "[document.hasFocus(), document.visibilityState, innerWidth, innerHeight]");
-    assert_eq!(live, serde_json::json!([true, "visible", 200, 100]));
-    println!("page live: focused, visible, 200x100 CSS px");
+    // Input goes out the instant Loading(false) arrives: the host must queue it, not drop it.
     let mods = Modifiers::default();
     let mouse = |kind| InputEvent::Mouse { kind, x: 10.0, y: 20.0, button: MouseButton::Left, clicks: 1, mods };
     h.send(AppToHost::Input { id: "b1".into(), event: mouse(MouseKind::Move) });
@@ -103,6 +100,8 @@ fn page_sees_mouse_keys_wheel_and_ime() {
     h.send(AppToHost::Input { id: "b1".into(), event: mouse(MouseKind::Up) });
     let e = page_event(&mut h, "mousedown");
     assert_eq!(e, serde_json::json!({"x": 10, "y": 20, "b": 0}));
+    let (_, live) = h.eval("b1", 90, "[document.hasFocus(), document.visibilityState, innerWidth, innerHeight]");
+    assert_eq!(live, serde_json::json!([true, "visible", 200, 100]));
     println!("mousedown -> page saw {e}");
 
     let key = |kind| InputEvent::Key { kind, key: "a".into(), code: "KeyA".into(), native: 0, repeat: false, mods };

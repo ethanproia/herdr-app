@@ -178,6 +178,7 @@ wrap_load_handler! {
 
     impl LoadHandler {
         fn on_loading_state_change(&self, _browser: Option<&mut Browser>, is_loading: ::std::os::raw::c_int, can_go_back: ::std::os::raw::c_int, can_go_forward: ::std::os::raw::c_int) {
+            super::on_loading(&self.id, is_loading != 0);
             send(HostToApp::Loading { id: self.id.clone(), loading: is_loading != 0, can_back: can_go_back != 0, can_forward: can_go_forward != 0 });
         }
     }
@@ -365,6 +366,20 @@ wrap_client! {
             Some(self.find.clone())
         }
     }
+}
+
+wrap_completion_callback! {
+    pub(crate) struct FlushDone;
+
+    impl CompletionCallback {
+        fn on_complete(&self) {
+            super::FLUSHED.set(true);
+        }
+    }
+}
+
+pub fn flush_done() -> CompletionCallback {
+    FlushDone::new()
 }
 
 /// The DevTools message id used for `Target.getTargetInfo` (one per browser, so any fixed id works).
