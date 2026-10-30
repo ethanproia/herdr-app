@@ -79,6 +79,18 @@ pub const COMMANDS: &[Command] = &[
     cmd("layout.reset", &[opt("name")], "Reset a shipped layout and its clicks (the old file is kept aside)."),
     cmd("mod.open", &[req("name")], "Open a mod as the overlay its mod.json describes."),
     cmd("overlay.close", &[opt("id")], "Close an overlay (default: the top dialog or popup)."),
+    // HERDR: browser block (part 5, src/browser/agent.rs). id: a browser block; else pane's; else the focused one.
+    cmd("browser.open", &[opt("url"), opt("place")], "Open a browser block at url (place \"tab\", default, or \"right\"/\"down\" of the focused pane); answers its id."),
+    cmd("browser.navigate", &[req("url"), opt("id"), opt("pane")], "Load url in a browser (id, or the one in pane; default: the focused browser)."),
+    cmd("browser.back", &[opt("id"), opt("pane")], "Go back in a browser's history."),
+    cmd("browser.forward", &[opt("id"), opt("pane")], "Go forward in a browser's history."),
+    cmd("browser.reload", &[opt("id"), opt("pane"), opt("ignore_cache")], "Reload a browser's page (ignore_cache: true skips the cache)."),
+    cmd("browser.stop", &[opt("id"), opt("pane")], "Stop loading a browser's page."),
+    cmd("browser.screenshot", &[opt("id"), opt("pane"), opt("path")], "Save a full-resolution PNG of a browser's page to path (default: browser/shots/ in the app's home); answers the path."),
+    cmd("browser.eval", &[req("expr"), opt("id"), opt("pane")], "Run JavaScript in a browser's page; answers its value."),
+    cmd("browser.find", &[opt("text"), opt("id"), opt("pane"), opt("forward"), opt("match_case"), opt("next")], "Find text in a browser's page (answers the match count); no text ends the find."),
+    cmd("browser.close", &[opt("id"), opt("pane")], "Close a browser block (default: the focused browser)."),
+    cmd("browser.devtools", &[opt("id"), opt("pane"), opt("open")], "Open a browser's DevTools (open: false closes them)."),
     // The app.
     cmd("app.help", &[], "Show the keys."),
     cmd("app.welcome", &[], "Show the welcome again."),

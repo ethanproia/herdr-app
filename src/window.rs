@@ -372,6 +372,8 @@ pub struct AppWindow {
     terms: HashMap<String, Term>,
     /// Mod copies by slot (block id, `<stack>#header`, or `overlay:<id>`).
     copies: HashMap<String, Copy>,
+    // HERDR: one browser view per browser block (src/browser/view.rs).
+    browsers: crate::browser::view::Browsers,
     overlays: Vec<Overlay>,
     folders: BTreeMap<String, Found>,
     /// Mods placed once; later the layout decides where (or whether) they show.
@@ -468,6 +470,7 @@ impl AppWindow {
             model: Model::default(),
             terms: HashMap::new(),
             copies: HashMap::new(),
+            browsers: Default::default(), // HERDR: browser block
             overlays: Vec::new(),
             folders: mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect(),
             seen,
@@ -1409,6 +1412,7 @@ impl AppWindow {
             }
         }
         self.publish_shown_copies();
+        self.sync_browsers(window, cx); // HERDR: browser block
 
         // Keyboard to the focused pane when it changes (never steal it from an open dialog).
         let model_pane = self.model.focused_pane();
@@ -3401,6 +3405,26 @@ impl AppWindow {
             Request::OpenOverlay { id, spec } => self.open_overlay(id, spec, window, cx),
             Request::CloseOverlay { id } => self.close_overlay(&id, window, cx),
             Request::Refresh => self.refresh_mods(cx),
+            // HERDR: browser block. `browser.*` may answer later (eval, screenshot): the reply goes with it.
+            Request::Control { cmd, reply } if cmd.get("do").and_then(Value::as_str).is_some_and(|n| n.starts_with("browser.")) => {
+                let name = cmd["do"].as_str().unwrap_or_default().to_owned();
+                let args = cmd.get("args").cloned().unwrap_or(json!({}));
+                self.browser_command(&name, args, Box::new(move |r| {
+                    let _ = reply.send(r.unwrap_or_else(|error| json!({ "error": error })));
+                }), window, cx);
+            }
+            // HERDR: a headless window is never asked to display, so its picture stays the first
+            // frame ("Loading..."): draw it now, outside this view's update, then take the shot.
+            Request::Control { cmd, reply } if crate::control::headless() && cmd.get("shot").and_then(Value::as_str).is_some() => {
+                let path = PathBuf::from(cmd["shot"].as_str().unwrap_or_default());
+                window.defer(cx, move |window, cx| {
+                    window.draw(cx).clear(cx);
+                    let _ = reply.send(match crate::control::save_shot(window, &path) {
+                        Ok(()) => json!({ "path": path }),
+                        Err(error) => json!({ "error": format!("cannot save screenshot: {error:#}") }),
+                    });
+                });
+            }
             Request::Control { cmd, reply } => {
                 let _ = reply.send(self.control(cmd, window, cx));
             }
@@ -3762,6 +3786,11 @@ impl AppWindow {
                 None => div().into_any_element(),
             },
             Content::Mod { .. } => self.render_slot(&n.id, cx),
+            // HERDR: browser block
+            Content::Browser { .. } => match self.browsers.view(&n.id) {
+                Some(v) => div().size_full().child(v.clone()).into_any_element(),
+                None => div().into_any_element(),
+            },
             Content::Agent { .. } => match self.shown_agent() {
                 Some(addr) => match self.agent_view(&n.id, &addr) {
                     Some(t) => div().size_full().child(shown_terminal(&t.view, cx)).into_any_element(),
@@ -3791,6 +3820,121 @@ impl AppWindow {
                         .into_any_element()
                 }
             },
+        }
+    }
+
+    // HERDR: browser block. A view per browser block in any layout (chrome, tabs, overlays,
+    // floats); a block that goes closes its page. The page's url is written back to the document.
+    fn sync_browsers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut blocks = crate::layout::browser_blocks(&self.chrome);
+        for t in self.model.tabs() {
+            blocks.extend(crate::layout::browser_blocks(&t.root));
+        }
+        for l in self.overlays.iter().filter_map(|o| o.layout.as_ref()) {
+            blocks.extend(crate::layout::browser_blocks(l));
+        }
+        self.browsers.sync(blocks, window, cx, |this, id, ev, window, cx| {
+            let url = match ev {
+                crate::browser::view::BrowserEvent::Url(url) => url,
+                crate::browser::view::BrowserEvent::Focused => {
+                    this.browsers.focused = Some(id.to_owned());
+                    return;
+                }
+                crate::browser::view::BrowserEvent::NewWindow(url) => {
+                    this.browser_new_window(id, url, window, cx);
+                    return;
+                }
+            };
+            let tab = this.model.tabs().find(|t| crate::layout::browser_blocks(&t.root).iter().any(|(b, _)| b == id)).map(|t| t.id.clone());
+            let changed = match tab.and_then(|t| this.model.tab_mut(&t)) {
+                Some(t) => crate::layout::set_browser_url(&mut t.root, id, url),
+                None => crate::layout::set_browser_url(&mut this.chrome, id, url),
+            };
+            if changed {
+                this.publish(cx);
+                this.save();
+            }
+        });
+    }
+
+    // HERDR: browser block. `herdr-app do browser.*`: part 5's agent answers, the window makes
+    // and closes blocks (`browser.open` place "tab", default, or "right"/"down" of the focused pane).
+    fn browser_command(&mut self, name: &str, args: Value, reply: crate::browser::agent::Reply, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::browser::agent::Step;
+        let blocks: HashSet<String> = self.browsers.ids().into_iter().collect();
+        let step = self.browsers.run(name, &args, &|pane| blocks.get(pane).cloned(), reply, cx);
+        let made = match step {
+            Step::Done => return,
+            Step::Open { url, place, reply } => {
+                let block = crate::layout::BrowserBlock { url: url.unwrap_or_default(), profile: "default".into() };
+                let r = self.open_browser(block, place.as_deref());
+                let ok = r.is_ok();
+                reply(r);
+                ok
+            }
+            Step::Close { id, reply } => {
+                if self.model.tab_of(&id).is_none() {
+                    reply(Err(format!("browser {id:?} is a layout block, not a pane: change the layout to remove it")));
+                    return;
+                }
+                let r = self.run_as("pane.close", json!({ "pane": id }), false, window, cx);
+                reply(match r.get("error").and_then(Value::as_str) {
+                    Some(e) => Err(e.to_owned()),
+                    None => Ok(json!({ "id": id, "closed": true })),
+                });
+                true
+            }
+        };
+        if made {
+            self.flush_documents(false, window, cx);
+            self.sync(window, cx);
+            cx.notify();
+        }
+    }
+
+    // HERDR: browser block. A page asked for a new window: a browser beside it (a split in its
+    // tab); a layout block's page opens a new tab.
+    fn browser_new_window(&mut self, from: &str, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let block = crate::layout::BrowserBlock { url: url.to_owned(), profile: "default".into() };
+        let r = if self.model.tab_of(from).is_some() {
+            let machine = self.model.space_of(from).and_then(|s| s.machine.clone());
+            let pane = self.model.fresh_id_on("p", machine.as_deref());
+            self.model.split_with(from, Axis::Row, Node::block(pane.clone(), Content::Browser { browser: block }));
+            self.model.focus_pane(&pane);
+            Ok(json!({ "id": pane }))
+        } else {
+            self.open_browser(block, Some("tab"))
+        };
+        match r {
+            Ok(_) => {
+                self.flush_documents(false, window, cx);
+                self.sync(window, cx);
+                cx.notify();
+            }
+            Err(e) => tracing::warn!("browser {from}: new window for {url}: {e}"),
+        }
+    }
+
+    // HERDR: browser block. A browser pane: a new tab (default) or beside the focused pane.
+    fn open_browser(&mut self, block: crate::layout::BrowserBlock, place: Option<&str>) -> Result<Value, String> {
+        let content = Content::Browser { browser: block };
+        match place.unwrap_or("tab") {
+            "tab" => {
+                let space = self.model.active_space().map(|p| p.id.clone()).ok_or("no space yet: make one first (space.new)")?;
+                let machine = self.machine_of(&space);
+                let (tab, pane) = (self.model.fresh_id_on("tb", machine.as_deref()), self.model.fresh_id_on("p", machine.as_deref()));
+                self.model.add_tab(&space, Tab::with_pane(&tab, "", Node::block(pane.clone(), content)));
+                self.model.active = Some(space.clone());
+                Ok(json!({ "id": pane, "tab": tab }))
+            }
+            side @ ("right" | "down") => {
+                let target = self.model.focused_pane().ok_or("no pane to open beside")?;
+                let machine = self.model.space_of(&target).and_then(|s| s.machine.clone());
+                let pane = self.model.fresh_id_on("p", machine.as_deref());
+                self.model.split_with(&target, if side == "right" { Axis::Row } else { Axis::Column }, Node::block(pane.clone(), content));
+                Ok(json!({ "id": pane }))
+            }
+            other => Err(format!("browser.open place {other:?}: tab, right or down")),
         }
     }
 

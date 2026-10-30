@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ghostty-sys"]
+members = ["crates/ghostty-sys", "crates/herdr-browser-protocol", "crates/herdr-browser-surface", "crates/herdr-browser-host"]
 exclude = ["vendor/gpui-kit", "vendor/gpui-pre", "vendor/gpui-pre-wgpu", "vendor/gpui-pre-apple", "vendor/gpui-pre-linux", "vendor/gpui-pre-macos", "vendor/gpui-pre-windows", "vendor/taffy", "vendor/quickjs-jit-runtime", "vendor/zed-xim", "vendor/xim-ctext"]
 resolver = "2"
 
@@ -17,6 +17,7 @@ publish.workspace = true
 
 [dependencies]
 ghostty-sys = { path = "crates/ghostty-sys" }
+herdr-browser-protocol = { path = "crates/herdr-browser-protocol" }
 gpui = { package = "gpui-pre", version = "=0.3.8", features = ["render-to-image"] }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 gpui-shell = { path = "vendor/gpui-kit/crates/shell" }
@@ -37,8 +38,23 @@ notify = "7"
 sha2 = "0.10"
 
 [[test]]
+name = "browser_frame"
+path = "tests/browser_frame.rs"
+harness = false
+
+[[test]]
+name = "surface_pixels"
+path = "tests/surface_pixels.rs"
+harness = false
+
+[[test]]
 name = "shot_pixels"
 path = "tests/shot_pixels.rs"
+harness = false
+
+[[test]]
+name = "browser_shot"
+path = "tests/browser_shot.rs"
 harness = false
 
 [dev-dependencies]
@@ -52,6 +68,10 @@ gpui_linux = { package = "gpui-pre-linux", version = "=0.3.8", features = ["rend
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_macos = { package = "gpui-pre-macos", version = "=0.3.8", features = ["render-to-image"] }
 libc = "0.2"
+core-video = "0.5.2"
+core-foundation = "0.10"
+herdr-browser-surface = { path = "crates/herdr-browser-surface" }
+herdr-browser-protocol = { path = "crates/herdr-browser-protocol" }
 
 [target.'cfg(windows)'.dependencies]
 gpui_windows = { package = "gpui-pre-windows", version = "=0.3.8", features = ["render-to-image"] }

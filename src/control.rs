@@ -43,7 +43,15 @@ fn serve(stream: UnixStream, tx: async_channel::Sender<Request>) {
     }
     let reply = match serde_json::from_str::<Value>(&line) {
         Ok(cmd) => {
-            let timeout = Duration::from_secs(if cmd.get("shot").is_some() { 30 } else { 5 });
+            // HERDR: browser block. Commands the browser host answers wait on it: a page
+            // screenshot or script gets the 30 s a window shot gets; a new page's first load 15 s.
+            let browser = cmd.get("do").and_then(Value::as_str).filter(|n| n.starts_with("browser."));
+            let timeout = Duration::from_secs(match browser {
+                Some("browser.screenshot" | "browser.eval") => 30,
+                Some("browser.find" | "browser.open") => 15,
+                _ if cmd.get("shot").is_some() => 30,
+                _ => 5,
+            });
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
             let _ = tx.send_blocking(Request::Control { cmd, reply: reply_tx });
             reply_rx.recv_timeout(timeout).unwrap_or_else(|_| json!({ "error": "the window did not answer" }))
@@ -51,6 +59,16 @@ fn serve(stream: UnixStream, tx: async_channel::Sender<Request>) {
         Err(e) => json!({ "error": format!("bad request: {e}") }),
     };
     let _ = (&stream).write_all(format!("{reply}\n").as_bytes());
+}
+
+// HERDR: out-of-sight mode for forks and tests: no shown window, no focus, no activation.
+pub fn headless() -> bool {
+    std::env::var("HERDR_APP_HEADLESS").is_ok_and(|v| v == "1")
+}
+
+// HERDR: a window serves this home, without raising it.
+pub fn running() -> bool {
+    UnixStream::connect(socket()).is_ok()
 }
 
 /// One Herdr per home: a second launch brings the running window to the
@@ -75,6 +93,12 @@ pub fn client(args: &[String]) -> i32 {
         println!("{}", serde_json::to_string_pretty(&crate::commands::listing()).unwrap());
         return 0;
     }
+    // HERDR: `render --layout <file.json> --out <file.png>`: set the layout, then shoot.
+    if let [verb, a, layout, b, out] = args
+        && verb == "render" && a == "--layout" && b == "--out"
+    {
+        return render(layout, out);
+    }
     let cmd = match args {
         [verb, rest @ ..] if verb == "shot" && rest.len() <= 1 => {
             let path = PathBuf::from(rest.first().map(String::as_str).unwrap_or("herdr-shot.png"));
@@ -94,7 +118,7 @@ pub fn client(args: &[String]) -> i32 {
             Ok(a) => json!({ "do": command, "args": a }),
             Err(e) => return fail(&e),
         },
-        _ => return fail("usage: herdr-app ls | herdr-app commands | herdr-app status | herdr-app shot [file.png] | herdr-app do <command> [--arg value ... | json]"),
+        _ => return fail("usage: herdr-app ls | herdr-app commands | herdr-app status | herdr-app shot [file.png] | herdr-app render --layout <file.json> --out <file.png> | herdr-app do <command> [--arg value ... | json]"),
     };
     let mut stream = match UnixStream::connect(socket()) {
         Ok(s) => s,
@@ -124,6 +148,26 @@ pub fn client(args: &[String]) -> i32 {
         println!("{}", serde_json::to_string_pretty(&reply).unwrap_or_default());
     }
     if reply.get("error").is_some() { 1 } else { 0 }
+}
+
+// HERDR: the render verb, against the (headless) window on this home.
+fn render(layout: &str, out: &str) -> i32 {
+    let tree: Value = match std::fs::read_to_string(layout).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string())) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("cannot read layout {layout}: {e}")),
+    };
+    // A personal layout in this home, so its whole tree applies (layout.set keeps shipped structure).
+    let dir = mods::app_dir().join("layouts");
+    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(dir.join("render.json"), tree.to_string())) {
+        return fail(&format!("cannot write {}: {e}", dir.display()));
+    }
+    let shown = client(&["do".into(), "layout.switch".into(), "--name".into(), "render".into()]);
+    if shown != 0 {
+        return shown;
+    }
+    // Let the new layout paint before the shot.
+    std::thread::sleep(Duration::from_millis(500));
+    client(&["shot".into(), out.into()])
 }
 
 /// `--name api --argv '["pi"]'` (values that parse as JSON are JSON), or one JSON object.

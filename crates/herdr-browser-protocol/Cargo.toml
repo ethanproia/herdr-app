@@ -1,0 +1,11 @@
+[package]
+name = "herdr-browser-protocol"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Wire contract between herdr-app and herdr-browser-host (CEF off-screen host)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
