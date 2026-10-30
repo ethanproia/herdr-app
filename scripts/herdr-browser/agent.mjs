@@ -13,6 +13,15 @@ const KEYS = { Enter: 13, Backspace: 8, Tab: 9, Escape: 27, Delete: 46, ArrowLef
 const MODS = { Alt: 1, Control: 2, Meta: 4, Shift: 8 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// One rule for "this field holds a secret", used by snapshots, redaction and the capture check.
+const SECRET_FIELD = `((c) => c.tagName === "INPUT" && (c.type === "password" || /cc-|password|one-time-code/i.test(c.autocomplete || "")
+  || /pass|secret|token|otp|cvv|cvc|ssn|card/i.test((c.name || "") + " " + (c.id || ""))))`;
+// The values of the page's secret fields (for redaction) and how many there are (the page is sensitive when any exist).
+const SECRETS = `[...document.querySelectorAll("input")].filter(${SECRET_FIELD}).map((c) => c.value)`;
+// Result fields that carry page content: untrusted data from the web page, never instructions to the agent.
+const PAGE_FIELDS = ["text", "snapshot", "value", "messages", "errors", "title", "url", "result", "selected"];
+const CAPTURES = new Set(["eval", "screenshot", "take_screenshot", "cdp"]);
+
 // Walks the DOM, tags visible interactive or text elements with data-hb-ref, returns one indented line each.
 const SNAPSHOT = (o) => `(() => {
   const O = ${JSON.stringify(o)}; let n = 0; const out = [];
@@ -28,7 +37,7 @@ const SNAPSHOT = (o) => `(() => {
         const ref = "e" + (++n); c.setAttribute("data-hb-ref", ref);
         const name = (c.getAttribute("aria-label") || c.alt || c.placeholder || (r ? c.innerText : own) || "").replace(/\\s+/g, " ").trim().slice(0, 80);
         // Never hand an agent a secret: passwords, card numbers, one-time codes and anything named like a credential.
-        const secret = c.type === "password" || /cc-|password|one-time-code/i.test(c.autocomplete || "") || /pass|secret|token|otp|cvv|cvc|ssn|card/i.test((c.name || "") + " " + (c.id || ""));
+        const secret = ${SECRET_FIELD}(c);
         const val = c.value !== undefined && c.tagName !== "BUTTON" && c.value !== "" ? (secret ? " value=<hidden>" : " value=" + JSON.stringify(String(c.value).slice(0, 80))) : "";
         out.push("  ".repeat(d) + "- " + (r || "text") + (name ? " " + JSON.stringify(name) : "") + val + (c.href ? " href=" + c.getAttribute("href") : "") + " [ref=" + ref + "]");
         walk(c, d + 1);
@@ -46,7 +55,16 @@ const SNAPSHOT = (o) => `(() => {
 // other tabs, the profile (cookies, storage), downloads, the browser process or the file system.
 export const CDP_ALLOWED = /^(DOM|CSS|Accessibility|Overlay|DOMSnapshot|Animation|Performance|Log|Debugger)\.|^(Runtime\.(evaluate|callFunctionOn|getProperties|releaseObject)|Page\.(captureScreenshot|getLayoutMetrics|getFrameTree|reload)|Emulation\.(setDeviceMetricsOverride|clearDeviceMetricsOverride|setEmulatedMedia)|Target\.getTargetInfo|Input\.dispatch(Mouse|Key|Touch)Event)$/;
 
-export default function register({ sessions, onEvent, onOpen, route, dir, openTab, closeTab, targets }) {
+// Replaces every secret field value anywhere in a result (eval, console, text...) with <hidden>.
+const redact = (v, secrets) => {
+  if (!secrets.length) return v;
+  if (typeof v === "string") return secrets.reduce((t, x) => t.split(String(x)).join("<hidden>"), v);
+  if (Array.isArray(v)) return v.map((x) => redact(x, secrets));
+  if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redact(x, secrets)]));
+  return v;
+};
+
+export default function register({ sessions, onEvent, onOpen, route, dir, openTab, closeTab, targets, lease = async () => {} }) {
   const opened = new Set(); // tab ids an agent opened
   const grants = () => { try { return JSON.parse(readFileSync(join(dir, "grants.json"), "utf8")); } catch { return {}; } };
   const granted = (id, cap) => grants()[id]?.[cap] === true;
@@ -111,7 +129,20 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
     forward: async (s) => { await evaluate(s, "history.forward()"); await sleep(300); await waitFor(s, {}); return { url: s.state.url }; },
     reload: async (s) => { await s.call("Page.reload"); await sleep(300); await waitFor(s, {}); return {}; },
     text: async (s) => ({ text: await evaluate(s, "document.body ? document.body.innerText : ''") }),
-    snapshot: async (s, { interactive, maxDepth, selector }) => ({ url: s.state.url, title: s.state.title, snapshot: await evaluate(s, SNAPSHOT({ interactive, maxDepth, selector })) }),
+    // compact (Cursor): interactive elements only, one flat line each, fewest tokens.
+    snapshot: async (s, { interactive, maxDepth, selector, compact }) => {
+      const snap = await evaluate(s, SNAPSHOT({ interactive: interactive || compact, maxDepth, selector }));
+      return { url: s.state.url, title: s.state.title, snapshot: compact ? snap.split("\n").map((l) => l.trim()).join("\n") : snap };
+    },
+    hover: async (s, { ref }) => { const c = await center(s, ref); await s.call("Input.dispatchMouseEvent", { type: "mouseMoved", x: c.x, y: c.y }); return c; },
+    // fields: [{ ref, value }]; a select takes value as an option value or label.
+    fill_form: async (s, { fields = [] }) => {
+      for (const f of [].concat(typeof fields === "string" ? JSON.parse(fields) : fields)) {
+        const isSelect = await onEl(s, f.ref, `return e.tagName === "SELECT";`);
+        if (isSelect) await acts.select_option(s, { ref: f.ref, values: [f.value] }); else await acts.fill(s, f);
+      }
+      return { filled: [].concat(fields).length };
+    },
     click: async (s, { ref, x, y, button = "left", clicks = 1, doubleClick, offsetX, offsetY }) => {
       if (doubleClick) clicks = 2;
       if (ref) { const b = await box(s, ref); x = b.x + (offsetX ?? b.width / 2); y = b.y + (offsetY ?? b.height / 2); }
@@ -152,7 +183,8 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
     get_bounding_box: async (s, { ref }) => box(s, ref, false),
     highlight: async (s, { ref, durationMs = 2000 }) => { await onEl(s, ref, `const o = e.style.outline; e.style.outline = "3px solid #f0a";
       setTimeout(() => { e.style.outline = o; }, ${Number(durationMs) | 0}); return {};`); return {}; },
-    lock: (s, { action = "lock" }) => { s.state.agentLock = action === "lock"; return { locked: s.state.agentLock }; },
+    // Cursor's lock: on the app, the block's input lease (the person sees who is driving and can take control back).
+    lock: async (s, { action = "lock" }) => { s.state.agentLock = action === "lock"; await lease(s.id, s.state.agentLock); return { locked: s.state.agentLock }; },
     cdp: async (s, { method, params }) => {
       if (!granted(s.id, "cdp")) throw new Error(`raw CDP on tab ${s.id} needs the person's cdp grant`);
       if (!CDP_ALLOWED.test(String(method))) throw new Error(`CDP method ${method} is not allowed for agents`);
@@ -197,18 +229,19 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
     if (cmd === "tabs") {
       const list = await tabs(), action = args.action ?? "list", pick = args.index !== undefined ? list[args.index]?.tab : tab;
       if (action === "list") return { tabs: list.map((t, index) => ({ index, ...t, selected: t.tab === selected })) };
-      if (action === "new") { const r = await run({ cmd: "open", url: args.url }); selected = r.tab; return r; }
+      if (action === "new") { const r = await run({ cmd: "open", url: args.url, position: args.position }); selected = r.tab; return r; }
       if (!pick) throw new Error(`no tab at index ${args.index}`);
       if (action === "select") { if (!list.find((t) => t.tab === pick)?.controllable) throw new Error(`tab ${pick} is not agent-controllable`); selected = pick; return { selected }; }
       if (action === "close") { if (selected === pick) selected = null; return run({ cmd: "close", tab: pick }); }
       throw new Error("action is list, new, close or select");
     }
     if (cmd !== "open") tab = tab ?? selected;
-    if (cmd === "navigate" && !tab) { const r = await run({ cmd: "open", url: args.url }); selected = r.tab; return r; }
+    if (cmd === "navigate" && !tab) { const r = await run({ cmd: "open", url: args.url, position: args.position }); selected = r.tab; return r; }
     if (cmd === "open") {
       const id = String(tab || `agent-${Date.now().toString(36)}`).replace(/[^a-z0-9_-]/gi, "");
       opened.add(id);
-      const s = await openTab(id); // a new browser block (or, on the stand-in, a new target); the app may pick its id
+      // position (Cursor): "side" opens beside the focused pane, "active" (default) as a tab.
+      const s = await openTab(id, args.position === "side" ? "right" : "tab"); // a new browser block (or, on the stand-in, a new target); the app may pick its id
       opened.add(s.id);
       s.state.agent = true; s.state.agentOpened = true;
       if (args.url) await acts.navigate(s, args);
@@ -220,7 +253,14 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
     if (!s) throw new Error(`no tab ${tab}; list them with cmd tabs`);
     if (!controllable(s)) throw new Error(`tab ${tab} is not agent-controllable; open your own tab or ask the person to allow agents in that block`);
     if (await devtoolsOpen(s)) throw new Error(`DevTools is open for tab ${tab}; close it before driving the page`);
-    const r = await acts[cmd](s, args);
+    // SEC2b: on a page with secret fields, anything that can read or picture them needs the person's capture grant.
+    const secrets = (await evaluate(s, SECRETS).catch(() => [])).filter((v) => String(v).length >= 4);
+    const sensitive = await evaluate(s, `${SECRETS}.length`).catch(() => 0) > 0;
+    if (sensitive && (CAPTURES.has(cmd) || take_screenshot_afterwards) && !granted(s.id, "capture"))
+      throw new Error(`tab ${s.id} has password or payment fields: ${cmd} needs the person's capture grant`);
+    const r = redact(await acts[cmd](s, args), secrets);
+    const untrusted = PAGE_FIELDS.filter((k) => k in r);
+    if (untrusted.length) r.untrusted = untrusted;
     if (take_screenshot_afterwards && cmd !== "close") r.screenshot = (await acts.screenshot(s, {})).path;
     if (cmd === "close") { opened.delete(s.id); await closeTab(s.id); }
     return r;

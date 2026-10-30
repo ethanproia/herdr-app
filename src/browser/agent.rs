@@ -24,11 +24,18 @@ pub struct Focus<'a> {
     pub block_of_pane: &'a dyn Fn(&str) -> Option<BrowserId>,
 }
 
+/// The profile (CEF cache) agent-opened browsers use unless the command names another.
+pub const AGENT_PROFILE: &str = "agent";
+
 pub enum Step {
     /// The reply was sent or parked.
     Done,
     /// `browser.open`: the window makes a browser block (at `place`, default a new tab) and answers with its id.
-    Open { url: Option<String>, place: Option<String>, reply: Reply },
+    /// `profile` defaults to "agent": a browser an agent opens never shares the person's cookies or logins.
+    Open { url: Option<String>, place: Option<String>, profile: String, reply: Reply },
+    /// `browser.lock`: the window grants `agent` the block's input lease (the person's input is refused with a
+    /// visible cue), or ends it (`agent` None).
+    Lease { id: BrowserId, agent: Option<String>, reply: Reply },
     /// `browser.close`: the window closes block `id` (and calls `Agent::closed`) and answers.
     Close { id: BrowserId, reply: Reply },
 }
@@ -70,7 +77,9 @@ fn flag(a: &Value, k: &str, default: bool) -> bool {
 }
 
 impl Agent {
+    /// A new app has no host yet: a cdp.json left by an earlier run names a dead port, so it goes.
     pub fn new(dir: PathBuf) -> Self {
+        let _ = std::fs::remove_file(dir.join("cdp.json"));
         Self { grants: Grants::new(dir.clone()), cdp: CdpFile::new(dir), ..Default::default() }
     }
 
@@ -86,7 +95,8 @@ impl Agent {
 
     pub fn run(&mut self, name: &str, a: &Value, reg: &dyn BrowserRegistry, focus: &Focus, reply: Reply) -> Step {
         if name == "browser.open" {
-            return Step::Open { url: arg(a, "url").map(Into::into), place: arg(a, "place").map(Into::into), reply };
+            let profile = arg(a, "profile").unwrap_or(AGENT_PROFILE).to_string();
+            return Step::Open { url: arg(a, "url").map(Into::into), place: arg(a, "place").map(Into::into), profile, reply };
         }
         let id = match Self::target(a, reg, focus) {
             Ok(id) => id,
@@ -97,6 +107,10 @@ impl Agent {
         };
         if name == "browser.close" {
             return Step::Close { id, reply };
+        }
+        if name == "browser.lock" {
+            let agent = flag(a, "on", true).then(|| arg(a, "agent").unwrap_or("an agent").to_string());
+            return Step::Lease { id, agent, reply };
         }
         let link = reg.link();
         let sent = |reply: Reply, msg: AppToHost| {
@@ -561,7 +575,11 @@ mod tests {
         let pane = |_: &str| None;
         let (_got, reply) = catch();
         let step = a.run("browser.open", &json!({ "url": "https://x.test", "place": "right" }), &reg, &Focus { focused: None, block_of_pane: &pane }, reply);
-        assert!(matches!(step, Step::Open { url: Some(u), place: Some(p), .. } if u == "https://x.test" && p == "right"));
+        assert!(matches!(step, Step::Open { url: Some(u), place: Some(p), profile, .. } if u == "https://x.test" && p == "right" && profile == "agent"),
+            "an agent's browser gets its own profile by default");
+        let (_got, reply) = catch();
+        let step = a.run("browser.open", &json!({ "profile": "default" }), &reg, &Focus { focused: None, block_of_pane: &pane }, reply);
+        assert!(matches!(step, Step::Open { profile, .. } if profile == "default"));
     }
 
     #[test]
@@ -613,6 +631,20 @@ mod tests {
     }
 
     #[test]
+    fn lock_goes_to_the_window_as_a_lease() {
+        let (_d, mut a) = agent();
+        let reg = reg();
+        let pane = |_: &str| None;
+        let focus = Focus { focused: Some("b1".into()), block_of_pane: &pane };
+        let (_g, reply) = catch();
+        assert!(matches!(a.run("browser.lock", &json!({ "agent": "claude" }), &reg, &focus, reply),
+            Step::Lease { id, agent: Some(who), .. } if id == "b1" && who == "claude"));
+        let (_g, reply) = catch();
+        assert!(matches!(a.run("browser.lock", &json!({ "on": false }), &reg, &focus, reply), Step::Lease { agent: None, .. }));
+        assert!(sent(&reg).is_empty());
+    }
+
+    #[test]
     fn grants_are_app_owned_and_private() {
         let (d, mut a) = agent();
         let id: BrowserId = "b1".into();
@@ -632,6 +664,16 @@ mod tests {
         assert_eq!(read(), json!({}), "a closed block keeps no grants");
         // No `herdr-app do` command can grant: the agent surface has none.
         assert!(crate::commands::COMMANDS.iter().all(|c| !c.name.contains("allow") && !c.name.contains("grant")));
+    }
+
+    #[test]
+    fn a_new_app_drops_a_stale_cdp_file() {
+        let (d, _a) = agent();
+        let path = d.path().join("browser/cdp.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"port":55580,"targets":{}}"#).unwrap();
+        let _again = Agent::new(d.path().join("browser"));
+        assert!(!path.exists(), "a port from an earlier run must not be published");
     }
 
     #[test]

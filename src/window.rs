@@ -3867,8 +3867,8 @@ impl AppWindow {
         let step = self.browsers.run(name, &args, &|pane| blocks.get(pane).cloned(), reply, cx);
         let made = match step {
             Step::Done => return,
-            Step::Open { url, place, reply } => {
-                let block = crate::layout::BrowserBlock { url: url.unwrap_or_default(), profile: "default".into() };
+            Step::Open { url, place, profile, reply } => {
+                let block = crate::layout::BrowserBlock { url: url.unwrap_or_default(), profile };
                 let r = self.open_browser(block, place.as_deref());
                 let ok = r.is_ok();
                 reply(r);
@@ -3885,6 +3885,18 @@ impl AppWindow {
                     None => Ok(json!({ "id": id, "closed": true })),
                 });
                 true
+            }
+            // The person sees "<agent> is driving · Take Control" and their input is refused while the lease holds.
+            Step::Lease { id, agent, reply } => {
+                let Some(view) = self.browsers.view(&id).cloned() else { return reply(Err(format!("no browser {id:?}"))) };
+                let input = view.read(cx).input().clone();
+                input.update(cx, |i, _| match &agent {
+                    Some(a) => i.grant_lease(a),
+                    None => i.end_lease(),
+                });
+                reply(Ok(json!({ "id": id, "locked": agent.is_some() })));
+                cx.notify();
+                return;
             }
         };
         if made {
