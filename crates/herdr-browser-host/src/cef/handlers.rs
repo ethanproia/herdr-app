@@ -1,6 +1,6 @@
 //! CEF callbacks, each turned into a protocol message for the app.
 
-use super::{downloads_dir, keep_chooser, keep_dialog, next_req, on_frame, send, view_of};
+use super::{downloads_dir, keep_chooser, keep_dialog, next_req, on_frame, on_popup_frame, on_popup_show, on_popup_size, send, view_of};
 use cef::*;
 use herdr_browser_protocol::{DialogKind, DownloadState, HostToApp};
 
@@ -107,11 +107,25 @@ wrap_render_handler! {
 
         fn on_accelerated_paint(&self, _browser: Option<&mut Browser>, type_: PaintElementType, _dirty_rects: Option<&[Rect]>, info: Option<&AcceleratedPaintInfo>) {
             let Some(info) = info else { return };
-            if type_ != PaintElementType::default() || info.shared_texture_io_surface.is_null() {
+            if info.shared_texture_io_surface.is_null() {
                 return;
             }
             let (w, h) = (info.extra.coded_size.width as u32, info.extra.coded_size.height as u32);
-            on_frame(&self.id, info.shared_texture_io_surface, w, h);
+            match *type_.as_ref() {
+                sys::cef_paint_element_type_t::PET_VIEW => on_frame(&self.id, info.shared_texture_io_surface, w, h),
+                sys::cef_paint_element_type_t::PET_POPUP => on_popup_frame(&self.id, info.shared_texture_io_surface, w, h),
+                _ => {}
+            }
+        }
+
+        fn on_popup_show(&self, _browser: Option<&mut Browser>, show: ::std::os::raw::c_int) {
+            on_popup_show(&self.id, show != 0);
+        }
+
+        fn on_popup_size(&self, _browser: Option<&mut Browser>, rect: Option<&Rect>) {
+            if let Some(r) = rect {
+                on_popup_size(&self.id, r.x, r.y, r.width, r.height);
+            }
         }
 
         fn on_ime_composition_range_changed(&self, _browser: Option<&mut Browser>, _selected_range: Option<&Range>, character_bounds: Option<&[Rect]>) {
