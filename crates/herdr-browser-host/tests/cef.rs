@@ -35,6 +35,12 @@ body{margin:0;background:#fff} select{position:absolute;left:10px;top:10px;width
 option{background:#00ff00;color:#00ff00}
 </style></head><body><select id=s><option value=a>a</option><option value=b>b</option><option value=c>c</option></select></body></html>"#;
 
+/// Logs every prefers-color-scheme change, so a test sees it update live.
+const SCHEME_PAGE: &str = r#"<!doctype html><html><head><title>scheme</title></head><body><script>
+const q=matchMedia('(prefers-color-scheme: dark)');
+q.addEventListener('change',e=>console.log('ev scheme '+JSON.stringify({dark:e.matches})));
+</script></body></html>"#;
+
 fn pages() -> Pages {
     Pages::start(vec![
         ("a", solid("A", "#3366cc")),
@@ -42,6 +48,7 @@ fn pages() -> Pages {
         ("input", INPUT_PAGE.to_string()),
         ("forge", FORGE_PAGE.to_string()),
         ("select", SELECT_PAGE.to_string()),
+        ("scheme", SCHEME_PAGE.to_string()),
     ])
 }
 
@@ -285,5 +292,61 @@ fn select_dropdown_paints_and_takes_input() {
     std::thread::sleep(SEC / 4);
     assert_eq!(h.eval("b1", 2, "s.value"), (true, serde_json::json!("b")));
     println!("select value is now b");
+    h.shutdown();
+}
+
+#[test]
+fn color_scheme_follows_the_app_live() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-scheme");
+    h.send(AppToHost::SetColorScheme { dark: false });
+    create(&mut h, "b1", &p.url("scheme"), 100.0, 50.0, 1.0);
+    loaded(&mut h);
+    let dark = "matchMedia('(prefers-color-scheme: dark)').matches";
+    assert_eq!(h.eval("b1", 1, dark), (true, serde_json::json!(false)));
+    h.send(AppToHost::SetColorScheme { dark: true });
+    assert_eq!(page_event(&mut h, "scheme"), serde_json::json!({"dark": true}));
+    assert_eq!(h.eval("b1", 2, dark), (true, serde_json::json!(true)));
+    println!("SetColorScheme dark -> page saw the change live, matchMedia dark = true");
+    // A browser made later starts in the current scheme, in a named profile too.
+    h.send(AppToHost::Create { id: "b2".into(), url: Some(p.url("scheme")), size: Size { w: 100.0, h: 50.0 }, scale: 1.0, profile: Some("work".into()) });
+    h.until(15 * SEC, |m| matches!(m, HostToApp::Loading { id, loading: false, .. } if id == "b2"));
+    assert_eq!(h.eval("b2", 3, dark), (true, serde_json::json!(true)));
+    h.send(AppToHost::SetColorScheme { dark: false });
+    assert_eq!(page_event(&mut h, "scheme"), serde_json::json!({"dark": false}));
+    println!("new browser in profile work starts dark; back to light live");
+    h.shutdown();
+}
+
+#[test]
+fn profiles_keep_cookies_and_storage_apart_and_across_restarts() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let dir = scratch("cef-profiles");
+    let make = |h: &mut Host, id: &str, profile: Option<&str>| {
+        h.send(AppToHost::Create { id: id.into(), url: Some(p.url("a")), size: Size { w: 100.0, h: 50.0 }, scale: 1.0, profile: profile.map(Into::into) });
+        let id = id.to_string();
+        h.until(15 * SEC, |m| matches!(m, HostToApp::Loading { id: i, loading: false, .. } if *i == id));
+    };
+    let mut h = Host::start_in(&dir);
+    make(&mut h, "w", Some("work"));
+    make(&mut h, "d", None);
+    let set = "document.cookie='who=work; max-age=3600; path=/'; document.cookie='sess=1; path=/'; localStorage.setItem('k','work'); document.cookie";
+    assert_eq!(h.eval("w", 1, set).0, true);
+    assert_eq!(h.eval("d", 2, "[document.cookie, localStorage.getItem('k')]"), (true, serde_json::json!(["", null])));
+    println!("profile work set cookies and localStorage; the default profile sees none");
+    h.shutdown();
+
+    let mut h = Host::start_in(&dir);
+    make(&mut h, "w", Some("work"));
+    let (ok, v) = h.eval("w", 3, "[document.cookie.split('; ').sort().join('; '), localStorage.getItem('k')]");
+    assert!(ok);
+    assert_eq!(v, serde_json::json!(["sess=1; who=work", "work"]));
+    println!("after a host restart, profile work still has {v} (persistent and session cookie, localStorage)");
     h.shutdown();
 }

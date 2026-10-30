@@ -101,3 +101,15 @@ fn create_reports_a_cdp_target_and_edit_is_accepted() {
     assert!(h.eval("b1", 2, "1").0);
     h.shutdown();
 }
+
+#[test]
+fn bad_profile_names_are_rejected() {
+    let p = pages();
+    let mut h = Host::start("bad-profile");
+    h.send(AppToHost::Create { id: "b1".into(), url: Some(p.url("a")), size: Size { w: 10.0, h: 10.0 }, scale: 1.0, profile: Some("../escape".into()) });
+    match h.next(10 * SEC) {
+        Some(HostToApp::Error { id: Some(i), message }) => assert!(i == "b1" && message.contains("profile"), "{message}"),
+        m => panic!("expected a profile error, got {m:?}"),
+    }
+    h.shutdown();
+}

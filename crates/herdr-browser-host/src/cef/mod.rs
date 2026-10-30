@@ -56,6 +56,12 @@ pub(crate) struct Host {
     dialogs: HashMap<u64, JsdialogCallback>,
     choosers: HashMap<u64, FileDialogCallback>,
     quit: bool,
+    /// The Hello profile root; named profiles live in folders under it.
+    root: PathBuf,
+    /// One request context per named profile (the default profile is CEF's global context).
+    contexts: HashMap<String, RequestContext>,
+    /// The app's appearance from the last SetColorScheme; None until the app says.
+    dark: Option<bool>,
 }
 
 thread_local! {
@@ -337,6 +343,9 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
             blitter: blit::Blitter::new(),
             downloads,
             next_req: 0,
+            root: profile_dir.clone(),
+            contexts: HashMap::new(),
+            dark: None,
             dialogs: HashMap::new(),
             choosers: HashMap::new(),
             quit: false,
@@ -433,6 +442,46 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
     Ok(())
 }
 
+/// prefers-color-scheme for every page in `ctx`: dark, light, or the system's (None).
+fn apply_scheme(ctx: &RequestContext, dark: Option<bool>) {
+    use sys::cef_color_variant_t as V;
+    let v = match dark {
+        Some(true) => V::CEF_COLOR_VARIANT_DARK,
+        Some(false) => V::CEF_COLOR_VARIANT_LIGHT,
+        None => V::CEF_COLOR_VARIANT_SYSTEM,
+    };
+    ctx.set_chrome_color_scheme(ColorVariant::from(v), 0);
+}
+
+/// The request context for a block's `profile`: None (CEF's global context) for the default
+/// profile, else one context per name with its own cookies and storage under `<root>/<name>`.
+fn context_for(profile: Option<&str>) -> Result<Option<RequestContext>, String> {
+    let name = match profile.map(str::trim) {
+        None | Some("") | Some("default") => return Ok(None),
+        Some(n) => n.to_string(),
+    };
+    if !crate::downloads::is_profile_name(&name) {
+        return Err(format!("bad profile name {name:?}: use letters, digits, - and _"));
+    }
+    if let Some(c) = with_host(|h| h.contexts.get(&name).cloned()).flatten() {
+        return Ok(Some(c));
+    }
+    let (root, dark) = with_host(|h| (h.root.clone(), h.dark)).ok_or("host not ready")?;
+    let dir = root.join("profiles").join(&name);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("profile {name}: {e}"))?;
+    let settings = RequestContextSettings {
+        cache_path: CefString::from(dir.to_string_lossy().as_ref()),
+        persist_session_cookies: 1,
+        ..Default::default()
+    };
+    let ctx = request_context_create_context(Some(&settings), None).ok_or_else(|| format!("CEF could not make profile {name}"))?;
+    if dark.is_some() {
+        apply_scheme(&ctx, dark);
+    }
+    with_host(|h| h.contexts.insert(name, ctx.clone()));
+    Ok(Some(ctx))
+}
+
 fn browser(id: &str) -> Option<Browser> {
     with_host(|h| h.browsers.get(id).and_then(|e| e.browser.clone())).flatten()
 }
@@ -446,18 +495,35 @@ fn handle(m: AppToHost) {
     match m {
         M::Hello { .. } => send(HostToApp::Error { id: None, message: "hello already received".into() }),
         M::Shutdown => {}
-        M::Create { id, url, size, scale, .. } => {
+        M::SetColorScheme { dark } => {
+            let contexts: Vec<RequestContext> = with_host(|h| {
+                h.dark = Some(dark);
+                h.contexts.values().cloned().collect()
+            })
+            .unwrap_or_default();
+            for ctx in request_context_get_global_context().into_iter().chain(contexts) {
+                apply_scheme(&ctx, Some(dark));
+            }
+        }
+        M::Create { id, url, size, scale, profile } => {
             let exists = with_host(|h| h.browsers.contains_key(&id)).unwrap_or(false);
             if exists {
                 send(HostToApp::Error { id: Some(id.clone()), message: format!("browser {id} exists") });
                 return;
             }
+            let mut context = match context_for(profile.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    send(HostToApp::Error { id: Some(id.clone()), message: e });
+                    return;
+                }
+            };
             with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, view: None, popup: None, popup_shown: false, popup_rect: None }));
             let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
             let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
             let mut client = handlers::client(&id);
             let url = CefString::from(url.as_deref().unwrap_or("about:blank"));
-            match browser_host_create_browser_sync(Some(&window_info), Some(&mut client), Some(&url), Some(&settings), None, None) {
+            match browser_host_create_browser_sync(Some(&window_info), Some(&mut client), Some(&url), Some(&settings), None, context.as_mut()) {
                 Some(b) => {
                     // Ask DevTools for this page's target id; the observer sends CdpTarget.
                     let reg = b.host().and_then(|host| {
