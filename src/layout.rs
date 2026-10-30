@@ -28,6 +28,59 @@ pub enum Content {
     },
     /// An agent's terminal, full size (`"focused"`: the selected agent).
     Agent { agent: String },
+    /// A Chromium page (`src/browser`); the url follows what the page shows.
+    Browser { browser: BrowserBlock },
+}
+
+/// `{ "browser": { "url": "https://...", "profile": "default" } }`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BrowserBlock {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default = "default_profile", skip_serializing_if = "is_default_profile")]
+    pub profile: String,
+}
+
+fn default_profile() -> String {
+    "default".into()
+}
+
+fn is_default_profile(p: &String) -> bool {
+    p == "default"
+}
+
+/// Every browser block under `n` (floats included), as (block id, block).
+pub fn browser_blocks(n: &Node) -> Vec<(String, BrowserBlock)> {
+    let mut out = Vec::new();
+    for n in n.walk() {
+        if let Some(Content::Browser { browser }) = n.content() {
+            out.push((n.id.clone(), browser.clone()));
+        }
+        for f in &n.floating {
+            if let Content::Browser { browser } = &f.content {
+                out.push((f.id.clone(), browser.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// The page in block or float `id` went to `url`: the document follows. False: not under `n`.
+pub fn set_browser_url(n: &mut Node, id: &str, url: &str) -> bool {
+    let content = match n.find_mut(id) {
+        Some(Node { kind: Kind::Block { content }, .. }) => content,
+        _ => match n.find_float_mut(id) {
+            Some(f) => &mut f.content,
+            None => return false,
+        },
+    };
+    match content {
+        Content::Browser { browser } => {
+            browser.url = url.to_owned();
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Which side of its node a floating block sits on. Left/right make it
@@ -465,9 +518,9 @@ impl Node {
         }
     }
 
-    /// A pane in a tab: a terminal, or a mod beside them (a viewer, a board).
+    /// A pane in a tab: a terminal, or a mod or browser beside them (a viewer, a board, a page).
     pub fn is_pane(&self) -> bool {
-        matches!(self.content(), Some(Content::Terminal { .. } | Content::Mod { .. }))
+        matches!(self.content(), Some(Content::Terminal { .. } | Content::Mod { .. } | Content::Browser { .. }))
     }
 
     pub fn closable(&self) -> bool {
@@ -736,6 +789,36 @@ mod tests {
         assert_eq!(snap(600.0, 5.0, 1200.0, 800.0), (Edge::Top, Align::Center));
         assert_eq!(snap(1000.0, 790.0, 1200.0, 800.0), (Edge::Bottom, Align::End));
         assert_eq!(snap(-50.0, 900.0, 1200.0, 800.0).1, Align::End);
+    }
+
+    #[test]
+    fn browser_blocks_parse_round_trip_and_follow_the_page() {
+        let json = r#"{ "id": "root", "type": "row", "children": [
+          { "id": "web", "type": "block", "content": {"browser": {"url": "https://example.com", "profile": "work"}} },
+          { "id": "bare", "type": "block", "content": {"browser": {}} } ],
+          "floating": [ { "id": "peek", "content": {"browser": {"url": "https://a.test"}} } ] }"#;
+        let mut n: Node = serde_json::from_str(json).unwrap();
+        let web = BrowserBlock { url: "https://example.com".into(), profile: "work".into() };
+        assert_eq!(n.find("web").unwrap().content(), Some(&Content::Browser { browser: web.clone() }));
+        let bare = BrowserBlock { url: String::new(), profile: "default".into() };
+        assert_eq!(n.find("bare").unwrap().content(), Some(&Content::Browser { browser: bare }));
+        // The default profile isn't written out; other blocks stay what they were.
+        let text = serde_json::to_string(&n).unwrap();
+        assert!(text.contains(r#""browser":{"url":"https://a.test"}"#), "{text}");
+        let back: Node = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, n);
+        assert_eq!(browser_blocks(&n).into_iter().map(|(id, _)| id).collect::<Vec<_>>(), ["peek", "web", "bare"]);
+        // A page that navigates writes its url into the document (blocks and floats).
+        assert!(set_browser_url(&mut n, "web", "https://example.com/next"));
+        assert!(set_browser_url(&mut n, "peek", "https://b.test"));
+        assert!(!set_browser_url(&mut n, "root", "https://x.test"));
+        assert!(!set_browser_url(&mut n, "nope", "https://x.test"));
+        let back: Node = serde_json::from_str(&serde_json::to_string(&n).unwrap()).unwrap();
+        assert_eq!(browser_blocks(&back)[1].1, BrowserBlock { url: "https://example.com/next".into(), profile: "work".into() });
+        assert_eq!(browser_blocks(&back)[0].1.url, "https://b.test");
+        // Not a terminal: the other block kinds still parse as before.
+        let t: Content = serde_json::from_str(r#"{"terminal": "t1"}"#).unwrap();
+        assert_eq!(t, Content::Terminal { terminal: "t1".into() });
     }
 
     #[test]

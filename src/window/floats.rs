@@ -134,6 +134,10 @@ impl AppWindow {
             (Content::Terminal { .. }, _, Some(t)) => {
                 div().w(settings::z(560.0)).h(settings::z(320.0)).rounded(settings::z(10.0)).overflow_hidden().child(super::shown_terminal(&t.view, cx)).into_any_element()
             }
+            // HERDR: browser block, floating.
+            (Content::Browser { .. }, _, _) if let Some(v) = self.browsers.view(&f.id) => {
+                div().w(settings::z(560.0)).h(settings::z(420.0)).rounded(settings::z(10.0)).overflow_hidden().child(v.clone()).into_any_element()
+            }
             (_, Some(Copy { root: Some(root), inst, .. }), _) => {
                 div().key_context(format!("Mod mod = {}", inst.name).as_str()).child(root.clone()).into_any_element()
             }

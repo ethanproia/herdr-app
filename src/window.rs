@@ -372,6 +372,8 @@ pub struct AppWindow {
     terms: HashMap<String, Term>,
     /// Mod copies by slot (block id, `<stack>#header`, or `overlay:<id>`).
     copies: HashMap<String, Copy>,
+    // HERDR: one browser view per browser block (src/browser/view.rs).
+    browsers: crate::browser::view::Browsers,
     overlays: Vec<Overlay>,
     folders: BTreeMap<String, Found>,
     /// Mods placed once; later the layout decides where (or whether) they show.
@@ -468,6 +470,7 @@ impl AppWindow {
             model: Model::default(),
             terms: HashMap::new(),
             copies: HashMap::new(),
+            browsers: Default::default(), // HERDR: browser block
             overlays: Vec::new(),
             folders: mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect(),
             seen,
@@ -1409,6 +1412,7 @@ impl AppWindow {
             }
         }
         self.publish_shown_copies();
+        self.sync_browsers(window, cx); // HERDR: browser block
 
         // Keyboard to the focused pane when it changes (never steal it from an open dialog).
         let model_pane = self.model.focused_pane();
@@ -3762,6 +3766,11 @@ impl AppWindow {
                 None => div().into_any_element(),
             },
             Content::Mod { .. } => self.render_slot(&n.id, cx),
+            // HERDR: browser block
+            Content::Browser { .. } => match self.browsers.view(&n.id) {
+                Some(v) => div().size_full().child(v.clone()).into_any_element(),
+                None => div().into_any_element(),
+            },
             Content::Agent { .. } => match self.shown_agent() {
                 Some(addr) => match self.agent_view(&n.id, &addr) {
                     Some(t) => div().size_full().child(shown_terminal(&t.view, cx)).into_any_element(),
@@ -3792,6 +3801,30 @@ impl AppWindow {
                 }
             },
         }
+    }
+
+    // HERDR: browser block. A view per browser block in any layout (chrome, tabs, overlays,
+    // floats); a block that goes closes its page. The page's url is written back to the document.
+    fn sync_browsers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut blocks = crate::layout::browser_blocks(&self.chrome);
+        for t in self.model.tabs() {
+            blocks.extend(crate::layout::browser_blocks(&t.root));
+        }
+        for l in self.overlays.iter().filter_map(|o| o.layout.as_ref()) {
+            blocks.extend(crate::layout::browser_blocks(l));
+        }
+        self.browsers.sync(blocks, window, cx, |this, id, ev, cx| {
+            let crate::browser::view::BrowserEvent::Url(url) = ev;
+            let tab = this.model.tabs().find(|t| crate::layout::browser_blocks(&t.root).iter().any(|(b, _)| b == id)).map(|t| t.id.clone());
+            let changed = match tab.and_then(|t| this.model.tab_mut(&t)) {
+                Some(t) => crate::layout::set_browser_url(&mut t.root, id, url),
+                None => crate::layout::set_browser_url(&mut this.chrome, id, url),
+            };
+            if changed {
+                this.publish(cx);
+                this.save();
+            }
+        });
     }
 
     fn render_slot(&self, slot: &str, cx: &mut Context<Self>) -> AnyElement {
