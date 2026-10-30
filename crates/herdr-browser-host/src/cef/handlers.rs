@@ -31,6 +31,8 @@ pub enum Op {
     /// The style panel (S10): `node` is set for SetStyle (to remember the original attribute)
     /// and RevertStyle (to forget it once restored).
     Styles { set: Option<String>, revert: Option<String> },
+    /// A pick (S4): describe the element under a point.
+    Pick,
     Eval,
     Overlay { epoch: u64 },
     /// The page-is-live probe for load `generation` (see `super::on_loading`).
@@ -118,6 +120,33 @@ pub fn revert_style_message(id: &str, req: u64, node: &str) -> Vec<u8> {
         }
     };
     evaluate(id, req, Op::Styles { set: None, revert: Some(node.into()) }, &style_js(node, &body))
+}
+
+/// `PickInfo`: the element at (x, y) viewport CSS px (descending open shadow roots), a selector
+/// that matches only it (id, else a tag.class:nth-of-type path checked with querySelectorAll),
+/// a label (tag plus up to 30 chars of its own text, aria-label or alt; form fields never give
+/// their value, password fields give nothing) and its box.
+pub fn pick_message(id: &str, req: u64, x: f32, y: f32) -> Vec<u8> {
+    let js = format!(
+        "(()=>{{const X={x},Y={y};let el=document.elementFromPoint(X,Y);if(!el)return{{ok:false}};\
+         while(el.shadowRoot){{const inner=el.shadowRoot.elementFromPoint(X,Y);if(!inner||inner===el)break;el=inner}}\
+         const root=el.getRootNode(),esc=s=>CSS.escape(s);\
+         const one=s=>{{try{{return root.querySelectorAll(s).length===1}}catch(e){{return false}}}};\
+         let selector=null;if(el.id&&one('#'+esc(el.id)))selector='#'+esc(el.id);\
+         else{{const parts=[];let n=el;while(n&&n.nodeType===1){{\
+           if(n!==el&&n.id&&one('#'+esc(n.id))){{parts.unshift('#'+esc(n.id));if(one(parts.join(' > '))){{selector=parts.join(' > ')}};break}}\
+           let p=n.tagName.toLowerCase()+[...n.classList].slice(0,2).map(c=>'.'+esc(c)).join('');\
+           const par=n.parentElement;if(par){{const same=[...par.children].filter(c=>c.tagName===n.tagName);if(same.length>1)p+=':nth-of-type('+(same.indexOf(n)+1)+')'}}\
+           parts.unshift(p);if(one(parts.join(' > '))){{selector=parts.join(' > ');break}}n=par}}\
+           if(!selector)selector=parts.join(' > ')}}\
+         const tag=el.tagName.toLowerCase(),field=/^(input|textarea|select|option)$/.test(tag)||el.isContentEditable;\
+         let t='';if(!(tag==='input'&&(el.type||'').toLowerCase()==='password')){{\
+           t=el.getAttribute('aria-label')||el.getAttribute('alt')||(field?'':[...el.childNodes].filter(c=>c.nodeType===3).map(c=>c.textContent).join(' '))}}\
+         t=t.replace(/\\s+/g,' ').trim().slice(0,30);\
+         const label=tag==='input'&&(el.type||'').toLowerCase()==='password'?'':(t?tag+' '+t:tag);\
+         const r=el.getBoundingClientRect();return{{ok:true,selector,label,rect:{{x:r.x,y:r.y,w:r.width,h:r.height}}}}}})()"
+    );
+    evaluate(id, req, Op::Pick, &js)
 }
 
 fn style_rows(value: &serde_json::Value) -> Vec<herdr_browser_protocol::StyleRow> {
@@ -716,6 +745,13 @@ wrap_dev_tools_message_observer! {
                             }
                             let rows = if ok { style_rows(&value) } else { vec![] };
                             send(HostToApp::StylesResult { id, req, ok, rows });
+                        }
+                        Op::Pick => {
+                            let ok = ok && value["ok"].as_bool() == Some(true);
+                            let text = |k: &str| if ok { value[k].as_str().unwrap_or_default().to_string() } else { String::new() };
+                            let f = |k: &str| value["rect"][k].as_f64().unwrap_or(0.0) as f32;
+                            let rect = herdr_browser_protocol::CssRect { x: f("x"), y: f("y"), w: f("w"), h: f("h") };
+                            send(HostToApp::PickInfoResult { id, req, ok, selector: text("selector"), label: text("label"), rect });
                         }
                         Op::Ready { generation } => {
                             super::debug(format_args!("{id}: first paint seen: {value}"));

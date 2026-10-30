@@ -949,8 +949,12 @@ fn browser_msg(m: AppToHost) {
             }
         }
         // Pick payload (S4): fork-host implements; until then "nothing there".
-        M::PickInfo { req, .. } => {
-            send(HostToApp::PickInfoResult { id, req, ok: false, selector: String::new(), label: String::new(), rect: herdr_browser_protocol::CssRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } });
+        M::PickInfo { req, x, y, .. } => {
+            let call = handlers::pick_message(&id, req, x, y);
+            if host.send_dev_tools_message(Some(&call)) == 0 {
+                handlers::eval_unsent(&id);
+                send(HostToApp::PickInfoResult { id, req, ok: false, selector: String::new(), label: String::new(), rect: herdr_browser_protocol::CssRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } });
+            }
         }
         // Style panel (S10): the host side is fork-host's slice; until it lands every request answers "no such element".
         M::Styles { req, ref node, ref props, .. } => {

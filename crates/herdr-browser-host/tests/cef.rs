@@ -63,6 +63,20 @@ const STYLES_PAGE: &str = r#"<!doctype html><html><head><title>styles</title><st
 .c{margin:2px} #b{color:rgb(0, 128, 0)}</style></head><body style="margin:0">
 <div id=a class=c style="color: red; display:inline-block">secret page text</div><div id=b>more text</div></body></html>"#;
 
+/// Known boxes: #go 98x43 at (10, 10); fields with values that must never leak; two cards
+/// without ids; a button inside an open shadow root.
+const PICK_PAGE: &str = r#"<!doctype html><html><head><title>pick</title><style>
+body{margin:0} #go{position:absolute;left:10px;top:10px;width:98px;height:43px;box-sizing:border-box}
+#pw{position:absolute;left:10px;top:70px;width:100px} #name{position:absolute;left:10px;top:100px;width:100px}
+.card{position:absolute;left:200px;width:150px} .card p{margin:0;height:20px}
+#host{position:absolute;left:10px;top:150px}
+</style></head><body><button id=go>Go now please</button>
+<input id=pw type=password value=hunter2><input id=name type=text value=secretvalue>
+<div class=card style="top:10px"><p>one</p><p>two</p></div><div class=card style="top:60px"><p>three</p><p>four</p></div>
+<div id=host></div><script>
+const s=document.getElementById('host').attachShadow({mode:'open'});s.innerHTML='<button style="width:80px;height:30px">deep</button>';
+</script></body></html>"#;
+
 fn pages() -> Pages {
     Pages::start(vec![
         ("a", solid("A", "#3366cc")),
@@ -75,6 +89,7 @@ fn pages() -> Pages {
         ("geo", GEO_PAGE.to_string()),
         ("links", LINKS_PAGE.to_string()),
         ("styles", STYLES_PAGE.to_string()),
+        ("pick", PICK_PAGE.to_string()),
     ])
 }
 
@@ -606,5 +621,47 @@ fn style_panel_reads_sets_and_reverts() {
     assert!(!styles(&mut h, AppToHost::Styles { id: "b1".into(), req: 18, node: "#nope".into(), props: vec!["color".into()] }).0);
     assert!(!styles(&mut h, AppToHost::Styles { id: "b1".into(), req: 19, node: "[[bad".into(), props: vec!["color".into()] }).0);
     println!("refused: content, bad name, missing node, bad selector; #b had no style attribute and has none again");
+    h.shutdown();
+}
+
+fn pick(h: &mut Host, req: u64, x: f32, y: f32) -> (bool, String, String, CssRect) {
+    h.send(AppToHost::PickInfo { id: "b1".into(), req, x, y });
+    match h.until(10 * SEC, |m| matches!(m, HostToApp::PickInfoResult { req: r, .. } if *r == req)) {
+        HostToApp::PickInfoResult { ok, selector, label, rect, .. } => (ok, selector, label, rect),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn pick_info_describes_the_element_under_a_point() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-pick");
+    create(&mut h, "b1", &p.url("pick"), 400.0, 250.0, 1.0);
+    loaded(&mut h);
+    assert!(h.eval("b1", 1, "1").0);
+    let t0 = std::time::Instant::now();
+    let go = pick(&mut h, 10, 50.0, 30.0);
+    println!("METRIC pick_info_ms={}", t0.elapsed().as_millis());
+    assert!(go.0);
+    assert_eq!(go.1, "#go");
+    assert!(go.2.starts_with("button") && go.2.len() <= "button ".len() + 30, "{:?}", go.2);
+    assert_eq!((go.3.x, go.3.y, go.3.w, go.3.h), (10.0, 10.0, 98.0, 43.0));
+    println!("#go: {go:?}");
+    let pw = pick(&mut h, 11, 30.0, 78.0);
+    assert!(pw.0 && pw.1 == "#pw" && pw.2.is_empty(), "{pw:?}");
+    let name = pick(&mut h, 12, 30.0, 108.0);
+    assert!(name.0 && name.2 == "input" && !name.2.contains("secret"), "{name:?}");
+    println!("password field: label {:?}; text field: label {:?} (values never leak)", pw.2, name.2);
+    let card = pick(&mut h, 13, 220.0, 70.0 + 15.0);
+    assert!(card.0 && card.2 == "p four", "{card:?}");
+    let found = h.eval("b1", 2, &format!("[document.querySelectorAll({0:?}).length, document.querySelector({0:?}).textContent]", card.1)).1;
+    assert_eq!(found, serde_json::json!([1, "four"]), "selector {}", card.1);
+    println!("no-id element: selector {:?} matches only it", card.1);
+    let deep = pick(&mut h, 14, 30.0, 160.0);
+    assert!(deep.0 && deep.2 == "button deep", "{deep:?}");
+    println!("shadow DOM: {deep:?}");
     h.shutdown();
 }
