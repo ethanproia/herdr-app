@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod agent;
+pub mod dialogs;
 pub mod frame;
 pub mod input;
 pub mod view;
