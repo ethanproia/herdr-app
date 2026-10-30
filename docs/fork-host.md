@@ -44,3 +44,11 @@ herdr-browser-host.app/Contents/
 ## Not verified yet
 - That a real page renders off-screen and OnAcceleratedPaint fires on this macOS (stage C).
 - That an IOSurface created by the host is visible to the app across processes (OQ1, part 3).
+
+## Running the real host (stage C, measured 2026-10-30)
+- Build the bundle: `CARGO_TARGET_DIR=~/code/herdr-app-target/host scripts/fork-host-bundle.sh` prints the bundle's executable. It is LSUIElement with the accessory activation policy: no window, no Dock icon, no focus change. Measured: the test runs never opened a window.
+- Run the tests against it: `HERDR_BROWSER_HOST=<that path> cargo test -p herdr-browser-host --test protocol --test cef -- --test-threads=1`. Unset, the same protocol suite runs against `--stub`.
+- Confirmed in that run: real frames via OnAcceleratedPaint (one Metal blit into a pool surface), pixel checks on local pages, resize, mouse/keys/text/IME/wheel reaching the page, eval, confirm dialog, screenshot PNG, CDP port, CdpTarget, and a cookie surviving a host restart.
+- Known flake: Chromium's own "Teardown watchdog" sometimes kills the host during `Shutdown` (exit 2) when the Mac is heavily loaded (2 of about 30 shutdowns, during parallel full-app builds). Cookies are flushed to disk before teardown, so logins survive it.
+- Wheel sign: CEF's convention, a negative `dy` scrolls the page down.
+- DevTools has no window here: `DevTools` answers an Error pointing at the CDP port.
