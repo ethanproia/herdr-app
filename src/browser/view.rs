@@ -617,6 +617,11 @@ impl BrowserView {
                     tracing::warn!("browser {}: frame {seq}: {e:#}", self.id);
                     // Unpaintable: ack anyway, or the host waits on it forever.
                     self.link.send(AppToHost::FrameAck { id: self.id.clone(), seq });
+                } else if crate::control::headless() && self.acked != Some(seq) {
+                    // A headless window never draws, so nothing would ack: take each frame as
+                    // shown, or the host stops after one and screenshots stay stale.
+                    self.acked = Some(seq);
+                    self.link.send(AppToHost::FrameAck { id: self.id.clone(), seq });
                 }
             }
             H::Console { message, .. } => {
