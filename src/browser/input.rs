@@ -190,6 +190,11 @@ impl BrowserInput {
         &self.comment
     }
 
+    /// The comment's text for saving; the field is left empty (text, composition and undo).
+    pub fn take_comment(&mut self) -> String {
+        std::mem::take(&mut self.comment).text
+    }
+
     /// Everything the overlay owners were sent since the last call.
     pub fn take_overlay(&mut self) -> Vec<OverlayEvent> {
         std::mem::take(&mut self.overlay)
@@ -213,6 +218,10 @@ impl BrowserInput {
         };
         if ok {
             self.leave(from);
+            // Every comment starts empty, whatever the last one left behind.
+            if owner == Owner::Comment {
+                self.comment = CommentField::default();
+            }
             self.owners.push(owner);
             self.overlay.push(OverlayEvent::Owner(owner));
         }
@@ -1012,6 +1021,20 @@ mod tests {
         cx.simulate_keystrokes(markup);
         assert_eq!(with(cx, &block, |i| i.owner()), Owner::Browse);
         assert!(rec.inputs().is_empty(), "the page saw none of the chords");
+    }
+
+    #[test]
+    fn each_comment_starts_empty_and_take_comment_clears_it() {
+        let mut i = BrowserInput::new("b1".into(), Arc::new(Recording::default()));
+        assert!(i.enter(Owner::Pick) && i.enter(Owner::Comment));
+        i.comment.commit("first");
+        i.comment.marked = Some("か".into());
+        assert_eq!(i.take_comment(), "first");
+        assert_eq!(i.comment(), &CommentField::default(), "text, composition and undo are gone");
+        i.comment.commit("left over");
+        i.escape();
+        assert!(i.enter(Owner::Comment));
+        assert_eq!(i.comment().text, "", "a new comment does not start with the last one's text");
     }
 
     #[test]

@@ -145,6 +145,18 @@ pub struct MenuItem {
     pub submenu: Vec<MenuItem>,
 }
 
+/// One row of the style panel: a property's computed value, its inline value (the element's own
+/// style attribute) and the matched-rule value that wins from a stylesheet, when any.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StyleRow {
+    pub prop: String,
+    pub computed: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched: Option<String>,
+}
+
 /// A rectangle in CSS pixels (an element box, a selection, a hit-test result).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CssRect {
@@ -195,6 +207,19 @@ pub enum AppToHost {
     SetColorScheme { dark: bool },
     /// Rects for an overlay; answered by `OverlayRects` with the same `req` and `epoch`.
     Overlay { id: BrowserId, req: u64, epoch: u64, query: OverlayQuery },
+    /// Describe the element at page point (x, y) CSS px for a pick (S4); answered by `PickInfoResult`
+    /// with the same `req`. Typed on purpose: the app never evaluates page JS for this.
+    PickInfo { id: BrowserId, req: u64, x: f32, y: f32 },
+    /// Read the style panel rows for the element `node` (a CSS selector, as `Picked` reports it) for
+    /// `props`; answered by `StylesResult` with the same `req`. Driven by the user's panel, so no
+    /// agent grant applies; answers carry CSS values only, never input values or page text.
+    Styles { id: BrowserId, req: u64, node: String, props: Vec<String> },
+    /// Set one inline property on `node` (`value` None removes it); the host remembers the element's
+    /// original style attribute the first time, for `RevertStyle`. Answered by `StylesResult` with
+    /// the one row afterwards.
+    SetStyle { id: BrowserId, req: u64, node: String, prop: String, value: Option<String> },
+    /// Restore the element's original style attribute exactly; answered by `StylesResult` (no rows).
+    RevertStyle { id: BrowserId, req: u64, node: String },
     Input { id: BrowserId, event: InputEvent },
     /// Run an editing command (copy, paste, ...) in the focused frame.
     Edit { id: BrowserId, command: EditCommand },
@@ -249,6 +274,13 @@ pub enum HostToApp {
     CdpTarget { id: BrowserId, target_id: String },
     /// Rects in the answering frame's CSS px; `frames`: enclosing iframe content-box offsets, outermost first. `epoch` echoed.
     OverlayRects { id: BrowserId, req: u64, epoch: u64, rects: Vec<CssRect>, frames: Vec<CssPoint> },
+    /// Answer to `PickInfo`: a unique-enough `selector`, a short `label` (tag plus up to 30 chars of
+    /// the element's own text, aria-label or alt; never an input's value) and the element box.
+    /// `ok` false: nothing there. Page-derived text: the app labels it untrusted before any agent sees it.
+    PickInfoResult { id: BrowserId, req: u64, ok: bool, selector: String, label: String, rect: CssRect },
+    /// Answer to `Styles`, `SetStyle` and `RevertStyle` with the same `req`. `ok` false: no such
+    /// element (it moved or the page navigated) or the property was refused; `rows` empty then.
+    StylesResult { id: BrowserId, req: u64, ok: bool, rows: Vec<StyleRow> },
     /// The page asked for a context menu at (x, y) page DIPs; `kind` flags what is under the pointer:
     /// "link", "image", "selection", "editable", "media", "page" (several may apply).
     /// `link_url`, `src_url`: for Open/Copy link and Save image. The app shows `items` and answers with `MenuResult`.
@@ -313,6 +345,11 @@ mod tests {
         roundtrip_app(AppToHost::SetVisible { id: "b1".into(), visible: false });
         roundtrip_app(AppToHost::MenuResult { id: "b1".into(), req: 7, command: Some(26500) });
         roundtrip_app(AppToHost::MenuResult { id: "b1".into(), req: 8, command: None });
+        roundtrip_app(AppToHost::Styles { id: "b1".into(), req: 9, node: "#a > b".into(), props: vec!["padding".into(), "color".into()] });
+        roundtrip_app(AppToHost::SetStyle { id: "b1".into(), req: 10, node: "#a".into(), prop: "padding".into(), value: Some("16px".into()) });
+        roundtrip_app(AppToHost::SetStyle { id: "b1".into(), req: 11, node: "#a".into(), prop: "margin".into(), value: None });
+        roundtrip_app(AppToHost::RevertStyle { id: "b1".into(), req: 12, node: "#a".into() });
+        roundtrip_app(AppToHost::PickInfo { id: "b1".into(), req: 13, x: 210.0, y: 130.5 });
         roundtrip_app(AppToHost::Shutdown);
     }
 
@@ -326,6 +363,8 @@ mod tests {
         roundtrip_host(HostToApp::EvalResult { id: "b1".into(), req: 1, ok: true, value: serde_json::json!({"n": 2}) });
         roundtrip_host(HostToApp::CdpTarget { id: "b1".into(), target_id: "T1".into() });
         roundtrip_host(HostToApp::ContextMenu { id: "b1".into(), req: 7, x: 4.0, y: 5.0, kind: vec!["link".into()], link_url: Some("https://a.test/".into()), src_url: None, selection: None, items: vec![MenuItem { command: 100, label: "Back".into(), enabled: true, checked: false, submenu: vec![] }, MenuItem { command: 0, label: String::new(), enabled: false, checked: false, submenu: vec![] }] });
+        roundtrip_host(HostToApp::StylesResult { id: "b1".into(), req: 9, ok: true, rows: vec![StyleRow { prop: "padding".into(), computed: "16px".into(), inline: Some("16px".into()), matched: None }, StyleRow { prop: "color".into(), computed: "rgb(0, 0, 0)".into(), inline: None, matched: Some("red".into()) }] });
+        roundtrip_host(HostToApp::PickInfoResult { id: "b1".into(), req: 13, ok: true, selector: "#go".into(), label: "button Go".into(), rect: CssRect { x: 1.0, y: 2.0, w: 98.0, h: 43.0 } });
         roundtrip_host(HostToApp::OverlayRects { id: "b1".into(), req: 3, epoch: 9, rects: vec![CssRect { x: 1.0, y: 2.0, w: 30.0, h: 40.0 }], frames: vec![CssPoint { x: 5.0, y: 6.0 }] });
         roundtrip_host(HostToApp::Viewport { id: "b1".into(), scroll_x: 0.0, scroll_y: 120.5, zoom_level: 1.0 });
         roundtrip_host(HostToApp::Crashed { id: None, reason: "gpu".into() });
