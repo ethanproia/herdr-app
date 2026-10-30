@@ -560,7 +560,14 @@ fn input(host: &BrowserHost, ev: InputEvent) {
     use sys::cef_mouse_button_type_t as B;
     match ev {
         InputEvent::Mouse { kind, x, y, button, clicks, mods } => {
-            let e = MouseEvent { x: x.round() as i32, y: y.round() as i32, modifiers: flags(&mods) };
+            // HERDR: the held button rides on the event's flags; without it a move is a hover, not a drag.
+            let held = match (kind, button) {
+                (MouseKind::Up | MouseKind::Leave, _) | (_, MouseButton::None) => 0,
+                (_, MouseButton::Left) => sys::cef_event_flags_t::EVENTFLAG_LEFT_MOUSE_BUTTON.0,
+                (_, MouseButton::Middle) => sys::cef_event_flags_t::EVENTFLAG_MIDDLE_MOUSE_BUTTON.0,
+                (_, MouseButton::Right) => sys::cef_event_flags_t::EVENTFLAG_RIGHT_MOUSE_BUTTON.0,
+            };
+            let e = MouseEvent { x: x.round() as i32, y: y.round() as i32, modifiers: flags(&mods) | held };
             let btn = match button {
                 MouseButton::Left | MouseButton::None => B::MBT_LEFT,
                 MouseButton::Middle => B::MBT_MIDDLE,
@@ -581,7 +588,7 @@ fn input(host: &BrowserHost, ev: InputEvent) {
         }
         InputEvent::Key { kind, key, code, native, mods, .. } => {
             use sys::cef_key_event_type_t as K;
-            let ch = if key.chars().count() == 1 { key.encode_utf16().next().unwrap_or(0) } else { 0 };
+            let ch = if key.chars().count() == 1 { key.encode_utf16().next().unwrap_or(0) } else { keys::mac_character(&code) };
             let e = KeyEvent {
                 type_: KeyEventType::from(if kind == KeyKind::Down { K::KEYEVENT_RAWKEYDOWN } else { K::KEYEVENT_KEYUP }),
                 modifiers: flags(&mods),
