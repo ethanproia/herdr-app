@@ -4,16 +4,50 @@ use super::{downloads_dir, keep_chooser, keep_dialog, next_req, on_frame, send, 
 use cef::*;
 use herdr_browser_protocol::{DialogKind, DownloadState, HostToApp};
 
-const EVAL_TAG: &str = "__herdr_eval__:";
+/// DevTools message ids for evals start here (below are fixed ids such as `TARGET_INFO_MSG`).
+const FIRST_EVAL_MSG: i32 = 1000;
 
-/// JS that evaluates `expr` (awaiting promises) and reports through a tagged console line,
-/// which `on_console_message` turns into `EvalResult` instead of `Console`.
-pub fn eval_script(req: u64, expr: &str) -> String {
-    let expr = serde_json::to_string(expr).expect("string encodes");
-    format!(
-        "(async()=>{{let r;try{{let v=await (0,eval)({expr});r={{ok:true,v:v===undefined?null:v}}}}catch(e){{r={{ok:false,v:String(e)}}}}\
-         let s;try{{s=JSON.stringify(r)}}catch(e){{s=JSON.stringify({{ok:true,v:String(r.v)}})}}console.log('{EVAL_TAG}{req}:'+s)}})()"
-    )
+thread_local! {
+    static NEXT_MSG: std::cell::Cell<i32> = const { std::cell::Cell::new(FIRST_EVAL_MSG) };
+    /// Evals in flight: DevTools message id -> (browser id, app request id).
+    static EVALS: std::cell::RefCell<std::collections::HashMap<i32, (String, u64)>> = Default::default();
+}
+
+/// A `Runtime.evaluate` DevTools message for `expr` in browser `id`, answered by
+/// `on_dev_tools_method_result`. The answer travels browser process to host only: nothing the page
+/// can print or call reaches it, so a page cannot forge an `EvalResult` (SEC3).
+pub fn eval_message(id: &str, req: u64, expr: &str) -> Vec<u8> {
+    let msg = NEXT_MSG.get();
+    NEXT_MSG.set(if msg == i32::MAX { FIRST_EVAL_MSG } else { msg + 1 });
+    EVALS.with_borrow_mut(|e| e.insert(msg, (id.to_string(), req)));
+    let call = serde_json::json!({
+        "id": msg,
+        "method": "Runtime.evaluate",
+        "params": { "expression": expr, "awaitPromise": true, "returnByValue": true, "userGesture": true },
+    });
+    serde_json::to_vec(&call).expect("json encodes")
+}
+
+/// The eval for DevTools message `msg` failed to send: forget it.
+pub fn eval_unsent(id: &str) -> Option<u64> {
+    EVALS.with_borrow_mut(|e| {
+        let msg = e.iter().filter(|(_, (b, _))| b == id).map(|(m, _)| *m).max()?;
+        e.remove(&msg).map(|(_, req)| req)
+    })
+}
+
+/// Turn a `Runtime.evaluate` result into (ok, value).
+pub fn eval_outcome(success: bool, result: &[u8]) -> (bool, serde_json::Value) {
+    let v: serde_json::Value = serde_json::from_slice(result).unwrap_or_default();
+    if !success {
+        let msg = v["message"].as_str().unwrap_or("DevTools refused the eval");
+        return (false, serde_json::Value::String(msg.into()));
+    }
+    if let Some(ex) = v.get("exceptionDetails") {
+        let text = ex["exception"]["description"].as_str().or(ex["text"].as_str()).unwrap_or("exception");
+        return (false, serde_json::Value::String(text.into()));
+    }
+    (true, v["result"].get("value").cloned().unwrap_or(serde_json::Value::Null))
 }
 
 fn s(v: Option<&CefString>) -> String {
@@ -140,19 +174,8 @@ wrap_display_handler! {
         }
 
         fn on_console_message(&self, _browser: Option<&mut Browser>, level: LogSeverity, message: Option<&CefString>, source: Option<&CefString>, line: ::std::os::raw::c_int) -> ::std::os::raw::c_int {
+            // Console lines are page text, forwarded as such: never parsed for results.
             let message = s(message);
-            if let Some(rest) = message.strip_prefix(EVAL_TAG) {
-                if let Some((req, json)) = rest.split_once(':') {
-                    let r: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
-                    send(HostToApp::EvalResult {
-                        id: self.id.clone(),
-                        req: req.parse().unwrap_or(0),
-                        ok: r["ok"].as_bool().unwrap_or(false),
-                        value: r["v"].clone(),
-                    });
-                    return 1;
-                }
-            }
             use sys::cef_log_severity_t as L;
             let level = match *level.as_ref() {
                 L::LOGSEVERITY_VERBOSE => "debug",
@@ -392,6 +415,18 @@ wrap_dev_tools_message_observer! {
 
     impl DevToolsMessageObserver {
         fn on_dev_tools_method_result(&self, _browser: Option<&mut Browser>, message_id: ::std::os::raw::c_int, success: ::std::os::raw::c_int, result: Option<&[u8]>) {
+            if message_id >= FIRST_EVAL_MSG {
+                // Only the browser that sent the eval may answer it.
+                let owner = EVALS.with_borrow_mut(|e| match e.get(&message_id) {
+                    Some((b, _)) if *b == self.id => e.remove(&message_id),
+                    _ => None,
+                });
+                if let Some((id, req)) = owner {
+                    let (ok, value) = eval_outcome(success != 0, result.unwrap_or_default());
+                    send(HostToApp::EvalResult { id, req, ok, value });
+                }
+                return;
+            }
             if message_id != TARGET_INFO_MSG || success == 0 {
                 return;
             }
@@ -420,4 +455,29 @@ pub fn client(id: &str) -> Client {
         Downloads::new(id.clone()),
         Finds::new(id),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eval_outcomes() {
+        assert_eq!(eval_outcome(true, br#"{"result":{"type":"number","value":2,"description":"2"}}"#), (true, serde_json::json!(2)));
+        assert_eq!(eval_outcome(true, br#"{"result":{"type":"undefined"}}"#), (true, serde_json::Value::Null));
+        let (ok, v) = eval_outcome(true, br#"{"result":{"type":"object"},"exceptionDetails":{"text":"Uncaught","exception":{"description":"ReferenceError: nope is not defined"}}}"#);
+        assert!(!ok && v == "ReferenceError: nope is not defined");
+        assert_eq!(eval_outcome(false, br#"{"code":-32000,"message":"no target"}"#), (false, serde_json::json!("no target")));
+    }
+
+    #[test]
+    fn eval_messages_are_bound_to_their_browser() {
+        let call: serde_json::Value = serde_json::from_slice(&eval_message("b1", 9, "1+1")).unwrap();
+        assert_eq!(call["method"], "Runtime.evaluate");
+        let msg = call["id"].as_i64().unwrap() as i32;
+        assert!(msg >= FIRST_EVAL_MSG);
+        EVALS.with_borrow(|e| assert_eq!(e.get(&msg), Some(&("b1".to_string(), 9))));
+        assert_eq!(eval_unsent("b1"), Some(9));
+        EVALS.with_borrow(|e| assert!(e.get(&msg).is_none()));
+    }
 }

@@ -525,11 +525,14 @@ fn browser_msg(m: AppToHost) {
         M::StopFind { clear_selection, .. } => host.stop_finding(clear_selection as i32),
         M::DevTools { .. } => send(HostToApp::Error {
             id: Some(id),
-            message: "DevTools needs a window; the host is headless. Use the CDP port (Ready.cdp_port)".into(),
+            message: "unsupported: the DevTools window is not available in the headless browser host yet; attach a DevTools client to the CDP port (Ready.cdp_port) instead".into(),
         }),
         M::Eval { req, expr, .. } => {
-            let Some(f) = b.main_frame() else { return };
-            f.execute_java_script(Some(&CefString::from(handlers::eval_script(req, &expr).as_str())), None, 0);
+            let call = handlers::eval_message(&id, req, &expr);
+            if host.send_dev_tools_message(Some(&call)) == 0 {
+                handlers::eval_unsent(&id);
+                send(HostToApp::EvalResult { id, req, ok: false, value: "DevTools is not available for this page".into() });
+            }
         }
         _ => {}
     }
@@ -560,7 +563,14 @@ fn input(host: &BrowserHost, ev: InputEvent) {
     use sys::cef_mouse_button_type_t as B;
     match ev {
         InputEvent::Mouse { kind, x, y, button, clicks, mods } => {
-            let e = MouseEvent { x: x.round() as i32, y: y.round() as i32, modifiers: flags(&mods) };
+            // HERDR: the held button rides on the event's flags; without it a move is a hover, not a drag.
+            let held = match (kind, button) {
+                (MouseKind::Up | MouseKind::Leave, _) | (_, MouseButton::None) => 0,
+                (_, MouseButton::Left) => sys::cef_event_flags_t::EVENTFLAG_LEFT_MOUSE_BUTTON.0,
+                (_, MouseButton::Middle) => sys::cef_event_flags_t::EVENTFLAG_MIDDLE_MOUSE_BUTTON.0,
+                (_, MouseButton::Right) => sys::cef_event_flags_t::EVENTFLAG_RIGHT_MOUSE_BUTTON.0,
+            };
+            let e = MouseEvent { x: x.round() as i32, y: y.round() as i32, modifiers: flags(&mods) | held };
             let btn = match button {
                 MouseButton::Left | MouseButton::None => B::MBT_LEFT,
                 MouseButton::Middle => B::MBT_MIDDLE,
@@ -579,12 +589,13 @@ fn input(host: &BrowserHost, ev: InputEvent) {
             let e = MouseEvent { x: x.round() as i32, y: y.round() as i32, modifiers: flags(&mods) };
             host.send_mouse_wheel_event(Some(&e), (dx * k).round() as i32, (dy * k).round() as i32);
         }
-        InputEvent::Key { kind, key, code, native, mods, .. } => {
+        InputEvent::Key { kind, key, code, native, repeat, mods } => {
             use sys::cef_key_event_type_t as K;
-            let ch = if key.chars().count() == 1 { key.encode_utf16().next().unwrap_or(0) } else { 0 };
+            let ch = if key.chars().count() == 1 { key.encode_utf16().next().unwrap_or(0) } else { keys::mac_character(&code) };
             let e = KeyEvent {
                 type_: KeyEventType::from(if kind == KeyKind::Down { K::KEYEVENT_RAWKEYDOWN } else { K::KEYEVENT_KEYUP }),
-                modifiers: flags(&mods),
+                // HERDR: auto-repeat reaches the page as KeyboardEvent.repeat.
+                modifiers: flags(&mods) | if repeat { sys::cef_event_flags_t::EVENTFLAG_IS_REPEAT.0 } else { 0 },
                 windows_key_code: keys::windows_key_code(&code, &key),
                 native_key_code: native as i32,
                 character: ch,

@@ -13,6 +13,8 @@ pub mod agent;
 pub mod frame;
 pub mod geometry;
 pub mod input;
+// HERDR: part 4, design slice S9.
+pub mod markup;
 pub mod view;
 
 pub use herdr_browser_protocol as protocol;
