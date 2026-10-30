@@ -463,6 +463,8 @@ pub enum BrowserEvent {
     NewWindow(String),
     /// Pick mode: the user clicked an element at (x, y) page DIPs (its highlight is the overlay).
     Picked { x: f32, y: f32 },
+    /// The page's title or favicon changed (`state` has them): the window republishes its tabs.
+    PageInfo,
     /// Show a toast (a download finished or failed): `{"title","body","level"}`.
     Notice(serde_json::Value),
 }
@@ -617,6 +619,17 @@ pub enum FrameEvent {
 
 pub type FrameProbe = Arc<dyn Fn(&FrameEvent) + Send + Sync>;
 
+/// A tab (as mods see it, `model::space_json`) showing page `st`: unnamed, it takes the page's
+/// title; `page_title`, `favicon` and `url` go with it for tab strips that show them.
+pub fn annotate_tab(tab: &mut serde_json::Value, st: &BrowserState, named: bool) {
+    if !named && !st.title.is_empty() {
+        tab["name"] = serde_json::json!(st.title);
+    }
+    tab["page_title"] = serde_json::json!(st.title);
+    tab["favicon"] = serde_json::json!(st.favicon);
+    tab["url"] = serde_json::json!(st.url);
+}
+
 /// Height of the bar above the page (back, forward, reload, address), in DIPs.
 pub const CHROME_HEIGHT: f32 = 28.0;
 
@@ -770,6 +783,11 @@ impl BrowserView {
             H::Url { url, .. } => {
                 if url != self.state.url {
                     self.overlay.changed(Change::Navigate);
+                    // A new page names its own icon (or none).
+                    if !self.state.favicon.is_empty() && zoom::host_of(&url) != zoom::host_of(&self.state.url) {
+                        self.state.favicon.clear();
+                        cx.emit(BrowserEvent::PageInfo);
+                    }
                     // Another host: its remembered zoom (Chrome keeps zoom per host the same way).
                     if zoom::host_of(&url) != zoom::host_of(&self.state.url) {
                         let level = self.zoom_prefs.lock().unwrap().level_for(&url);
@@ -785,7 +803,18 @@ impl BrowserView {
                     cx.emit(BrowserEvent::Url(url));
                 }
             }
-            H::Title { title, .. } => self.state.title = title,
+            H::Title { title, .. } => {
+                if title != self.state.title {
+                    self.state.title = title;
+                    cx.emit(BrowserEvent::PageInfo);
+                }
+            }
+            H::Favicon { url, .. } => {
+                if url != self.state.favicon {
+                    self.state.favicon = url;
+                    cx.emit(BrowserEvent::PageInfo);
+                }
+            }
             H::Loading { loading, can_back, can_forward, .. } => {
                 (self.state.loading, self.state.can_back, self.state.can_forward) = (loading, can_back, can_forward);
             }
@@ -1085,12 +1114,9 @@ impl BrowserView {
 
     /// Toggle a mode (Pick or Markup): enter it, or leave it when it is on top.
     pub fn toggle_mode(&mut self, owner: Owner, cx: &mut Context<Self>) {
+        // Opens the mode, swaps pick and markup, or closes it when on top; refused under a lease.
         self.input.update(cx, |i, _| {
-            if i.owner() == owner {
-                i.escape();
-            } else {
-                i.enter(owner);
-            }
+            i.toggle(owner);
         });
         self.drain_overlay(cx);
         cx.notify();
@@ -1609,6 +1635,8 @@ impl Render for BrowserView {
                 }
             }))
             .on_action(cx.listener(|v, _: &OpenFind, window, cx| v.open_find(window, cx)))
+            .on_action(cx.listener(|v, _: &input::TogglePick, _, cx| v.toggle_mode(Owner::Pick, cx)))
+            .on_action(cx.listener(|v, _: &input::ToggleMarkup, _, cx| v.toggle_mode(Owner::Markup, cx)))
             .on_action(cx.listener(|v, _: &ZoomIn, _, cx| v.zoom_step(true, cx)))
             .on_action(cx.listener(|v, _: &ZoomOut, _, cx| v.zoom_step(false, cx)))
             .on_action(cx.listener(|v, _: &ZoomReset, _, cx| v.set_zoom(0.0, cx)))
@@ -1642,6 +1670,13 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{cmd}--"), ZoomOut, Some("Browser")),
         KeyBinding::new(&format!("{cmd}-0"), ZoomReset, Some("Browser")),
     ]);
+    // Mode chords (part 4, docs/browser-input-owner.md): pick and markup.
+    for (k, m) in input::default_chords() {
+        match m {
+            Owner::Pick => cx.bind_keys([KeyBinding::new(k, input::TogglePick, Some("Browser"))]),
+            _ => cx.bind_keys([KeyBinding::new(k, input::ToggleMarkup, Some("Browser"))]),
+        }
+    }
 }
 
 /// One `BrowserView` per browser block in the layouts. A view lives while its block does (shown
@@ -1831,6 +1866,21 @@ mod tests {
             }
         });
         (seen, kill)
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_tab_showing_a_page_takes_its_title_unless_named() {
+        let st = BrowserState { url: "https://a.test/".into(), title: "A page".into(), favicon: "https://a.test/f.ico".into(), ..Default::default() };
+        let mut t = serde_json::json!({ "name": "2" });
+        annotate_tab(&mut t, &st, false);
+        assert_eq!((t["name"].as_str(), t["favicon"].as_str(), t["url"].as_str()), (Some("A page"), Some("https://a.test/f.ico"), Some("https://a.test/")));
+        let mut named = serde_json::json!({ "name": "docs" });
+        annotate_tab(&mut named, &st, true);
+        assert_eq!(named["name"], "docs", "a name someone gave stays");
+        assert_eq!(named["page_title"], "A page");
+        let mut blank = serde_json::json!({ "name": "3" });
+        annotate_tab(&mut blank, &BrowserState::default(), false);
+        assert_eq!(blank["name"], "3", "no title yet: the number stays");
     }
 
     #[::core::prelude::v1::test]

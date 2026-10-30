@@ -71,5 +71,15 @@ fn main() {
     assert_eq!(p.page_top(), 28.0);
     p.click(300.0, 300.0);
     assert!(p.wait(Duration::from_secs(5), |p| mouse_lines(p) > before), "the user drives again");
-    println!("modes passed: markup draws (page untouched, red edge, cmd-z), pick picks at (210, 130), lease strip refuses input until Take Control");
+    // The chords: cmd-shift-m opens markup, cmd-shift-c swaps to pick, again closes it; the page sees none.
+    let keys_before = p.console().iter().filter(|l| l.contains(r#""type":"key""#)).count();
+    p.key("cmd-shift-m");
+    assert_eq!(owner(&mut p), Owner::Markup, "cmd-shift-m opens markup");
+    p.key("cmd-shift-c");
+    assert_eq!(owner(&mut p), Owner::Pick, "cmd-shift-c swaps to pick");
+    p.key("cmd-shift-c");
+    assert_eq!(owner(&mut p), Owner::Browse, "again closes it");
+    p.run_for(Duration::from_millis(200));
+    assert_eq!(p.console().iter().filter(|l| l.contains(r#""type":"key""#)).count(), keys_before, "the page saw no chord");
+    println!("modes passed: markup draws (page untouched, red edge, cmd-z), pick picks at (210, 130), lease strip refuses input until Take Control, chords toggle pick and markup");
 }
