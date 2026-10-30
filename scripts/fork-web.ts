@@ -20,7 +20,28 @@ function app(...args: string[]): any {
 const cdpInfo = JSON.parse(readFileSync(`${home}/browser/cdp.json`, "utf8"));
 const blockId = Object.keys(cdpInfo.targets)[0];
 const targetId = cdpInfo.targets[blockId];
-const ws = new WebSocket(`ws://127.0.0.1:${cdpInfo.port}/devtools/page/${targetId}`);
+// HERDR: part 5. CDP is on the app's pipe by default: talk to the broker (agent.sock + token), shaped like a
+// page WebSocket; a dev TCP port (HERDR_BROWSER_CDP_PORT) still works as before.
+function brokerSocket(): any {
+  const { createConnection } = require("node:net");
+  const t: any = { readyState: 0 };
+  const sock = createConnection(cdpInfo.broker);
+  let buf = "";
+  sock.on("connect", () => { sock.write(JSON.stringify({ token: readFileSync(cdpInfo.token_file, "utf8").trim() }) + "\n"); t.readyState = 1; t.onopen?.(); });
+  sock.on("data", (d: Buffer) => {
+    buf += d; let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const m = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
+      const msg = m.id ? (m.error !== undefined ? { id: m.id, error: { message: m.error } } : { id: m.id, result: m.result }) : { method: m.method, params: m.params };
+      t.onmessage?.({ data: JSON.stringify(msg) });
+    }
+  });
+  sock.on("error", (e: any) => t.onerror?.(e));
+  t.send = (line: string) => sock.write(JSON.stringify({ ...JSON.parse(line), block: blockId }) + "\n");
+  t.close = () => sock.destroy();
+  return t;
+}
+const ws: any = cdpInfo.broker ? brokerSocket() : new WebSocket(`ws://127.0.0.1:${cdpInfo.port}/devtools/page/${targetId}`);
 await new Promise((ok, no) => { ws.onopen = ok; ws.onerror = no; });
 
 let seq = 0;

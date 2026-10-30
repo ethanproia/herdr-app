@@ -9,9 +9,10 @@
 use super::agent::{Agent, Focus, Reply, Step};
 use super::cdp::CdpPipe;
 
-/// `HERDR_BROWSER_CDP_PIPE=1`: CDP on the pipe (opt-in until the broker flips the default).
+/// CDP on a pipe only the app holds, served to agents by the broker (the default). A dev-only TCP port
+/// (`HERDR_BROWSER_CDP_PORT`, which any local process can attach to) or `HERDR_BROWSER_CDP_PIPE=0` turns it off.
 fn cdp_pipe_wanted() -> bool {
-    std::env::var("HERDR_BROWSER_CDP_PIPE").is_ok_and(|v| v == "1")
+    std::env::var("HERDR_BROWSER_CDP_PIPE").map_or(true, |v| v != "0") && std::env::var("HERDR_BROWSER_CDP_PORT").map_or(true, |v| v.is_empty())
 }
 
 /// Start the host with CDP on fds 3/4 (macOS; elsewhere no pipe yet).
@@ -113,9 +114,8 @@ pub struct HostConfig {
     pub program: PathBuf,
     /// Extra arguments (`--stub` from `$HERDR_BROWSER_HOST_ARGS`, for tests).
     pub args: Vec<String>,
-    /// A TCP CDP port (0 picks one; any local process can attach). Today's default until the broker
-    /// lands; `HERDR_BROWSER_CDP_PIPE=1` puts CDP on a pipe only the app holds instead
-    /// (docs/browser-cdp-pipe.md), when the app starts the host itself.
+    /// A TCP CDP port (0 picks one; any local process can attach): dev only, from `HERDR_BROWSER_CDP_PORT`.
+    /// By default there is none: CDP is on a pipe only the app holds (docs/browser-cdp-pipe.md).
     pub cdp_port: Option<u16>,
 }
 
@@ -125,13 +125,10 @@ impl HostConfig {
             std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("herdr-browser-host"))).unwrap_or_else(|| "herdr-browser-host".into())
         });
         let args = std::env::var("HERDR_BROWSER_HOST_ARGS").map(|a| a.split_whitespace().map(str::to_owned).collect()).unwrap_or_default();
-        // The pipe is opt-in (HERDR_BROWSER_CDP_PIPE=1) until the host side and the broker land;
-        // until then agents use the TCP port, as before.
+        // No TCP port unless a developer asks for one (agents go through the broker).
         let cdp_port = match std::env::var("HERDR_BROWSER_CDP_PORT").ok().as_deref() {
-            Some("off") => None,
-            Some(p) if !p.is_empty() => p.parse().ok().or(Some(0)),
-            _ if cdp_pipe_wanted() => None,
-            _ => Some(0),
+            Some("off") | None | Some("") => None,
+            Some(p) => p.parse().ok().or(Some(0)),
         };
         Self { dir: crate::mods::app_dir().join("browser"), program, args, cdp_port }
     }
