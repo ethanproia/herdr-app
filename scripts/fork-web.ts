@@ -149,14 +149,20 @@ try {
     await evaluate(`(() => { const v = document.querySelector("video"); if (v) { v.muted = true; return v.play().then(() => "ok", e => String(e)); } })()`);
     const btn = await center(".ytp-large-play-button, .ytp-play-button");
     if (btn && await evaluate(`document.querySelector("video")?.paused`)) await click(...btn);
+    // Warm-up: the adaptive player starts low and climbs; wait for HD or the time limit.
+    const warm = Number(process.env.FORK_WEB_WARMUP_S ?? 15) * 1000;
+    const tw = Date.now();
+    while (Date.now() - tw < warm && !(await evaluate(`(document.querySelector("video")?.videoHeight ?? 0) >= 720`))) await sleep(500);
     await sleep(2000);
+    result.warmup_ms = Date.now() - tw;
+    result.rendition_start = await evaluate(`(() => { const v = document.querySelector("video"); return v.videoWidth + "x" + v.videoHeight; })()`);
     const q0 = await evaluate(`(() => { const v = document.querySelector("video"); const q = v.getVideoPlaybackQuality(); return [v.currentTime, q.totalVideoFrames, q.droppedVideoFrames, performance.now()]; })()`);
-    await sleep(5000);
+    await sleep(10000);
     const q1 = await evaluate(`(() => { const v = document.querySelector("video"); const q = v.getVideoPlaybackQuality(); return [v.currentTime, q.totalVideoFrames, q.droppedVideoFrames, performance.now(), v.videoWidth, v.videoHeight, v.paused, v.error && v.error.message]; })()`);
     const secs = (q1[3] - q0[3]) / 1000;
     result.playback = { advanced_s: +(q1[0] - q0[0]).toFixed(2), fps: Math.round((q1[1] - q0[1]) / secs), dropped: q1[2] - q0[2], size: `${q1[4]}x${q1[5]}`, paused: q1[6], error: q1[7] };
-    result.stream_mime = await evaluate(`(() => { try { const r = document.querySelector("#movie_player")?.getStatsForNerds?.(); return r && (r.codecs || r.video_codec || JSON.stringify(r).slice(0, 200)); } catch (e) { return String(e); } })()`);
-    checks.plays = result.playback.advanced_s > 3;
+    result.stream_mime = await evaluate(`(() => { try { const r = document.querySelector("#movie_player")?.getStatsForNerds?.(); return r && [r.codecs, r.resolution, r.optimal_format, r.current_quality ?? ""].filter(Boolean).join(" | "); } catch (e) { return String(e); } })()`);
+    checks.plays = result.playback.advanced_s > 6;
     result.shot = shot("playing");
   } else if (scenario === "W4") {
     result.load_ms = await load("https://todomvc.com/examples/react/dist/");
