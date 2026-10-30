@@ -1,0 +1,10 @@
+[package]
+name = "herdr-browser-surface"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "IOSurface create/export/import shared by herdr-browser-host and herdr-app (no per-frame copies)."
+
+[dependencies]
+herdr-browser-protocol = { path = "../herdr-browser-protocol" }
