@@ -2,7 +2,7 @@
 // Run:  node scripts/herdr-browser/selftest.agent.mjs     (exit 0 = pass)
 // Backend: by default a headless Google Chrome stands in for the CEF host (standin-chrome.mjs), found through a temp
 // cdp.json. HERDR_BROWSER_SELFTEST=app runs against a real app and CEF host instead: HERDR_BROWSER_DIR is that app's
-// browser dir and HERDR_APP_BIN runs `herdr-app` for it (scripts/fork-browser-agent.sh sets both for a headless fork). Serves a local form page, then through the CLI:
+// browser dir and HERDR_BROWSER_APP runs `herdr-app` for it (scripts/fork-browser-agent.sh sets both for a headless fork). Serves a local form page, then through the CLI:
 // open, snapshot, click ref, type, press, wait, text, console, network, eval, screenshot (2x PNG), permission refusal
 // on a person's block until its switch is on, DevTools refusal, and the MCP wrapper.
 import { spawn, execFile, execFileSync } from "node:child_process";
@@ -21,7 +21,7 @@ const env = { ...process.env, HERDR_BROWSER_DIR: dir, HERDR_BROWSER_BACKEND: onA
 const standin = onApp ? null : await startStandin(dir);
 console.log(`backend: ${onApp ? `real app + CEF host (${dir})` : "headless Chrome stand-in"}`);
 const cdpHttp = () => `http://127.0.0.1:${JSON.parse(readFileSync(join(dir, "cdp.json"), "utf8")).port}`;
-const appDo = (name, args) => new Promise((r) => execFile(process.env.HERDR_APP_BIN, ["do", name, JSON.stringify(args)], { encoding: "utf8" }, (_e, out) => r(JSON.parse(out))));
+const appDo = (name, args) => new Promise((r) => execFile(process.env.HERDR_BROWSER_APP, ["do", name, JSON.stringify(args)], { encoding: "utf8" }, (_e, out) => r(JSON.parse(out))));
 // What the app does when the person opens a block: a page plus its id in cdp.json. Answers the block id.
 const personBlock = async (id) => {
   if (onApp) {
@@ -49,7 +49,7 @@ const html = `<!doctype html><title>Form</title><body style="margin:0;font:16px 
 <h1>Agent test</h1><input id=q placeholder="Your name"><button id=go onclick="document.getElementById('out').textContent='Hello '+q.value;console.log('clicked',q.value)">Greet</button>
 <p id=out>nobody yet</p><select id=pick><option value=a>Apple</option><option value=b>Banana</option></select>
 <input id=f placeholder="Fill me" oninput="document.title='filled '+this.value"><input type=password id=pw placeholder="Password" value="hunter2-secret"><input id=card_number placeholder="Card" value="4111111111111111">
-<div id=src draggable=true style="width:40px;height:20px;background:red">drag</div><div id=dst style="width:60px;height:30px;background:#ccc" ondragover="event.preventDefault()">drop</div><img src="/missing.png" alt=x><script>console.warn('page ready')</script></body>`;
+<div id=src draggable=true style="width:40px;height:20px;background:red">drag</div><div id=dst style="width:60px;height:30px;background:#ccc" ondragover="event.preventDefault()">drop</div><span id=hov onmouseover="this.dataset.hit=1">hover me</span><img src="/missing.png" alt=x><script>console.warn('page ready')</script></body>`;
 const web = createServer((req, res) => { if (req.url === "/missing.png") { res.statusCode = 404; res.end(); return; } res.setHeader("content-type", "text/html"); res.end(html); });
 await new Promise((r) => web.listen(0, "127.0.0.1", r));
 const site = `http://127.0.0.1:${web.address().port}/`;
@@ -57,8 +57,13 @@ const site = `http://127.0.0.1:${web.address().port}/`;
 try {
   const o = (await json("open", T, `url=${site}`));
   T = o.tab ?? T;
-  check(o.ok && o.url === site, `open starts the daemon and loads the page (${o.url})`);
+  check(o.ok && o.url === site, `open starts the daemon and loads the page (${o.url ?? JSON.stringify(o)})`);
   check((await json("tabs")).tabs?.some((t) => t.tab === T && t.controllable && t.agentOpened), "tabs lists the agent tab as controllable");
+  // SEC2b: the page has password and card fields, so reading or picturing it needs the person's capture grant.
+  check(/needs the person's capture grant/.test(await cli("eval", T, "expression=1")) && /needs the person's capture grant/.test(await cli("screenshot", T)), "X3 eval and screenshot refused on a sensitive page without a grant");
+  grant(T, { capture: true });
+  check((await json("eval", T, "expression=document.getElementById('pw').value + '|' + document.getElementById('card_number').value")).value === "<hidden>|<hidden>", "X3 eval results never carry secret field values");
+  check((await json("console", T)).untrusted?.includes("messages"), "SEC2c page console output is labelled untrusted");
   const snap = (await cli("snapshot", T));
   const ref = (re) => snap.split("\n").find((l) => re.test(l))?.match(/ref=(e\d+)/)?.[1];
   const box = ref(/textbox "Your name"/), btn = ref(/button "Greet"/);
@@ -90,6 +95,13 @@ try {
   check((await json("browser_mouse_click_xy", T, "x=3", "y=3")).ok, "mouse_click_xy");
   check((await json("browser_drag", T, `sourceRef=${r2(/text "drag"/)}`, `targetRef=${r2(/text "drop"/)}`)).to?.x > 0, "drag between refs");
   check((await json("browser_press_key", T, "key=Tab")).ok, "press_key");
+  // A2: the rest of Cursor's set.
+  check((await json("browser_hover", T, `ref=${r2(/text "hover me"/)}`, "element=the hover text")).ok && (await json("eval", T, "expression=document.getElementById('hov').dataset.hit")).value === "1", "hover reaches the element");
+  check((await json("browser_fill_form", T, `fields=[{"ref":"${fill}","value":"form1"},{"ref":"${sel}","value":"Apple"}]`)).filled === 2
+    && (await json("eval", T, "expression=document.getElementById('f').value + document.getElementById('pick').value")).value === "form1a", "fill_form fills a textbox and a select");
+  const compact = await cli("browser_snapshot", T, "compact=true");
+  check(/^- button "Greet"/m.test(compact) && !/^ /m.test(compact) && !/^- text /m.test(compact), "compact snapshot: flat, interactive only");
+  await cli("browser_snapshot", T); // a full snapshot again, so the refs above stay the ones it hands out
   check((await json("browser_scroll", T, "direction=down", "amount=50")).ok, "scroll by direction");
   // X2: raw CDP is brokered: refused without the person's grant, and only allowed methods with it.
   check(/needs the person's cdp grant/.test(await cli("browser_cdp", T, "method=Runtime.evaluate", 'params={"expression":"1+1"}')), "X2 raw CDP refused without a grant");
@@ -99,7 +111,7 @@ try {
   check((await json("browser_lock", T, "action=lock")).locked === true && (await json("tabs")).ok, "lock sets the lock flag");
   (await json("browser_lock", T, "action=unlock"));
   const tl = await json("browser_tabs", "action=list");
-  check(tl.tabs?.[0]?.tab === T && tl.tabs[0].selected, "tabs list marks the selected tab");
+  check(tl.tabs?.find((t) => t.tab === T)?.selected && tl.tabs.filter((t) => t.selected).length === 1, "tabs list marks the selected tab");
   check((await cli("browser_text")).includes("Hello"), "commands default to the selected tab");
   const aft = await json("browser_click", T, "x=3", "y=3", "take_screenshot_afterwards=true");
   check(/\.png$/.test(aft.screenshot ?? ""), "take_screenshot_afterwards returns a PNG path");
@@ -156,6 +168,7 @@ try {
   await Promise.race([answered, new Promise((r) => setTimeout(r, 60000))]);
   m.kill();
   const rs = buf.trim().split("\n").map((l) => JSON.parse(l));
+  check(/^UNTRUSTED PAGE CONTENT in text/.test(rs[2]?.result?.content?.[0]?.text ?? ""), "SEC2c MCP results label page content as untrusted");
   check(rs[1]?.result?.tools?.some((t) => t.name === "browser_take_screenshot") && rs[1].result.tools.length >= 25 && rs[2]?.result?.content?.[0]?.text.includes("Hello Bob"), `MCP lists ${rs[1]?.result?.tools?.length} tools and a call returns page text`);
 
   check((await json("close", T)).ok && !(await json("tabs")).tabs.some((t) => t.tab === T), "close removes the agent tab");

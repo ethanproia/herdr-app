@@ -14,17 +14,66 @@ const FIRST_EVAL_MSG: i32 = 1000;
 
 thread_local! {
     static NEXT_MSG: std::cell::Cell<i32> = const { std::cell::Cell::new(FIRST_EVAL_MSG) };
-    /// Evals in flight: DevTools message id -> (browser id, app request id).
-    static EVALS: std::cell::RefCell<std::collections::HashMap<i32, (String, u64)>> = Default::default();
+    /// Runtime.evaluate calls in flight: DevTools message id -> (browser id, app request id, what for).
+    static EVALS: std::cell::RefCell<std::collections::HashMap<i32, (String, u64, Op)>> = Default::default();
 }
 
 /// A `Runtime.evaluate` DevTools message for `expr` in browser `id`, answered by
 /// `on_dev_tools_method_result`. The answer travels browser process to host only: nothing the page
 /// can print or call reaches it, so a page cannot forge an `EvalResult` (SEC3).
 pub fn eval_message(id: &str, req: u64, expr: &str) -> Vec<u8> {
+    evaluate(id, req, Op::Eval, expr)
+}
+
+/// What a Runtime.evaluate answer turns into.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Op {
+    Eval,
+    Overlay { epoch: u64 },
+    /// The page-is-live probe for load `generation` (see `super::on_loading`).
+    Ready { generation: u64 },
+}
+
+/// The readiness probe: answers once the page has presented its first paint (a `paint`
+/// performance entry), or after 5 s for pages that never paint content (under heavy CPU load a
+/// first paint took over 1 s). Until that paint Chromium
+/// holds commits and drops input, which is what lost early clicks under CPU load.
+pub fn ready_message(id: &str, generation: u64) -> Vec<u8> {
+    const FIRST_PAINT: &str = "new Promise(r=>{const ok=()=>performance.getEntriesByType('paint').length>0;\
+        if(ok())return r(1);const o=new PerformanceObserver(()=>{if(ok()){o.disconnect();r(1)}});\
+        o.observe({type:'paint',buffered:true});setTimeout(()=>r(0),5000)})";
+    evaluate(id, 0, Op::Ready { generation }, FIRST_PAINT)
+}
+
+/// Overlay geometry, measured by a privileged DevTools evaluate (the page cannot answer for it).
+/// Rects are viewport CSS px of the top document; `frames` stays empty (no iframe descent yet).
+pub fn overlay_message(id: &str, req: u64, epoch: u64, query: &herdr_browser_protocol::OverlayQuery) -> Vec<u8> {
+    use herdr_browser_protocol::OverlayQuery as Q;
+    const BOX: &str = "r=>({x:r.x,y:r.y,w:r.width,h:r.height})";
+    let expr = match query {
+        Q::HitTest { x, y } => format!("(()=>{{const e=document.elementFromPoint({x},{y});return{{rects:e?[({BOX})(e.getBoundingClientRect())]:[]}}}})()"),
+        Q::Selector { selector } => {
+            let sel = serde_json::to_string(selector).expect("string encodes");
+            format!("(()=>{{let l;try{{l=document.querySelectorAll({sel})}}catch(e){{return{{rects:[],error:String(e)}}}}return{{rects:[...l].slice(0,500).map(e=>({BOX})(e.getBoundingClientRect()))}}}})()")
+        }
+        Q::Selection => format!("(()=>{{const s=getSelection();if(!s||!s.rangeCount)return{{rects:[]}};return{{rects:[...s.getRangeAt(0).getClientRects()].map({BOX})}}}})()"),
+    };
+    evaluate(id, req, Op::Overlay { epoch }, &expr)
+}
+
+/// `{rects: [{x, y, w, h}]}` from an overlay evaluate.
+pub fn overlay_rects(value: &serde_json::Value) -> Vec<herdr_browser_protocol::CssRect> {
+    let f = |v: &serde_json::Value| v.as_f64().unwrap_or(0.0) as f32;
+    value["rects"]
+        .as_array()
+        .map(|a| a.iter().map(|r| herdr_browser_protocol::CssRect { x: f(&r["x"]), y: f(&r["y"]), w: f(&r["w"]), h: f(&r["h"]) }).collect())
+        .unwrap_or_default()
+}
+
+fn evaluate(id: &str, req: u64, op: Op, expr: &str) -> Vec<u8> {
     let msg = NEXT_MSG.get();
     NEXT_MSG.set(if msg == i32::MAX { FIRST_EVAL_MSG } else { msg + 1 });
-    EVALS.with_borrow_mut(|e| e.insert(msg, (id.to_string(), req)));
+    EVALS.with_borrow_mut(|e| e.insert(msg, (id.to_string(), req, op)));
     let call = serde_json::json!({
         "id": msg,
         "method": "Runtime.evaluate",
@@ -36,8 +85,8 @@ pub fn eval_message(id: &str, req: u64, expr: &str) -> Vec<u8> {
 /// The eval for DevTools message `msg` failed to send: forget it.
 pub fn eval_unsent(id: &str) -> Option<u64> {
     EVALS.with_borrow_mut(|e| {
-        let msg = e.iter().filter(|(_, (b, _))| b == id).map(|(m, _)| *m).max()?;
-        e.remove(&msg).map(|(_, req)| req)
+        let msg = e.iter().filter(|(_, (b, _, _))| b == id).map(|(m, _)| *m).max()?;
+        e.remove(&msg).map(|(_, req, _)| req)
     })
 }
 
@@ -106,7 +155,8 @@ wrap_render_handler! {
             1
         }
 
-        fn on_paint(&self, _browser: Option<&mut Browser>, _type_: PaintElementType, _dirty_rects: Option<&[Rect]>, _buffer: *const u8, _width: ::std::os::raw::c_int, _height: ::std::os::raw::c_int) {
+        fn on_paint(&self, _browser: Option<&mut Browser>, type_: PaintElementType, _dirty_rects: Option<&[Rect]>, _buffer: *const u8, width: ::std::os::raw::c_int, height: ::std::os::raw::c_int) {
+            super::debug(format_args!("{}: software paint type {:?} {width}x{height} (unused)", self.id, *type_.as_ref()));
             // Software frames are not used: shared_texture_enabled routes paints to on_accelerated_paint.
         }
 
@@ -131,6 +181,10 @@ wrap_render_handler! {
             if let Some(r) = rect {
                 on_popup_size(&self.id, r.x, r.y, r.width, r.height);
             }
+        }
+
+        fn on_scroll_offset_changed(&self, _browser: Option<&mut Browser>, x: f64, y: f64) {
+            super::on_scroll(&self.id, x, y);
         }
 
         fn on_ime_composition_range_changed(&self, _browser: Option<&mut Browser>, _selected_range: Option<&Range>, character_bounds: Option<&[Rect]>) {
@@ -232,8 +286,11 @@ wrap_life_span_handler! {
     }
 
     impl LifeSpanHandler {
-        fn on_after_created(&self, _browser: Option<&mut Browser>) {
+        fn on_after_created(&self, browser: Option<&mut Browser>) {
             super::OPEN.set(super::OPEN.get() + 1);
+            if let Some(b) = browser {
+                super::on_created(&self.id, b.clone());
+            }
         }
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
@@ -375,6 +432,80 @@ wrap_find_handler! {
     }
 }
 
+/// App-handled menu extras (CEF's MENU_ID_USER_FIRST and up): the app acts, then answers None.
+pub const MENU_OPEN_LINK_IN_NEW_TAB: i32 = 26500;
+pub const MENU_COPY_LINK_ADDRESS: i32 = 26501;
+pub const MENU_SAVE_IMAGE_AS: i32 = 26502;
+
+fn menu_items(model: &MenuModel) -> Vec<herdr_browser_protocol::MenuItem> {
+    use sys::cef_menu_item_type_t as T;
+    (0..model.count())
+        .filter(|&i| model.is_visible_at(i) == 1)
+        .map(|i| {
+            let kind = *model.type_at(i).as_ref();
+            let separator = kind == T::MENUITEMTYPE_SEPARATOR;
+            herdr_browser_protocol::MenuItem {
+                command: if separator { 0 } else { model.command_id_at(i) },
+                // CEF labels carry "&" accelerator marks ("&Back"); "&&" is a literal "&".
+                label: uf(&model.label_at(i)).replace("&&", "\u{0}").replace('&', "").replace('\u{0}', "&"),
+                enabled: !separator && model.is_enabled_at(i) == 1,
+                checked: model.is_checked_at(i) == 1,
+                submenu: if kind == T::MENUITEMTYPE_SUBMENU { model.sub_menu_at(i).map(|m| menu_items(&m)).unwrap_or_default() } else { vec![] },
+            }
+        })
+        .collect()
+}
+
+fn extra(command: i32, label: &str) -> herdr_browser_protocol::MenuItem {
+    herdr_browser_protocol::MenuItem { command, label: label.into(), enabled: true, checked: false, submenu: vec![] }
+}
+
+wrap_context_menu_handler! {
+    pub(crate) struct Menus {
+        id: String,
+    }
+
+    impl ContextMenuHandler {
+        fn run_context_menu(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, params: Option<&mut ContextMenuParams>, model: Option<&mut MenuModel>, callback: Option<&mut RunContextMenuCallback>) -> ::std::os::raw::c_int {
+            let (Some(params), Some(model), Some(cb)) = (params, model, callback) else { return 0 };
+            use sys::cef_context_menu_type_flags_t as F;
+            let flags = params.type_flags().as_ref().0;
+            let mut kind: Vec<String> = Vec::new();
+            for (flag, name) in [(F::CM_TYPEFLAG_PAGE, "page"), (F::CM_TYPEFLAG_LINK, "link"), (F::CM_TYPEFLAG_MEDIA, "media"), (F::CM_TYPEFLAG_SELECTION, "selection"), (F::CM_TYPEFLAG_EDITABLE, "editable")] {
+                if flags & flag.0 != 0 {
+                    kind.push(name.into());
+                }
+            }
+            let image = params.has_image_contents() == 1 || *params.media_type().as_ref() == sys::cef_context_menu_media_type_t::CM_MEDIATYPE_IMAGE;
+            if image {
+                kind.push("image".into());
+            }
+            let nonempty = |s: String| (!s.is_empty()).then_some(s);
+            let link_url = nonempty(uf(&params.link_url()));
+            let src_url = nonempty(uf(&params.source_url()));
+            let selection = nonempty(uf(&params.selection_text()));
+            let mut items = menu_items(model);
+            let mut extras = Vec::new();
+            if link_url.is_some() {
+                extras.push(extra(MENU_OPEN_LINK_IN_NEW_TAB, "Open Link in New Tab"));
+                extras.push(extra(MENU_COPY_LINK_ADDRESS, "Copy Link Address"));
+            }
+            if image && src_url.is_some() {
+                extras.push(extra(MENU_SAVE_IMAGE_AS, "Save Image As…"));
+            }
+            if !extras.is_empty() {
+                extras.push(herdr_browser_protocol::MenuItem { command: 0, label: String::new(), enabled: false, checked: false, submenu: vec![] });
+                extras.append(&mut items);
+                items = extras;
+            }
+            let req = next_req();
+            super::keep_menu(&self.id, req, cb.clone());
+            send(HostToApp::ContextMenu { id: self.id.clone(), req, x: params.xcoord() as f32, y: params.ycoord() as f32, kind, link_url, src_url, selection, items });
+            1 // the app draws the menu; CEF never opens a native one
+        }
+    }
+}
+
 wrap_client! {
     pub(crate) struct ClientBuilder {
         render: RenderHandler,
@@ -385,6 +516,7 @@ wrap_client! {
         dialog: DialogHandler,
         download: DownloadHandler,
         find: FindHandler,
+        menus: ContextMenuHandler,
     }
 
     impl Client {
@@ -412,6 +544,9 @@ wrap_client! {
         fn find_handler(&self) -> Option<FindHandler> {
             Some(self.find.clone())
         }
+        fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
+            Some(self.menus.clone())
+        }
     }
 }
 
@@ -420,13 +555,26 @@ wrap_completion_callback! {
 
     impl CompletionCallback {
         fn on_complete(&self) {
-            super::FLUSHED.set(true);
+            super::FLUSHED.set(super::FLUSHED.get() + 1);
         }
     }
 }
 
 pub fn flush_done() -> CompletionCallback {
     FlushDone::new()
+}
+
+/// The DevTools message id for `Emulation.setEmulatedMedia` (its result is not needed).
+pub const SCHEME_MSG: i32 = 2;
+
+/// prefers-color-scheme for one page, through DevTools media emulation (live; survives navigation).
+pub fn scheme_message(dark: bool) -> Vec<u8> {
+    let call = serde_json::json!({
+        "id": SCHEME_MSG,
+        "method": "Emulation.setEmulatedMedia",
+        "params": { "features": [{ "name": "prefers-color-scheme", "value": if dark { "dark" } else { "light" } }] },
+    });
+    serde_json::to_vec(&call).expect("json encodes")
 }
 
 /// The DevTools message id used for `Target.getTargetInfo` (one per browser, so any fixed id works).
@@ -442,12 +590,25 @@ wrap_dev_tools_message_observer! {
             if message_id >= FIRST_EVAL_MSG {
                 // Only the browser that sent the eval may answer it.
                 let owner = EVALS.with_borrow_mut(|e| match e.get(&message_id) {
-                    Some((b, _)) if *b == self.id => e.remove(&message_id),
+                    Some((b, _, _)) if *b == self.id => e.remove(&message_id),
                     _ => None,
                 });
-                if let Some((id, req)) = owner {
+                if let Some((id, req, op)) = owner {
                     let (ok, value) = eval_outcome(success != 0, result.unwrap_or_default());
-                    send(HostToApp::EvalResult { id, req, ok, value });
+                    match op {
+                        Op::Eval => send(HostToApp::EvalResult { id, req, ok, value }),
+                        Op::Ready { generation } => {
+                            super::debug(format_args!("{id}: first paint seen: {value}"));
+                            super::input_live(&id, generation)
+                        }
+                        Op::Overlay { epoch } => {
+                            if !ok || value.get("error").is_some() {
+                                super::debug(format_args!("{id}: overlay {req} found nothing: {value}"));
+                            }
+                            let rects = if ok { overlay_rects(&value) } else { vec![] };
+                            send(HostToApp::OverlayRects { id, req, epoch, rects, frames: vec![] });
+                        }
+                    }
                 }
                 return;
             }
@@ -477,7 +638,8 @@ pub fn client(id: &str) -> Client {
         Dialogs::new(id.clone()),
         Files::new(id.clone()),
         Downloads::new(id.clone()),
-        Finds::new(id),
+        Finds::new(id.clone()),
+        Menus::new(id),
     )
 }
 
@@ -500,7 +662,7 @@ mod tests {
         assert_eq!(call["method"], "Runtime.evaluate");
         let msg = call["id"].as_i64().unwrap() as i32;
         assert!(msg >= FIRST_EVAL_MSG);
-        EVALS.with_borrow(|e| assert_eq!(e.get(&msg), Some(&("b1".to_string(), 9))));
+        EVALS.with_borrow(|e| assert_eq!(e.get(&msg), Some(&("b1".to_string(), 9, Op::Eval))));
         assert_eq!(eval_unsent("b1"), Some(9));
         EVALS.with_borrow(|e| assert!(e.get(&msg).is_none()));
     }

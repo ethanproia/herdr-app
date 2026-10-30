@@ -52,3 +52,17 @@ fn stub_echoes_input_and_focus_as_console() {
     assert_eq!(got[3], "edit paste");
     h.shutdown();
 }
+
+#[test]
+fn stub_reports_color_scheme_changes() {
+    if real_host().is_some() {
+        return;
+    }
+    let mut h = Host::start("stub-scheme");
+    create(&mut h, "b1", "https://a.test/", 10.0, 10.0, 1.0);
+    h.frame("b1");
+    h.send(AppToHost::SetColorScheme { dark: true });
+    let m = h.until(Duration::from_secs(5), |m| matches!(m, HostToApp::Console { message, .. } if message.starts_with("color-scheme")));
+    assert!(matches!(m, HostToApp::Console { message, .. } if message == "color-scheme dark"));
+    h.shutdown();
+}

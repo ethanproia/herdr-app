@@ -30,21 +30,34 @@ pub(crate) struct Entry {
     size: Size,
     scale: f32,
     pool: FramePool,
-    /// The newest frame sent, kept for `Screenshot`.
+    /// The newest completed frame (blitted, sent or not), kept for `Screenshot`.
     last: Option<Surface>,
+    /// The app said the block is not visible: CEF is told `was_hidden`, nothing is sent.
+    hidden: bool,
+    /// Screenshots asked for while hidden: answered from the next paint (shown just for it).
+    shots: Vec<(u64, String)>,
+    /// When the last `Resize` arrived, until the first paint at that size (stats only).
+    resized: Option<std::time::Instant>,
     /// Keeps the DevTools observer that reports the CDP target id alive.
     _devtools: Option<Registration>,
-    /// Input waits here until the page can take it: Chromium drops events sent between the first
-    /// load finishing and the first frame painted after it. See `input_ready`.
+    /// Input waits here until the page can take it: Chromium drops input that arrives right after
+    /// a load finishes, before the renderer is live. See `on_loading` and `input_live`.
     queued: Vec<InputEvent>,
     loaded: bool,
     input_ready: bool,
+    /// Counts main-page loads, so a readiness answer from an older load is ignored.
+    load_gen: u64,
     /// Copies of the newest page and popup paints, composed into each frame sent.
     view: Option<Surface>,
     popup: Option<Surface>,
     popup_shown: bool,
     /// The popup's bounds in DIPs (x, y, w, h).
     popup_rect: Option<(i32, i32, i32, i32)>,
+    /// Messages for this browser that arrived before CEF finished making it.
+    starting: Vec<AppToHost>,
+    /// The newest scroll offset (CSS px) and the last `Viewport` sent (scroll x, y, zoom level).
+    scroll: Option<(f32, f32)>,
+    viewport: Option<(f32, f32, f64)>,
 }
 
 pub(crate) struct Host {
@@ -55,7 +68,56 @@ pub(crate) struct Host {
     next_req: u64,
     dialogs: HashMap<u64, JsdialogCallback>,
     choosers: HashMap<u64, FileDialogCallback>,
+    menus: HashMap<u64, (String, RunContextMenuCallback)>,
     quit: bool,
+    /// The Hello profile root; named profiles live in folders under it.
+    root: PathBuf,
+    /// One request context per named profile (the default profile is CEF's global context).
+    contexts: HashMap<String, RequestContext>,
+    /// The app's appearance from the last SetColorScheme; None until the app says.
+    dark: Option<bool>,
+    /// `HERDR_BROWSER_STATS=1`: blit cost, appended to `<browser dir>/host-stats.log`.
+    stats: Option<BlitStats>,
+}
+
+/// Per-frame copy cost (review A4: `waitUntilCompleted` runs on CEF's UI thread).
+pub(crate) struct BlitStats {
+    out: std::fs::File,
+    since: std::time::Instant,
+    ms: Vec<f64>,
+    hidden: u32,
+}
+
+impl BlitStats {
+    fn open(dir: &Path) -> Option<Self> {
+        std::env::var_os("HERDR_BROWSER_STATS").filter(|v| !v.is_empty() && v != "0")?;
+        let out = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("host-stats.log")).ok()?;
+        Some(Self { out, since: std::time::Instant::now(), ms: Vec::new(), hidden: 0 })
+    }
+
+    fn record(&mut self, ms: f64, hidden: bool) {
+        self.ms.push(ms);
+        self.hidden += hidden as u32;
+        let span = self.since.elapsed();
+        if span < Duration::from_secs(2) {
+            return;
+        }
+        self.ms.sort_by(f64::total_cmp);
+        let p = |q: f64| self.ms[((self.ms.len() - 1) as f64 * q).round() as usize];
+        let _ = writeln!(
+            self.out,
+            "blit count={} per_s={:.1} p50_ms={:.2} p95_ms={:.2} max_ms={:.2} hidden={}",
+            self.ms.len(),
+            self.ms.len() as f64 / span.as_secs_f64(),
+            p(0.5),
+            p(0.95),
+            p(1.0),
+            self.hidden
+        );
+        self.ms.clear();
+        self.hidden = 0;
+        self.since = std::time::Instant::now();
+    }
 }
 
 thread_local! {
@@ -63,7 +125,7 @@ thread_local! {
     /// Browsers CEF has created and not yet finished closing (`on_before_close`).
     pub(crate) static OPEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Set by the cookie store's flush callback.
-    pub(crate) static FLUSHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FLUSHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How long `cef::shutdown` may take before the host exits on its own (Chromium's watchdog is longer).
@@ -73,7 +135,7 @@ unsafe extern "C" {
     fn _exit(code: i32) -> !;
 }
 
-fn debug(args: std::fmt::Arguments) {
+pub(crate) fn debug(args: std::fmt::Arguments) {
     if std::env::var_os("HERDR_BROWSER_HOST_DEBUG").is_some() {
         eprintln!("herdr-browser-host: {args}");
     }
@@ -115,22 +177,36 @@ pub(crate) fn keep_dialog(req: u64, cb: JsdialogCallback) {
     with_host(|h| h.dialogs.insert(req, cb));
 }
 
+/// Hold browser `id`'s context-menu callback until the app answers `MenuResult` for `req`.
+pub(crate) fn keep_menu(id: &str, req: u64, cb: RunContextMenuCallback) {
+    with_host(|h| h.menus.insert(req, (id.to_string(), cb)));
+}
+
 pub(crate) fn keep_chooser(req: u64, cb: FileDialogCallback) {
     with_host(|h| h.choosers.insert(req, cb));
 }
 
+enum Painted {
+    Out(Option<(u64, Surface, f32)>),
+    Shots(Vec<(u64, String)>, Surface),
+}
+use Painted::{Out, Shots};
+
 /// A painted CEF surface arrived: blit it into a pool surface and send it if nothing is in flight.
 pub(crate) fn on_frame(id: &str, src: *mut std::ffi::c_void, w: u32, h: u32) {
     paint(id, Some((false, src, w, h)));
+    report_viewport(id);
 }
 
 /// A `<select>` list, datalist or other popup widget painted (PET_POPUP).
 pub(crate) fn on_popup_frame(id: &str, src: *mut std::ffi::c_void, w: u32, h: u32) {
+    debug(format_args!("{id}: popup paint {w}x{h}"));
     paint(id, Some((true, src, w, h)));
 }
 
 /// The popup widget opened or closed (`OnPopupShow`). Closing repaints the page without it.
 pub(crate) fn on_popup_show(id: &str, show: bool) {
+    debug(format_args!("{id}: popup show={show}"));
     let changed = with_host(|h| {
         h.browsers.get_mut(id).map(|e| {
             let was = e.popup_shown;
@@ -151,6 +227,7 @@ pub(crate) fn on_popup_show(id: &str, show: bool) {
 
 /// Where the popup goes, in DIPs from the view's top-left (`OnPopupSize`).
 pub(crate) fn on_popup_size(id: &str, x: i32, y: i32, w: i32, h: i32) {
+    debug(format_args!("{id}: popup at {x},{y} {w}x{h}"));
     with_host(|host| host.browsers.get_mut(id).map(|e| e.popup_rect = Some((x, y, w.max(0), h.max(0)))));
 }
 
@@ -160,7 +237,12 @@ fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
     let ready = with_host(|host| {
         let entry = host.browsers.get_mut(id)?;
         let blitter = host.blitter.as_ref()?;
-        let res = (|| -> Result<_, String> {
+        let t = std::time::Instant::now();
+        let res = (|| -> Result<Painted, String> {
+            // Hidden and no screenshot waiting: CEF should not paint, and if it does, skip the copies.
+            if entry.hidden && entry.shots.is_empty() {
+                return Ok(Out(None));
+            }
             if let Some((popup, src, w, h)) = layer {
                 let px = PixelSize { w, h };
                 let slot = if popup { &mut entry.popup } else { &mut entry.view };
@@ -170,31 +252,53 @@ fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
                 let copy = slot.as_ref().expect("just made");
                 blitter.copy(src, copy.as_ptr(), w as usize, h as usize)?;
             }
-            let Some(view) = entry.view.as_ref() else { return Ok(None) };
+            let Some(view) = entry.view.as_ref() else { return Ok(Out(None)) };
             let vs = view.size();
             let dst = entry.pool.acquire(vs).map_err(|e| format!("surface: {e}"))?;
             blitter.copy(view.as_ptr(), dst.as_ptr(), vs.w as usize, vs.h as usize)?;
             if let (true, Some(popup), Some(rect)) = (entry.popup_shown, entry.popup.as_ref(), entry.popup_rect) {
                 let ps = popup.size();
                 let place = popup_place(rect, entry.scale, (ps.w, ps.h), (vs.w, vs.h));
+                debug(format_args!("{id}: compose popup {ps:?} at {rect:?} -> {place:?}"));
                 if let Some((from, to, w, h)) = place {
                     blitter.copy_region(popup.as_ptr(), (ps.w as usize, ps.h as usize), from, dst.as_ptr(), (vs.w as usize, vs.h as usize), to, w, h)?;
                 }
             }
-            Ok(entry.pool.submit(dst).map(|f| (f.seq, f.surface.clone(), entry.scale)))
+            entry.last = Some(dst.clone());
+            if entry.hidden {
+                // Painted only for screenshots: answer them and send nothing (hidden again below).
+                return Ok(Shots(std::mem::take(&mut entry.shots), dst));
+            }
+            Ok(Out(entry.pool.submit(dst).map(|f| (f.seq, f.surface.clone(), entry.scale))))
         })();
+        // Stats (HERDR_BROWSER_STATS): copy cost, and the first paint at a new size after Resize.
+        let hidden = entry.hidden;
+        let size = entry.view.as_ref().map(|v| v.size());
+        let want = ((entry.size.w * entry.scale).ceil() as u32, (entry.size.h * entry.scale).ceil() as u32);
+        let resized = entry.resized.filter(|_| size.is_some_and(|s| (s.w, s.h) == want));
+        if resized.is_some() {
+            entry.resized = None;
+        }
+        if let (Some(stats), true) = (host.stats.as_mut(), layer.is_some()) {
+            stats.record(t.elapsed().as_secs_f64() * 1e3, hidden);
+            if let (Some(r), Some(s)) = (resized, size) {
+                let _ = writeln!(stats.out, "resize_to_paint_ms={:.1} size={}x{}", r.elapsed().as_secs_f64() * 1e3, s.w, s.h);
+            }
+        }
         Some(res)
     })
     .flatten();
-    let woke = with_host(|h| h.browsers.get_mut(id).filter(|e| e.loaded && !e.input_ready).map(|e| {
-        e.input_ready = true;
-        std::mem::take(&mut e.queued)
-    })).flatten();
-    if let Some(events) = woke {
-        replay(id, events);
-    }
     match ready {
-        Some(Ok(Some((seq, s, scale)))) => send_frame(id, seq, s, scale),
+        Some(Ok(Out(Some((seq, s, scale))))) => send_frame(id, seq, s, scale),
+        Some(Ok(Shots(shots, s))) => {
+            if let Some(host) = browser(id).and_then(|b| b.host()) {
+                host.was_hidden(1);
+            }
+            for (req, path) in shots {
+                let res = write_png(&s, Path::new(&path));
+                send(HostToApp::ScreenshotDone { id: id.into(), req, ok: res.is_ok(), error: res.err() });
+            }
+        }
         Some(Err(e)) => send(HostToApp::Error { id: Some(id.into()), message: format!("frame: {e}") }),
         _ => {}
     }
@@ -215,10 +319,69 @@ pub(crate) fn popup_place(rect: (i32, i32, i32, i32), scale: f32, ps: (u32, u32)
     Some(((sx as usize, sy as usize), (dx as usize, dy as usize), w as usize, h as usize))
 }
 
-/// The page finished (or started) loading. Input becomes deliverable on the next frame.
+/// The page scrolled; reported as `Viewport` with the next page paint (at most one per frame).
+pub(crate) fn on_scroll(id: &str, x: f64, y: f64) {
+    with_host(|h| h.browsers.get_mut(id).map(|e| e.scroll = Some((x as f32, y as f32))));
+}
+
+/// After a page paint: send `Viewport` if scroll or zoom changed since the last one.
+fn report_viewport(id: &str) {
+    let zoom = browser(id).and_then(|b| b.host()).map(|h| h.zoom_level());
+    let msg = with_host(|h| {
+        let e = h.browsers.get_mut(id)?;
+        let (sx, sy) = e.scroll.unwrap_or((0.0, 0.0));
+        let now = (sx, sy, zoom.unwrap_or(0.0));
+        if e.viewport == Some(now) {
+            return None;
+        }
+        e.viewport = Some(now);
+        Some(HostToApp::Viewport { id: id.into(), scroll_x: sx, scroll_y: sy, zoom_level: now.2 })
+    })
+    .flatten();
+    if let Some(m) = msg {
+        send(m);
+    }
+}
+
+/// The page started or finished loading. A new load holds input; when it finishes, one privileged
+/// DevTools evaluate goes to the page, and its answer (`input_live`) proves the renderer is running
+/// script for the loaded page and releases the held input. Measured: input sent the moment
+/// loading ends (or on the first paint after it) is dropped by Chromium under load.
 pub(crate) fn on_loading(id: &str, loading: bool) {
-    if !loading {
-        with_host(|h| h.browsers.get_mut(id).map(|e| e.loaded = true));
+    let probe = with_host(|h| {
+        let e = h.browsers.get_mut(id)?;
+        if loading {
+            e.load_gen += 1;
+            e.loaded = false;
+            e.input_ready = false;
+            return None;
+        }
+        e.loaded = true;
+        (!e.input_ready).then_some(e.load_gen)
+    })
+    .flatten();
+    let Some(generation) = probe else { return };
+    let sent = browser(id).and_then(|b| b.host()).is_some_and(|host| host.send_dev_tools_message(Some(&handlers::ready_message(id, generation))) == 1);
+    if !sent {
+        handlers::eval_unsent(id);
+        input_live(id, generation);
+    }
+}
+
+/// The readiness evaluate for load `generation` answered: deliver held input (if still current).
+pub(crate) fn input_live(id: &str, generation: u64) {
+    let events = with_host(|h| {
+        let e = h.browsers.get_mut(id)?;
+        if e.load_gen != generation || e.input_ready {
+            return None;
+        }
+        e.input_ready = true;
+        Some(std::mem::take(&mut e.queued))
+    })
+    .flatten();
+    if let Some(events) = events {
+        debug(format_args!("{id}: page live (load {generation}), releasing {} held input events", events.len()));
+        replay(id, events);
     }
 }
 
@@ -233,7 +396,6 @@ fn send_frame(id: &str, seq: u64, mut s: Surface, scale: f32) {
     match s.export(Transport::GlobalId) {
         Ok(surface) => {
             let size = s.size();
-            with_host(|h| h.browsers.get_mut(id).map(|e| e.last = Some(s)));
             send(HostToApp::Frame { id: id.into(), seq, surface, size, scale });
         }
         Err(e) => send(HostToApp::Error { id: Some(id.into()), message: format!("export: {e}") }),
@@ -250,6 +412,21 @@ enum Incoming {
 /// exit; the browser process serves `socket`.
 pub fn main(socket: Option<&Path>) -> i32 {
     let is_helper = std::env::args().any(|a| a.starts_with("--type="));
+    // Listen before loading the framework (hundreds of MB; seconds under load), so the app's
+    // connect succeeds at once and the slow part waits behind Hello instead of the start timeout.
+    let listener = match socket.filter(|_| !is_helper) {
+        Some(sock) => {
+            let _ = std::fs::remove_file(sock);
+            match UnixListener::bind(sock) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    eprintln!("herdr-browser-host: cannot listen on {}: {e}", sock.display());
+                    return 1;
+                }
+            }
+        }
+        None => None,
+    };
     let exe = std::env::current_exe().expect("current exe");
     let loader = library_loader::LibraryLoader::new(&exe, is_helper);
     if !loader.load() {
@@ -261,11 +438,11 @@ pub fn main(socket: Option<&Path>) -> i32 {
     if is_helper {
         return execute_process(Some(args.as_main_args()), None::<&mut App>, std::ptr::null_mut());
     }
-    let Some(socket) = socket else {
+    let (Some(socket), Some(listener)) = (socket, listener) else {
         eprintln!("usage: herdr-browser-host --socket <path>");
         return 2;
     };
-    match serve(socket, &args) {
+    match serve(socket, listener, &args) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("herdr-browser-host: {e}");
@@ -287,10 +464,8 @@ fn pick_port(want: Option<u16>) -> io::Result<Option<u16>> {
     }
 }
 
-fn serve(socket: &Path, args: &Args) -> io::Result<()> {
+fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
     mac_app::setup();
-    let _ = std::fs::remove_file(socket);
-    let listener = UnixListener::bind(socket)?;
     let (stream, _) = listener.accept()?;
     let mut out = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
@@ -337,9 +512,14 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
             blitter: blit::Blitter::new(),
             downloads,
             next_req: 0,
+            root: profile_dir.clone(),
+            contexts: HashMap::new(),
+            dark: None,
             dialogs: HashMap::new(),
             choosers: HashMap::new(),
+            menus: HashMap::new(),
             quit: false,
+            stats: BlitStats::open(profile_dir.parent().unwrap_or(&profile_dir)),
         })
     });
     if with_host(|h| h.blitter.is_none()).unwrap_or(true) {
@@ -398,12 +578,21 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
     }
     // Write cookies to disk and wait (bounded) for CEF to confirm, so logins never depend on
     // how teardown goes.
-    FLUSHED.set(false);
-    let flushing = cookie_manager_get_global_manager(None).is_some_and(|cm| cm.flush_store(Some(&mut handlers::flush_done())) == 1);
+    // Every profile's cookie store: the default (global) one and each named profile's.
+    FLUSHED.set(0);
+    let contexts: Vec<RequestContext> = with_host(|h| h.contexts.drain().map(|(_, c)| c).collect()).unwrap_or_default();
+    let managers = cookie_manager_get_global_manager(None).into_iter().chain(contexts.iter().filter_map(|c| c.cookie_manager(None)));
+    let started = managers.filter(|cm| cm.flush_store(Some(&mut handlers::flush_done())) == 1).count();
     let end = std::time::Instant::now() + Duration::from_secs(3);
-    while flushing && !FLUSHED.get() && std::time::Instant::now() < end {
+    while FLUSHED.get() < started && std::time::Instant::now() < end {
         do_message_loop_work();
         std::thread::sleep(Duration::from_millis(5));
+    }
+    debug(format_args!("cookie stores flushed: {}/{started}", FLUSHED.get()));
+    drop(contexts);
+    // Menus still open: dismiss them (outside the state borrow: CEF may call back).
+    for (_, (_, cb)) in with_host(|h| h.menus.drain().collect::<Vec<_>>()).unwrap_or_default() {
+        cb.cancel();
     }
     // Let CEF finish the close and flush tasks it queued; `shutdown` hangs if they are pending.
     for _ in 0..40 {
@@ -428,9 +617,51 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
     });
     let t = std::time::Instant::now();
     cef::shutdown();
-    debug(format_args!("CEF shut down in {:?} (cookies flushed: {})", t.elapsed(), FLUSHED.get()));
+    debug(format_args!("CEF shut down in {:?}", t.elapsed()));
     HOST.with_borrow_mut(|h| *h = None);
     Ok(())
+}
+
+/// prefers-color-scheme for every page in `ctx`: dark, light, or the system's (None).
+fn apply_scheme(ctx: &RequestContext, dark: Option<bool>) {
+    use sys::cef_color_variant_t as V;
+    let v = match dark {
+        Some(true) => V::CEF_COLOR_VARIANT_DARK,
+        Some(false) => V::CEF_COLOR_VARIANT_LIGHT,
+        None => V::CEF_COLOR_VARIANT_SYSTEM,
+    };
+    ctx.set_chrome_color_scheme(ColorVariant::from(v), 0);
+}
+
+/// The request context for a block's `profile`: None (CEF's global context) for the default
+/// profile, else one context per name with its own cookies and storage under `<root>/<name>`.
+fn context_for(profile: Option<&str>) -> Result<Option<RequestContext>, String> {
+    let name = match profile.map(str::trim) {
+        None | Some("") | Some("default") => return Ok(None),
+        Some(n) => n.to_string(),
+    };
+    if !crate::downloads::is_profile_name(&name) {
+        return Err(format!("bad profile name {name:?}: use letters, digits, - and _"));
+    }
+    if let Some(c) = with_host(|h| h.contexts.get(&name).cloned()).flatten() {
+        return Ok(Some(c));
+    }
+    let (root, dark) = with_host(|h| (h.root.clone(), h.dark)).ok_or("host not ready")?;
+    // Chrome only opens profiles that sit directly in its data folder (nested paths fail with
+    // "Cannot create profile" and silently fall back to a throwaway profile).
+    let dir = root.join(format!("profile-{name}"));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("profile {name}: {e}"))?;
+    let settings = RequestContextSettings {
+        cache_path: CefString::from(dir.to_string_lossy().as_ref()),
+        persist_session_cookies: 1,
+        ..Default::default()
+    };
+    let ctx = request_context_create_context(Some(&settings), None).ok_or_else(|| format!("CEF could not make profile {name}"))?;
+    if dark.is_some() {
+        apply_scheme(&ctx, dark);
+    }
+    with_host(|h| h.contexts.insert(name, ctx.clone()));
+    Ok(Some(ctx))
 }
 
 fn browser(id: &str) -> Option<Browser> {
@@ -446,37 +677,47 @@ fn handle(m: AppToHost) {
     match m {
         M::Hello { .. } => send(HostToApp::Error { id: None, message: "hello already received".into() }),
         M::Shutdown => {}
-        M::Create { id, url, size, scale, .. } => {
+        M::SetColorScheme { dark } => {
+            let (contexts, browsers): (Vec<RequestContext>, Vec<Browser>) = with_host(|h| {
+                h.dark = Some(dark);
+                (h.contexts.values().cloned().collect(), h.browsers.values().filter_map(|e| e.browser.clone()).collect())
+            })
+            .unwrap_or_default();
+            // Chrome's colour scheme recolours form controls and scrollbars; the page's
+            // prefers-color-scheme follows the DevTools media emulation (set per page, live).
+            for ctx in request_context_get_global_context().into_iter().chain(contexts) {
+                apply_scheme(&ctx, Some(dark));
+            }
+            let call = handlers::scheme_message(dark);
+            for b in browsers {
+                if let Some(host) = b.host() {
+                    host.send_dev_tools_message(Some(&call));
+                }
+            }
+        }
+        M::Create { id, url, size, scale, profile } => {
             let exists = with_host(|h| h.browsers.contains_key(&id)).unwrap_or(false);
             if exists {
                 send(HostToApp::Error { id: Some(id.clone()), message: format!("browser {id} exists") });
                 return;
             }
-            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, view: None, popup: None, popup_shown: false, popup_rect: None }));
+            let mut context = match context_for(profile.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    send(HostToApp::Error { id: Some(id.clone()), message: e });
+                    return;
+                }
+            };
+            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, hidden: false, shots: Vec::new(), resized: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, load_gen: 0, view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new(), scroll: None, viewport: None }));
             let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
             let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
             let mut client = handlers::client(&id);
             let url = CefString::from(url.as_deref().unwrap_or("about:blank"));
-            match browser_host_create_browser_sync(Some(&window_info), Some(&mut client), Some(&url), Some(&settings), None, None) {
-                Some(b) => {
-                    // Ask DevTools for this page's target id; the observer sends CdpTarget.
-                    let reg = b.host().and_then(|host| {
-                        let mut obs = handlers::devtools_observer(&id);
-                        let reg = host.add_dev_tools_message_observer(Some(&mut obs));
-                        host.execute_dev_tools_method(handlers::TARGET_INFO_MSG, Some(&CefString::from("Target.getTargetInfo")), None);
-                        reg
-                    });
-                    with_host(|h| {
-                        h.browsers.get_mut(&id).map(|e| {
-                            e.browser = Some(b);
-                            e._devtools = reg;
-                        })
-                    });
-                }
-                None => {
-                    with_host(|h| h.browsers.remove(&id));
-                    send(HostToApp::Error { id: Some(id), message: "CEF could not create the browser".into() });
-                }
+            // Async: a named profile's context may still be starting, and a synchronous create
+            // fails then. `on_created` attaches the browser and replays what arrived meanwhile.
+            if browser_host_create_browser(Some(&window_info), Some(&mut client), Some(&url), Some(&settings), None, context.as_mut()) != 1 {
+                with_host(|h| h.browsers.remove(&id));
+                send(HostToApp::Error { id: Some(id), message: "CEF could not create the browser".into() });
             }
         }
         M::FileChooserResult { id, req, paths } => {
@@ -491,6 +732,17 @@ fn handle(m: AppToHost) {
                     list.append(p);
                 }
                 cb.cont(Some(&mut list));
+            }
+        }
+        M::MenuResult { id, req, command } => {
+            // Only the browser that opened the menu may answer it.
+            let Some((_, cb)) = with_host(|h| h.menus.remove(&req).filter(|(owner, _)| *owner == id)).flatten() else {
+                return send(HostToApp::Error { id: Some(id), message: format!("no context menu {req}") });
+            };
+            match command {
+                // App-handled extras were done by the app; CEF's own commands run here.
+                Some(c) if c > 0 && c < handlers::MENU_OPEN_LINK_IN_NEW_TAB => cb.cont(c, EventFlags::default()),
+                _ => cb.cancel(),
             }
         }
         M::DialogResult { id, req, accept, text } => {
@@ -514,6 +766,16 @@ fn handle(m: AppToHost) {
             }
         }
         M::Screenshot { id, req, path } => {
+            // Hidden: CEF is not painting, so the last pixels may be stale. Show the page to CEF
+            // until its next paint, which answers (see `on_frame`).
+            let hidden = with_host(|h| h.browsers.get_mut(&id).filter(|e| e.hidden).map(|e| e.shots.push((req, path.clone())))).flatten();
+            if hidden.is_some() {
+                if let Some(b) = browser(&id).and_then(|b| b.host()) {
+                    b.was_hidden(0);
+                    b.invalidate(PaintElementType::default());
+                }
+                return;
+            }
             let Some(last) = with_host(|h| h.browsers.get(&id).map(|e| e.last.clone())).flatten() else { return unknown(&id) };
             let res = match last {
                 Some(s) => write_png(&s, Path::new(&path)),
@@ -521,7 +783,55 @@ fn handle(m: AppToHost) {
             };
             send(HostToApp::ScreenshotDone { id, req, ok: res.is_ok(), error: res.err() });
         }
-        other => browser_msg(other),
+        // Every per-browser message, listed: a new protocol message must be added here (or above)
+        // to compile, so none can be dropped silently again.
+        other @ (M::Navigate { .. }
+        | M::Back { .. }
+        | M::Forward { .. }
+        | M::Reload { .. }
+        | M::Stop { .. }
+        | M::Resize { .. }
+        | M::Focus { .. }
+        | M::SetZoom { .. }
+        | M::Overlay { .. }
+        | M::Input { .. }
+        | M::Edit { .. }
+        | M::SetVisible { .. }
+        | M::Find { .. }
+        | M::StopFind { .. }
+        | M::DevTools { .. }
+        | M::Eval { .. }) => browser_msg(other),
+    }
+}
+
+/// CEF made browser `id` (`OnAfterCreated`): attach it, ask for its CDP target and colour scheme,
+/// then run the messages that arrived while it was starting.
+pub(crate) fn on_created(id: &str, b: Browser) {
+    let reg = b.host().and_then(|host| {
+        let mut obs = handlers::devtools_observer(id);
+        let reg = host.add_dev_tools_message_observer(Some(&mut obs));
+        host.execute_dev_tools_method(handlers::TARGET_INFO_MSG, Some(&CefString::from("Target.getTargetInfo")), None);
+        if let Some(dark) = with_host(|h| h.dark).flatten() {
+            host.send_dev_tools_message(Some(&handlers::scheme_message(dark)));
+        }
+        reg
+    });
+    let waiting = with_host(|h| {
+        h.browsers.get_mut(id).map(|e| {
+            e.browser = Some(b.clone());
+            e._devtools = reg;
+            std::mem::take(&mut e.starting)
+        })
+    })
+    .flatten();
+    match waiting {
+        Some(msgs) => msgs.into_iter().for_each(browser_msg),
+        // Closed before CEF finished making it.
+        None => {
+            if let Some(host) = b.host() {
+                host.close_browser(1);
+            }
+        }
     }
 }
 
@@ -530,10 +840,20 @@ fn browser_msg(m: AppToHost) {
     let id = match &m {
         M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. } | M::Stop { id } | M::Resize { id, .. }
         | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Input { id, .. } | M::Edit { id, .. } | M::Find { id, .. } | M::StopFind { id, .. }
-        | M::DevTools { id, .. } | M::Eval { id, .. } => id.clone(),
-        _ => return,
+        | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::SetVisible { id, .. } => id.clone(),
+        other => {
+            debug(format_args!("not a browser message, dropped: {}", encode(&other)));
+            return;
+        }
     };
-    let Some(b) = browser(&id) else { return unknown(&id) };
+    let Some(b) = browser(&id) else {
+        // Still starting: keep it for `on_created`.
+        let kept = with_host(|h| h.browsers.get_mut(&id).map(|e| e.starting.push(m.clone()))).flatten().is_some();
+        if !kept {
+            unknown(&id);
+        }
+        return;
+    };
     let Some(host) = b.host() else { return unknown(&id) };
     match m {
         M::Navigate { url, .. } => {
@@ -557,6 +877,7 @@ fn browser_msg(m: AppToHost) {
                     let changed = e.scale != scale;
                     e.size = size;
                     e.scale = scale;
+                    e.resized = Some(std::time::Instant::now());
                     changed
                 })
             })
@@ -568,6 +889,24 @@ fn browser_msg(m: AppToHost) {
             host.was_resized();
         }
         M::Focus { focused, .. } => host.set_focus(focused as i32),
+        M::SetVisible { visible, .. } => {
+            let changed = with_host(|h| {
+                h.browsers.get_mut(&id).filter(|e| e.hidden == visible).map(|e| {
+                    e.hidden = !visible;
+                    if !visible {
+                        e.pool.drop_pending();
+                    }
+                })
+            })
+            .flatten();
+            if changed.is_some() {
+                host.was_hidden(!visible as i32);
+                if visible {
+                    // A fresh full frame on resume.
+                    host.invalidate(PaintElementType::default());
+                }
+            }
+        }
         M::SetZoom { level, .. } => host.set_zoom_level(level),
         M::Input { event, .. } => {
             let queued = with_host(|h| {
@@ -605,7 +944,14 @@ fn browser_msg(m: AppToHost) {
                 send(HostToApp::EvalResult { id, req, ok: false, value: "DevTools is not available for this page".into() });
             }
         }
-        _ => {}
+        M::Overlay { req, epoch, query, .. } => {
+            let call = handlers::overlay_message(&id, req, epoch, &query);
+            if host.send_dev_tools_message(Some(&call)) == 0 {
+                handlers::eval_unsent(&id);
+                send(HostToApp::OverlayRects { id, req, epoch, rects: vec![], frames: vec![] });
+            }
+        }
+        other => send(HostToApp::Error { id: Some(id), message: format!("unhandled message {}", encode(&other)) }),
     }
 }
 

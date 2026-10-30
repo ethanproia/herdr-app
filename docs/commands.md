@@ -412,12 +412,13 @@ Close an overlay (default: the top dialog or popup).
 
 ## `browser.open`
 
-Open a browser block at url (place "tab", default, or "right"/"down" of the focused pane); answers its id.
+Open a browser block at url (place "tab", default, or "right"/"down" of the focused pane) with its own cookies and logins (profile, default "agent"; "default" is the person's); answers its id.
 
 | Argument | Required |
 |---|---|
 | `url` | no |
 | `place` | no |
+| `profile` | no |
 
 ## `browser.navigate`
 
@@ -507,6 +508,17 @@ Close a browser block (default: the focused browser).
 |---|---|
 | `id` | no |
 | `pane` | no |
+
+## `browser.lock`
+
+An agent takes a browser (on, default true): the person's input there is refused with a visible "<agent> is driving · Take Control" strip until the agent unlocks (on: false) or the person takes control.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+| `agent` | no |
+| `on` | no |
 
 ## `browser.devtools`
 

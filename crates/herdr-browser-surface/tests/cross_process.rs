@@ -63,6 +63,50 @@ fn child() {
     println!("CHILD_OK pid={} id={}", std::process::id(), s.id());
 }
 
+/// The fence the host pool relies on: a use count taken in another process is visible here.
+#[test]
+fn use_count_crosses_processes() {
+    use std::io::{BufRead, Write};
+    if let Ok(id) = std::env::var("HERDR_SURFACE_USE_CHILD") {
+        let s = import(&SurfaceRef::GlobalId { id: id.parse().unwrap() }).unwrap();
+        let guard = s.use_guard();
+        let mut line = String::new();
+        println!("HELD");
+        std::io::stdout().flush().unwrap();
+        std::io::stdin().read_line(&mut line).unwrap();
+        drop(guard);
+        println!("RELEASED");
+        std::io::stdout().flush().unwrap();
+        std::io::stdin().read_line(&mut line).unwrap();
+        return;
+    }
+    let s = create_pixels(PixelSize { w: 4, h: 4 }).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "use_count_crosses_processes", "--nocapture"])
+        .env("HERDR_SURFACE_USE_CHILD", s.id().to_string())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut inp = child.stdin.take().unwrap();
+    let mut wait_for = |word: &str| {
+        let mut line = String::new();
+        while !line.contains(word) {
+            line.clear();
+            assert!(out.read_line(&mut line).unwrap() > 0, "child exited before {word}");
+        }
+    };
+    assert!(!s.in_use());
+    wait_for("HELD");
+    assert!(s.in_use(), "child's use count not visible to the parent");
+    writeln!(inp).unwrap();
+    wait_for("RELEASED");
+    assert!(!s.in_use());
+    writeln!(inp).unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
 #[test]
 fn cross_process_global_id() {
     run(Transport::GlobalId);

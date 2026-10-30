@@ -43,6 +43,11 @@ pub fn unique_path_except(dir: &Path, suggested: &str, reserved: &HashSet<PathBu
         .expect("some name is free")
 }
 
+/// A profile name that is safe as a folder name.
+pub fn is_profile_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +67,7 @@ mod tests {
         assert_eq!(unique_path(&d, "../../etc/passwd"), d.join("passwd"));
         assert_eq!(unique_path(&d, ".hidden"), d.join("hidden"));
         assert_eq!(unique_path(&d, ""), d.join("download"));
+        assert!(is_profile_name("work-2") && !is_profile_name("../x") && !is_profile_name(""));
         let reserved = HashSet::from([d.join("a.zip"), d.join("a (1).zip")]);
         assert_eq!(unique_path_except(&d, "a.zip", &reserved), d.join("a (2).zip"));
         let _ = std::fs::remove_dir_all(&d);

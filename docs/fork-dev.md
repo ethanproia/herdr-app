@@ -122,3 +122,25 @@ cef-rs examples.
   `git submodule update --init --reference ~/code/herdr-app/.git/modules/vendor/ghostty vendor/ghostty`.
 
 - **Stale artifacts in a shared target dir.** When several worktrees share one `CARGO_TARGET_DIR` and you switch branches or merge, cargo can reuse a stale build of a workspace crate (symptoms: `no variant named X found` for an enum that has it, or `has no field named Y` for a field that exists). Fix: `touch` the changed source file (for example `crates/herdr-browser-protocol/src/lib.rs`) and rebuild. Seen twice on 2026-10-30 with the protocol crate.
+
+## Dynamic-site checks: `scripts/fork-web.ts`
+
+Parity plan section W, against a headless fork, one site at a time:
+
+```sh
+export HERDR_APP_BIN=$HOME/work.noindex/herdr-fork/target-web/debug/herdr-app   # your own target dir
+export HERDR_BROWSER_HOST=$HOME/work.noindex/herdr-fork/host-cef/herdr-browser-host.app/Contents/MacOS/herdr-browser-host
+scripts/fork-run.sh web up
+scripts/fork-run.sh web do space.new
+scripts/fork-run.sh web do browser.open --url about:blank
+scripts/fork-run.sh web shot /tmp/hf-web-start.png   # the first draw starts the host
+FORK_WORKER=web ~/work.noindex/herdr-fork/bin/chromium-slot bun scripts/fork-web.ts web W1   # W1..W5: METRIC lines, then JSON (pass, load_ms, fps, console errors, shots
+scripts/fork-run.sh web down
+```
+
+Input goes through the CDP port (`Input.*`, the agent path); screenshots
+through `browser.screenshot`. Fps is frames the page painted (rAF) while
+wheel-scrolling, or decoded video frames for W3, not frames the app drew.
+A headless window never draws; the app acks frames on receipt when headless,
+so screenshots stay current. The script still draws the app once before
+each screenshot for builds without that fix (`FORK_WEB_NO_DRAW=1` skips it).
