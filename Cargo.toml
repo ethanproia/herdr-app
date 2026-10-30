@@ -93,6 +93,11 @@ path = "tests/browser_modes.rs"
 harness = false
 
 [[test]]
+name = "browser_zoom"
+path = "tests/browser_zoom.rs"
+harness = false
+
+[[test]]
 name = "browser_dialogs"
 path = "tests/browser_dialogs.rs"
 harness = false

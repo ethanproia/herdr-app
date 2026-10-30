@@ -25,6 +25,7 @@ pub mod region;
 // HERDR: part 4, design slice S10 (panel model and UI).
 pub mod styles;
 pub mod view;
+pub mod zoom;
 
 pub use herdr_browser_protocol as protocol;
 use herdr_browser_protocol::{AppToHost, BrowserId, PixelSize, Size, SurfaceRef};
