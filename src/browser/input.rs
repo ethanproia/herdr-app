@@ -12,7 +12,7 @@
 //! Printable keys send `Key` down and let the event continue, so the platform's text input
 //! (layouts, dead keys, IME) delivers the characters as `Text` through `replace_text_in_range`.
 
-use super::protocol::{self, AppToHost, BrowserId, ImeEvent, InputEvent, KeyKind, MouseKind};
+use super::protocol::{self, AppToHost, BrowserId, EditCommand, ImeEvent, InputEvent, KeyKind, MouseKind};
 use super::HostLink;
 use gpui::{
     Bounds, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle, KeyDownEvent, KeyUpEvent,
@@ -160,6 +160,11 @@ impl BrowserInput {
         if self.marked.is_some() {
             return false;
         }
+        // Clipboard and edit chords become explicit commands: CEF off-screen does not act on them as keys.
+        if let Some(command) = edit_command(k) {
+            self.link.send(AppToHost::Edit { id: self.id.clone(), command });
+            return true;
+        }
         let (key, code, native) = dom_key(k);
         if !self.held_keys.iter().any(|(_, c, _)| *c == code) {
             self.held_keys.push((key.clone(), code.clone(), native));
@@ -252,20 +257,20 @@ pub fn cursor_style(name: &str) -> CursorStyle {
 }
 
 /// The clipboard and edit chords a focused page should get (cmd on macOS, ctrl elsewhere).
-/// They arrive as `Key` events; CEF off-screen may need an explicit edit command (see the PR notes).
-pub fn edit_command(k: &gpui::Keystroke) -> Option<&'static str> {
+/// The page gets them as `AppToHost::Edit`, not as `Key` events.
+pub fn edit_command(k: &gpui::Keystroke) -> Option<EditCommand> {
     let m = k.modifiers;
     let primary = if cfg!(target_os = "macos") { m.platform && !m.control } else { m.control && !m.platform };
     if !primary || m.alt {
         return None;
     }
     Some(match (k.key.as_str(), m.shift) {
-        ("c", false) => "copy",
-        ("x", false) => "cut",
-        ("v", false) => "paste",
-        ("a", false) => "select_all",
-        ("z", false) => "undo",
-        ("z", true) => "redo",
+        ("c", false) => EditCommand::Copy,
+        ("x", false) => EditCommand::Cut,
+        ("v", false) => EditCommand::Paste,
+        ("a", false) => EditCommand::SelectAll,
+        ("z", false) => EditCommand::Undo,
+        ("z", true) => EditCommand::Redo,
         _ => return None,
     })
 }
@@ -289,7 +294,8 @@ fn types_text(k: &gpui::Keystroke) -> bool {
 }
 
 /// DOM `key`, DOM `code` (US layout) and the macOS virtual key code for a GPUI keystroke.
-/// GPUI does not expose the native code, so it is derived from the key name.
+/// Known limitation: GPUI does not expose the native code, so it is derived from the key name
+/// assuming a US layout; on other layouts `code` and `native` can name the wrong physical key.
 fn dom_key(k: &gpui::Keystroke) -> (String, String, u32) {
     let name = k.key.as_str();
     let named = |key: &str, code: &str, vk: u32| (key.to_owned(), code.to_owned(), vk);
@@ -531,21 +537,26 @@ mod tests {
     #[gpui::test]
     fn printable_keys_send_key_then_text_and_herdr_bindings_are_not_swallowed(cx: &mut TestAppContext) {
         let (rec, block, cx) = setup(cx);
-        cx.simulate_keystrokes("a enter cmd-c cmd-t");
-        let cmd = protocol::Modifiers { platform: true, ..mods() };
-        assert_eq!(rec.inputs(), vec![
-            InputEvent::Key { kind: KeyKind::Down, key: "a".into(), code: "KeyA".into(), native: 0x00, repeat: false, mods: mods() },
-            InputEvent::Text { text: "a".into() },
-            InputEvent::Key { kind: KeyKind::Down, key: "Enter".into(), code: "Enter".into(), native: 0x24, repeat: false, mods: mods() },
-            InputEvent::Key { kind: KeyKind::Down, key: "c".into(), code: "KeyC".into(), native: 0x08, repeat: false, mods: cmd },
+        let primary = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+        cx.simulate_keystrokes(&format!("a enter {primary}-c {primary}-v {primary}-a {primary}-shift-z cmd-t"));
+        let edit = |command| AppToHost::Edit { id: "b1".into(), command };
+        let input = |event| AppToHost::Input { id: "b1".into(), event };
+        assert_eq!(rec.take(), vec![
+            input(InputEvent::Key { kind: KeyKind::Down, key: "a".into(), code: "KeyA".into(), native: 0x00, repeat: false, mods: mods() }),
+            input(InputEvent::Text { text: "a".into() }),
+            input(InputEvent::Key { kind: KeyKind::Down, key: "Enter".into(), code: "Enter".into(), native: 0x24, repeat: false, mods: mods() }),
+            edit(EditCommand::Copy),
+            edit(EditCommand::Paste),
+            edit(EditCommand::SelectAll),
+            edit(EditCommand::Redo),
         ]);
         // cmd-t is a Herdr binding: it ran, and the page never saw it.
         assert_eq!(block.read_with(cx, |b, _| b.bound), 1);
         // The page sees the character a shifted key types, with the physical code.
         let bang = Keystroke { modifiers: Modifiers::shift(), key: "1".into(), key_char: Some("!".into()) };
         assert_eq!(dom_key(&bang), ("!".into(), "Digit1".into(), 0x12));
-        assert_eq!(edit_command(&Keystroke::parse(if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" }).unwrap()), Some("copy"));
-        assert_eq!(edit_command(&Keystroke::parse(if cfg!(target_os = "macos") { "cmd-shift-z" } else { "ctrl-shift-z" }).unwrap()), Some("redo"));
+        assert_eq!(edit_command(&Keystroke::parse(if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" }).unwrap()), Some(EditCommand::Copy));
+        assert_eq!(edit_command(&Keystroke::parse(if cfg!(target_os = "macos") { "cmd-shift-z" } else { "ctrl-shift-z" }).unwrap()), Some(EditCommand::Redo));
     }
 
     #[gpui::test]
