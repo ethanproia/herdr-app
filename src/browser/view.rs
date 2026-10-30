@@ -542,8 +542,6 @@ pub struct BrowserView {
     annotations: annotate::Annotations,
     comment_on_pick: bool,
     comment_target: Option<annotate::Target>,
-    /// The comment field's text when it opened (it isn't cleared between comments yet).
-    comment_base: String,
     /// Page questions in flight (view-owned PickInfo reqs >= VIEW_REQ_BASE).
     asks: HashMap<u64, PageAsk>,
     next_ask: u64,
@@ -756,7 +754,6 @@ impl BrowserView {
             annotations: Default::default(),
             comment_on_pick: false,
             comment_target: None,
-            comment_base: String::new(),
             asks: HashMap::new(),
             next_ask: 0,
             dialogs,
@@ -1202,7 +1199,6 @@ impl BrowserView {
                 Some(t) => {
                     let entered = self.input.update(cx, |i, _| i.enter(Owner::Comment));
                     if entered {
-                        self.comment_base = self.input.read(cx).comment().text.clone();
                         self.comment_target = Some(t);
                     }
                 }
@@ -1219,8 +1215,7 @@ impl BrowserView {
     /// Save the open comment as an annotation (S7) and close the field and pick.
     pub fn save_comment(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.comment_target.take() else { return };
-        let text = self.input.read(cx).comment().text.clone();
-        let text = text.strip_prefix(&self.comment_base).unwrap_or(&text).to_owned();
+        let text = self.input.update(cx, |i, _| i.take_comment());
         self.annotations.add(target, &text);
         self.input.update(cx, |i, _| {
             i.escape(); // Comment -> Pick
@@ -1288,8 +1283,7 @@ impl BrowserView {
         }
         if let Some(t) = &self.comment_target {
             let input = self.input.read(cx);
-            let full = input.comment().text.clone();
-            let typed = full.strip_prefix(&self.comment_base).unwrap_or(&full).to_owned() + input.comment().marked.as_deref().unwrap_or("");
+            let typed = input.comment().text.clone() + input.comment().marked.as_deref().unwrap_or("");
             let (x, y, _, h) = t.rect;
             out.push(
                 div()
