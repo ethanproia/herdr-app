@@ -46,7 +46,9 @@ fn report(id: &str, label: &str, unit: &str, target: &str, pass: impl Fn(f64) ->
     let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0).max(1.0)).sqrt();
     let (min, max) = v.iter().fold((f64::MAX, f64::MIN), |(a, b), x| (a.min(*x), b.max(*x)));
     let ok = if target.is_empty() { "-" } else if pass(mean) { "PASS" } else { "MISS" };
-    println!("RESULT {id} [{label}] mean={mean:.2} sd={sd:.2} min={min:.2} max={max:.2} {unit} n={} target={target} {ok}", v.len());
+    let mut sorted = v.to_vec();
+    let p50 = pct(&mut sorted, 0.5);
+    println!("RESULT {id} [{label}] mean={mean:.2} sd={sd:.2} p50={p50:.2} min={min:.2} max={max:.2} {unit} n={} target={target} {ok}", v.len());
     metric(id, mean, unit, target);
 }
 
@@ -229,6 +231,10 @@ fn r5(server: &fixtures::Server) {
         during.push(p.frame_stats(start).fps);
     }
     report("R5-resize-first-frame", "delivery", "ms", "<= 100", |m| m <= 100.0, &first);
+    let host_side = host_stat_values("resize_to_paint_ms=");
+    if !host_side.is_empty() {
+        report("R5-host-resize-to-paint", "host: Resize received to first paint at that size", "ms", "", |_| true, &host_side);
+    }
     let mut f = first.clone();
     println!("RESULT R5-resize-first-frame-p95 [delivery] p95={:.1} ms", pct(&mut f, 0.95));
     report("R5-continuous-resize-fps", "delivery", "fps", "", |_| true, &during);
@@ -314,6 +320,20 @@ fn blit_p95() -> Option<f64> {
         }
     }
     best.map(|(_, v)| v)
+}
+
+/// Every `key=value` sample in this process's pages' host-stats.log files.
+fn host_stat_values(key: &str) -> Vec<f64> {
+    let pid = std::process::id();
+    let mut out = vec![];
+    for e in std::fs::read_dir("/tmp").into_iter().flatten().flatten() {
+        if !e.file_name().to_string_lossy().starts_with(&format!("hp-{pid}-")) {
+            continue;
+        }
+        let text = std::fs::read_to_string(e.path().join("host-stats.log")).unwrap_or_default();
+        out.extend(text.lines().flat_map(|l| l.split_whitespace()).filter_map(|w| w.strip_prefix(key)?.parse::<f64>().ok()));
+    }
+    out
 }
 
 fn main() {

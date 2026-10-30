@@ -36,6 +36,8 @@ pub(crate) struct Entry {
     hidden: bool,
     /// Screenshots asked for while hidden: answered from the next paint (shown just for it).
     shots: Vec<(u64, String)>,
+    /// When the last `Resize` arrived, until the first paint at that size (stats only).
+    resized: Option<std::time::Instant>,
     /// Keeps the DevTools observer that reports the CDP target id alive.
     _devtools: Option<Registration>,
     /// Input waits here until the page can take it: Chromium drops events sent between the first
@@ -184,8 +186,16 @@ pub(crate) fn on_frame(id: &str, src: *mut std::ffi::c_void, w: u32, h: u32) {
             return Some(Err(e));
         }
         let hidden = entry.hidden;
+        let want = ((entry.size.w * entry.scale).ceil() as u32, (entry.size.h * entry.scale).ceil() as u32);
+        let resized = entry.resized.filter(|_| (w, h) == want);
+        if resized.is_some() {
+            entry.resized = None;
+        }
         if let Some(stats) = host.stats.as_mut() {
             stats.record(t.elapsed().as_secs_f64() * 1e3, hidden);
+            if let Some(r) = resized {
+                let _ = writeln!(stats.out, "resize_to_paint_ms={:.1} size={w}x{h}", r.elapsed().as_secs_f64() * 1e3);
+            }
         }
         let entry = host.browsers.get_mut(id)?;
         entry.last = Some(dst.clone());
@@ -458,7 +468,7 @@ fn handle(m: AppToHost) {
                 send(HostToApp::Error { id: Some(id.clone()), message: format!("browser {id} exists") });
                 return;
             }
-            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, hidden: false, shots: Vec::new(), _devtools: None, queued: Vec::new(), loaded: false, input_ready: false }));
+            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, hidden: false, shots: Vec::new(), resized: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false }));
             let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
             let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
             let mut client = handlers::client(&id);
@@ -573,6 +583,7 @@ fn browser_msg(m: AppToHost) {
                     let changed = e.scale != scale;
                     e.size = size;
                     e.scale = scale;
+                    e.resized = Some(std::time::Instant::now());
                     changed
                 })
             })
