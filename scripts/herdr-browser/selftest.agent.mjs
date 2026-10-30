@@ -111,6 +111,17 @@ try {
   const lit = readPng(await cli("screenshot", T, `path=${join(dir, "a4-on.png")}`));
   await new Promise((r) => setTimeout(r, 1800));
   const off = readPng(await cli("screenshot", T, `path=${join(dir, "a4-off.png")}`));
+  // A5: a pick reaches the agent: selector, HTML, box, styles and a picture cropped to the element (the app's
+  // capture path; here the agent names the point, a person's click in pick mode takes the same path).
+  if (onApp) {
+    const pk = await appDo("browser.pick", { id: T, x: gb.x + gb.width / 2, y: gb.y + gb.height / 2 });
+    const crop = pk.screenshot ? readPng(pk.screenshot) : null;
+    check(/Greet/.test(pk.html ?? "") && pk.selector && pk.styles?.display && crop && Math.abs(crop.width - Math.round(gb.width * dpr)) <= 1 && Math.abs(crop.height - Math.round(gb.height * dpr)) <= 1,
+      `A5 pick captures the element (${pk.selector ?? JSON.stringify(pk).slice(0, 300)}, ${crop?.width}x${crop?.height})`);
+    const [px, py] = (await json("eval", T, "expression=(() => { const r = document.getElementById('pw').getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; })()")).value ?? [];
+    const pw = await appDo("browser.pick", { id: T, x: px, y: py });
+    check(pw.tag === "input" && !/hunter2-secret/.test(JSON.stringify(pk) + JSON.stringify(pw)) && pk.untrusted?.includes("html"), "A5 pick output carries no secret values and is labelled untrusted");
+  }
   check(magenta(edge(lit)) && !magenta(edge(off)), `A4 highlight is visible in the pixels, then gone (on ${edge(lit)}, off ${edge(off)})`);
   check((await json("browser_mouse_click_xy", T, "x=3", "y=3")).ok, "mouse_click_xy");
   check((await json("browser_drag", T, `sourceRef=${r2(/text "drag"/)}`, `targetRef=${r2(/text "drop"/)}`)).to?.x > 0, "drag between refs");
@@ -129,6 +140,18 @@ try {
   check((await json("browser_cdp", T, "method=Runtime.evaluate", 'params={"expression":"1+1"}')).result?.result?.value === 2, "cdp passthrough with the grant");
   check(/not allowed for agents/.test(await cli("browser_cdp", T, "method=Storage.getCookies")), "X2 cookie and profile methods refused even with the grant");
   check((await json("browser_lock", T, "action=lock")).locked === true && (await json("tabs")).ok, "lock sets the lock flag");
+  // A6: on the app, the lock is the block's input lease: the window shows the "is driving · Take Control" strip.
+  if (onApp) {
+    const shot = (name) => new Promise((r) => execFile(process.env.HERDR_BROWSER_APP, ["shot", join(dir, name)], { encoding: "utf8" }, () => r(readPng(join(dir, name)))));
+    const locked = await shot("a6-locked.png");
+    (await json("browser_lock", T, "action=unlock"));
+    const free = await shot("a6-free.png");
+    // The strip is the block's violet bar; count its pixels (every other pixel) in each picture.
+    const violet = (png) => { let n = 0; for (let y = 0; y < png.height; y += 2) for (let x = 0; x < png.width; x += 2) {
+      const [r, g, b] = png.pixel(x, y); if (b > 200 && g < 90 && r > 90 && r < 170) n++; } return n; };
+    const [on, off] = [violet(locked), violet(free)];
+    check(on > 2000 && off === 0, `A6 the lease strip shows while an agent holds the page and goes when it unlocks (${on} vs ${off} strip pixels; ${join(dir, "a6-locked.png")})`);
+  }
   (await json("browser_lock", T, "action=unlock"));
   const tl = await json("browser_tabs", "action=list");
   check(tl.tabs?.find((t) => t.tab === T)?.selected && tl.tabs.filter((t) => t.selected).length === 1, "tabs list marks the selected tab");

@@ -3845,7 +3845,10 @@ impl AppWindow {
                     return;
                 }
                 // Pick results go to the agent tools (part 5) through the view; nothing for the layout.
-                crate::browser::view::BrowserEvent::Picked { .. } => return,
+                crate::browser::view::BrowserEvent::Picked { x, y } => {
+                    this.browsers.picked(id, *x, *y);
+                    return;
+                }
                 // A download finished or failed: a toast, like other notices.
                 crate::browser::view::BrowserEvent::Notice(n) => {
                     let spec = json!({ "kind": "toast", "notification": n });
@@ -3891,6 +3894,15 @@ impl AppWindow {
                     None => Ok(json!({ "id": id, "closed": true })),
                 });
                 true
+            }
+            // `browser.pick`: the block enters pick mode; the agent answers when the person clicks an element.
+            Step::Pick { id } => {
+                if let Some(view) = self.browsers.view(&id).cloned() {
+                    let input = view.read(cx).input().clone();
+                    input.update(cx, |i, _| i.enter(crate::browser::input::Owner::Pick));
+                    cx.notify();
+                }
+                return;
             }
             // The person sees "<agent> is driving · Take Control" and their input is refused while the lease holds.
             Step::Lease { id, agent, reply } => {

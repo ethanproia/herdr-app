@@ -1652,6 +1652,14 @@ impl Browsers {
         agent.lock().unwrap().run(name, args, self, &focus, reply)
     }
 
+    // HERDR: browser block (part 5). The person picked an element: the agent captures it for `browser.pick`.
+    pub fn picked(&mut self, id: &str, x: f32, y: f32) {
+        let link = self.link_arc();
+        if let Some(agent) = &self.agent {
+            agent.lock().unwrap().picked(&id.to_owned(), x, y, &*link);
+        }
+    }
+
     /// Match the views to `blocks` (every browser block in every layout, as id and block):
     /// new blocks get a view (`on_event` hears its url changes), gone ones close their page.
     pub fn sync<W: 'static>(
