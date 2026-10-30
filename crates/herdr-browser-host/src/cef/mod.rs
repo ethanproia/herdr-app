@@ -47,6 +47,9 @@ pub(crate) struct Entry {
     popup_rect: Option<(i32, i32, i32, i32)>,
     /// Messages for this browser that arrived before CEF finished making it.
     starting: Vec<AppToHost>,
+    /// The newest scroll offset (CSS px) and the last `Viewport` sent (scroll x, y, zoom level).
+    scroll: Option<(f32, f32)>,
+    viewport: Option<(f32, f32, f64)>,
 }
 
 pub(crate) struct Host {
@@ -136,6 +139,7 @@ pub(crate) fn keep_chooser(req: u64, cb: FileDialogCallback) {
 /// A painted CEF surface arrived: blit it into a pool surface and send it if nothing is in flight.
 pub(crate) fn on_frame(id: &str, src: *mut std::ffi::c_void, w: u32, h: u32) {
     paint(id, Some((false, src, w, h)));
+    report_viewport(id);
 }
 
 /// A `<select>` list, datalist or other popup widget painted (PET_POPUP).
@@ -234,6 +238,30 @@ pub(crate) fn popup_place(rect: (i32, i32, i32, i32), scale: f32, ps: (u32, u32)
         return None;
     }
     Some(((sx as usize, sy as usize), (dx as usize, dy as usize), w as usize, h as usize))
+}
+
+/// The page scrolled; reported as `Viewport` with the next page paint (at most one per frame).
+pub(crate) fn on_scroll(id: &str, x: f64, y: f64) {
+    with_host(|h| h.browsers.get_mut(id).map(|e| e.scroll = Some((x as f32, y as f32))));
+}
+
+/// After a page paint: send `Viewport` if scroll or zoom changed since the last one.
+fn report_viewport(id: &str) {
+    let zoom = browser(id).and_then(|b| b.host()).map(|h| h.zoom_level());
+    let msg = with_host(|h| {
+        let e = h.browsers.get_mut(id)?;
+        let (sx, sy) = e.scroll.unwrap_or((0.0, 0.0));
+        let now = (sx, sy, zoom.unwrap_or(0.0));
+        if e.viewport == Some(now) {
+            return None;
+        }
+        e.viewport = Some(now);
+        Some(HostToApp::Viewport { id: id.into(), scroll_x: sx, scroll_y: sy, zoom_level: now.2 })
+    })
+    .flatten();
+    if let Some(m) = msg {
+        send(m);
+    }
 }
 
 /// The page finished (or started) loading. Input becomes deliverable on the next frame.
@@ -553,7 +581,7 @@ fn handle(m: AppToHost) {
                     return;
                 }
             };
-            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new() }));
+            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new(), scroll: None, viewport: None }));
             let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
             let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
             let mut client = handlers::client(&id);
@@ -618,7 +646,24 @@ fn handle(m: AppToHost) {
             };
             send(HostToApp::ScreenshotDone { id, req, ok: res.is_ok(), error: res.err() });
         }
-        other => browser_msg(other),
+        // Every per-browser message, listed: a new protocol message must be added here (or above)
+        // to compile, so none can be dropped silently again.
+        other @ (M::Navigate { .. }
+        | M::Back { .. }
+        | M::Forward { .. }
+        | M::Reload { .. }
+        | M::Stop { .. }
+        | M::Resize { .. }
+        | M::Focus { .. }
+        | M::SetZoom { .. }
+        | M::Overlay { .. }
+        | M::Input { .. }
+        | M::Edit { .. }
+        | M::SetVisible { .. }
+        | M::Find { .. }
+        | M::StopFind { .. }
+        | M::DevTools { .. }
+        | M::Eval { .. }) => browser_msg(other),
     }
 }
 
@@ -658,8 +703,11 @@ fn browser_msg(m: AppToHost) {
     let id = match &m {
         M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. } | M::Stop { id } | M::Resize { id, .. }
         | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Input { id, .. } | M::Edit { id, .. } | M::Find { id, .. } | M::StopFind { id, .. }
-        | M::DevTools { id, .. } | M::Eval { id, .. } => id.clone(),
-        _ => return,
+        | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::SetVisible { id, .. } => id.clone(),
+        other => {
+            debug(format_args!("not a browser message, dropped: {}", encode(&other)));
+            return;
+        }
     };
     let Some(b) = browser(&id) else {
         // Still starting: keep it for `on_created`.
@@ -740,7 +788,21 @@ fn browser_msg(m: AppToHost) {
                 send(HostToApp::EvalResult { id, req, ok: false, value: "DevTools is not available for this page".into() });
             }
         }
-        _ => {}
+        M::Overlay { req, epoch, query, .. } => {
+            let call = handlers::overlay_message(&id, req, epoch, &query);
+            if host.send_dev_tools_message(Some(&call)) == 0 {
+                handlers::eval_unsent(&id);
+                send(HostToApp::OverlayRects { id, req, epoch, rects: vec![], frames: vec![] });
+            }
+        }
+        // Minimal: CEF stops (or resumes) painting. Pending-frame handling is fork-frames' #22.
+        M::SetVisible { visible, .. } => {
+            host.was_hidden((!visible) as i32);
+            if visible {
+                host.invalidate(PaintElementType::default());
+            }
+        }
+        other => send(HostToApp::Error { id: Some(id), message: format!("unhandled message {}", encode(&other)) }),
     }
 }
 

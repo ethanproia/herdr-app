@@ -14,17 +14,53 @@ const FIRST_EVAL_MSG: i32 = 1000;
 
 thread_local! {
     static NEXT_MSG: std::cell::Cell<i32> = const { std::cell::Cell::new(FIRST_EVAL_MSG) };
-    /// Evals in flight: DevTools message id -> (browser id, app request id).
-    static EVALS: std::cell::RefCell<std::collections::HashMap<i32, (String, u64)>> = Default::default();
+    /// Runtime.evaluate calls in flight: DevTools message id -> (browser id, app request id, what for).
+    static EVALS: std::cell::RefCell<std::collections::HashMap<i32, (String, u64, Op)>> = Default::default();
 }
 
 /// A `Runtime.evaluate` DevTools message for `expr` in browser `id`, answered by
 /// `on_dev_tools_method_result`. The answer travels browser process to host only: nothing the page
 /// can print or call reaches it, so a page cannot forge an `EvalResult` (SEC3).
 pub fn eval_message(id: &str, req: u64, expr: &str) -> Vec<u8> {
+    evaluate(id, req, Op::Eval, expr)
+}
+
+/// What a Runtime.evaluate answer turns into.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Op {
+    Eval,
+    Overlay { epoch: u64 },
+}
+
+/// Overlay geometry, measured by a privileged DevTools evaluate (the page cannot answer for it).
+/// Rects are viewport CSS px of the top document; `frames` stays empty (no iframe descent yet).
+pub fn overlay_message(id: &str, req: u64, epoch: u64, query: &herdr_browser_protocol::OverlayQuery) -> Vec<u8> {
+    use herdr_browser_protocol::OverlayQuery as Q;
+    const BOX: &str = "r=>({x:r.x,y:r.y,w:r.width,h:r.height})";
+    let expr = match query {
+        Q::HitTest { x, y } => format!("(()=>{{const e=document.elementFromPoint({x},{y});return{{rects:e?[({BOX})(e.getBoundingClientRect())]:[]}}}})()"),
+        Q::Selector { selector } => {
+            let sel = serde_json::to_string(selector).expect("string encodes");
+            format!("(()=>{{let l;try{{l=document.querySelectorAll({sel})}}catch(e){{return{{rects:[],error:String(e)}}}}return{{rects:[...l].slice(0,500).map(e=>({BOX})(e.getBoundingClientRect()))}}}})()")
+        }
+        Q::Selection => format!("(()=>{{const s=getSelection();if(!s||!s.rangeCount)return{{rects:[]}};return{{rects:[...s.getRangeAt(0).getClientRects()].map({BOX})}}}})()"),
+    };
+    evaluate(id, req, Op::Overlay { epoch }, &expr)
+}
+
+/// `{rects: [{x, y, w, h}]}` from an overlay evaluate.
+pub fn overlay_rects(value: &serde_json::Value) -> Vec<herdr_browser_protocol::CssRect> {
+    let f = |v: &serde_json::Value| v.as_f64().unwrap_or(0.0) as f32;
+    value["rects"]
+        .as_array()
+        .map(|a| a.iter().map(|r| herdr_browser_protocol::CssRect { x: f(&r["x"]), y: f(&r["y"]), w: f(&r["w"]), h: f(&r["h"]) }).collect())
+        .unwrap_or_default()
+}
+
+fn evaluate(id: &str, req: u64, op: Op, expr: &str) -> Vec<u8> {
     let msg = NEXT_MSG.get();
     NEXT_MSG.set(if msg == i32::MAX { FIRST_EVAL_MSG } else { msg + 1 });
-    EVALS.with_borrow_mut(|e| e.insert(msg, (id.to_string(), req)));
+    EVALS.with_borrow_mut(|e| e.insert(msg, (id.to_string(), req, op)));
     let call = serde_json::json!({
         "id": msg,
         "method": "Runtime.evaluate",
@@ -36,8 +72,8 @@ pub fn eval_message(id: &str, req: u64, expr: &str) -> Vec<u8> {
 /// The eval for DevTools message `msg` failed to send: forget it.
 pub fn eval_unsent(id: &str) -> Option<u64> {
     EVALS.with_borrow_mut(|e| {
-        let msg = e.iter().filter(|(_, (b, _))| b == id).map(|(m, _)| *m).max()?;
-        e.remove(&msg).map(|(_, req)| req)
+        let msg = e.iter().filter(|(_, (b, _, _))| b == id).map(|(m, _)| *m).max()?;
+        e.remove(&msg).map(|(_, req, _)| req)
     })
 }
 
@@ -132,6 +168,10 @@ wrap_render_handler! {
             if let Some(r) = rect {
                 on_popup_size(&self.id, r.x, r.y, r.width, r.height);
             }
+        }
+
+        fn on_scroll_offset_changed(&self, _browser: Option<&mut Browser>, x: f64, y: f64) {
+            super::on_scroll(&self.id, x, y);
         }
 
         fn on_ime_composition_range_changed(&self, _browser: Option<&mut Browser>, _selected_range: Option<&Range>, character_bounds: Option<&[Rect]>) {
@@ -537,12 +577,21 @@ wrap_dev_tools_message_observer! {
             if message_id >= FIRST_EVAL_MSG {
                 // Only the browser that sent the eval may answer it.
                 let owner = EVALS.with_borrow_mut(|e| match e.get(&message_id) {
-                    Some((b, _)) if *b == self.id => e.remove(&message_id),
+                    Some((b, _, _)) if *b == self.id => e.remove(&message_id),
                     _ => None,
                 });
-                if let Some((id, req)) = owner {
+                if let Some((id, req, op)) = owner {
                     let (ok, value) = eval_outcome(success != 0, result.unwrap_or_default());
-                    send(HostToApp::EvalResult { id, req, ok, value });
+                    match op {
+                        Op::Eval => send(HostToApp::EvalResult { id, req, ok, value }),
+                        Op::Overlay { epoch } => {
+                            if !ok || value.get("error").is_some() {
+                                super::debug(format_args!("{id}: overlay {req} found nothing: {value}"));
+                            }
+                            let rects = if ok { overlay_rects(&value) } else { vec![] };
+                            send(HostToApp::OverlayRects { id, req, epoch, rects, frames: vec![] });
+                        }
+                    }
                 }
                 return;
             }
@@ -596,7 +645,7 @@ mod tests {
         assert_eq!(call["method"], "Runtime.evaluate");
         let msg = call["id"].as_i64().unwrap() as i32;
         assert!(msg >= FIRST_EVAL_MSG);
-        EVALS.with_borrow(|e| assert_eq!(e.get(&msg), Some(&("b1".to_string(), 9))));
+        EVALS.with_borrow(|e| assert_eq!(e.get(&msg), Some(&("b1".to_string(), 9, Op::Eval))));
         assert_eq!(eval_unsent("b1"), Some(9));
         EVALS.with_borrow(|e| assert!(e.get(&msg).is_none()));
     }
