@@ -1,0 +1,8 @@
+<!doctype html><title>scroll</title>
+<style>body{margin:0;font:16px sans-serif} .row{height:40px;display:flex;align-items:center;padding-left:12px}</style>
+<script>
+// 2000 rows, alternating colours, each row's number readable by eval: window.scrollY tells position.
+document.addEventListener('DOMContentLoaded',()=>{const f=document.createDocumentFragment();
+for(let i=0;i<2000;i++){const d=document.createElement('div');d.className='row';d.textContent='row '+i;
+d.style.background=`hsl(${(i*37)%360} 70% 80%)`;f.append(d)}document.body.append(f)});
+</script>

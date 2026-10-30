@@ -466,3 +466,11 @@ fn main() {
     assert!(link.open_ids().is_empty());
     println!("browser block shot passed: {}x{}, scale {scale}, page {}x{} DIPs", image.width(), image.height(), size.w, size.h);
 }
+
+/// The app's control.rs: tests draw their windows themselves, so never "headless" here.
+#[allow(dead_code)]
+mod control {
+    pub fn headless() -> bool {
+        false
+    }
+}

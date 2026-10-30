@@ -120,3 +120,5 @@ cef-rs examples.
   Spotlight skips): `target/` (the one `CARGO_TARGET_DIR`), `wt/` (worktrees), `cef/`
   (`CEF_PATH`), `scratch/`. New worktrees take ghostty with
   `git submodule update --init --reference ~/code/herdr-app/.git/modules/vendor/ghostty vendor/ghostty`.
+
+- **Stale artifacts in a shared target dir.** When several worktrees share one `CARGO_TARGET_DIR` and you switch branches or merge, cargo can reuse a stale build of a workspace crate (symptoms: `no variant named X found` for an enum that has it, or `has no field named Y` for a field that exists). Fix: `touch` the changed source file (for example `crates/herdr-browser-protocol/src/lib.rs`) and rebuild. Seen twice on 2026-10-30 with the protocol crate.

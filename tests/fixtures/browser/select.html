@@ -1,0 +1,16 @@
+<!doctype html><title>select</title>
+<style>body{font:20px serif;margin:20px;line-height:32px} #drop{width:200px;height:100px;border:2px dashed #888;margin-top:20px}
+#drag{width:80px;height:40px;background:#39f;color:#fff} </style>
+<p id=p>The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.</p>
+<div id=drag draggable=true>drag me</div><div id=drop>drop here</div>
+<a id=link href="links.html" style="display:block;margin-top:20px">a link</a>
+<div id=resize style="width:200px;height:40px;cursor:ew-resize;background:#eee;margin-top:10px">resize cursor</div>
+<script>
+// window.selected(): the current selection; window.dropped: true after a drop on #drop; window.menu: last contextmenu target id.
+window.selected=()=>String(getSelection());window.dropped=false;window.menu=null;
+const drop=document.getElementById('drop');drop.addEventListener('dragover',e=>e.preventDefault());
+drop.addEventListener('drop',e=>{e.preventDefault();window.dropped=true});
+document.addEventListener('contextmenu',e=>{window.menu=e.target.id||e.target.tagName});
+document.getElementById('drag').addEventListener('dragstart',e=>e.dataTransfer.setData('text/plain','x'));
+function rect(id){const r=document.getElementById(id).getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}}
+</script>
