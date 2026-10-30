@@ -65,7 +65,7 @@ impl Host {
             }
         });
         let mut h = Host { child, out, rx, ready: HostToApp::Error { id: None, message: String::new() } };
-        h.send(AppToHost::Hello { version: PROTOCOL_VERSION, profile_dir: dir.join("profile").display().to_string(), cdp_port: Some(0) });
+        h.send(AppToHost::Hello { version: PROTOCOL_VERSION, profile_dir: dir.join("profile").display().to_string(), cdp_port: Some(0), cdp_pipe: false });
         h.ready = h.until(Duration::from_secs(30), |m| matches!(m, HostToApp::Ready { .. }));
         h
     }
