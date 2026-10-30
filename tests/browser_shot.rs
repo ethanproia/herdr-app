@@ -243,7 +243,128 @@ fn stub_input() {
     cx.run_until_parked();
 }
 
+/// A window holding `Browsers` the way the app's window does (one block, "web").
+struct Agents {
+    browsers: browser::view::Browsers,
+}
+
+impl Render for Agents {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let v = self.browsers.view("web").cloned();
+        div().size_full().flex().bg(rgb(0x1e1e1e)).child(div().w(px(120.))).child(div().flex_1().h_full().children(v))
+    }
+}
+
+/// `browser.*` through the agent (part 5) as the window runs it: eval and screenshot get their
+/// answers from the host; with real CEF, text typed through the page's input reads back by eval.
+fn agent(program: std::path::PathBuf, args: Vec<String>, url: &str, real: bool) {
+    let dir = std::path::PathBuf::from(format!("/tmp/hb-{}-agent-{}", std::process::id(), args.len()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let link = HostClient::new(HostConfig { dir: dir.clone(), program, args });
+    let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
+    cx.update(gpui_base::init);
+    let block = layout::BrowserBlock { url: url.into(), profile: "default".into() };
+    let window = cx
+        .open_window(size(px(480.), px(300.)), |window, cx| {
+            cx.new(|cx| {
+                let mut browsers = browser::view::Browsers::with_link(link.clone());
+                browsers.sync(vec![("web".into(), block)], window, cx, |_: &mut Agents, _, _, _| {});
+                Agents { browsers }
+            })
+        })
+        .unwrap();
+    let pump = |cx: &mut HeadlessAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            let _ = window.draw(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    let browser = window.update(&mut cx, |a, _, _| a.browsers.view("web").cloned().unwrap()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while cx.update(|cx| browser.read(cx).frame_seq()).is_none() || (real && cx.update(|cx| browser.read(cx).state.loading)) {
+        assert!(Instant::now() < deadline, "the page never painted");
+        pump(&mut cx);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let run = |cx: &mut HeadlessAppContext, name: &str, a: serde_json::Value| -> Result<serde_json::Value, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let step = window.update(cx, |w, _, _| w.browsers.run(name, &a, &|_| None, Box::new(move |r| { let _ = tx.send(r); }))).unwrap();
+        assert!(matches!(step, browser::agent::Step::Done), "{name} is answered by the agent");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(r) = rx.try_recv() {
+                return r;
+            }
+            assert!(Instant::now() < deadline, "{name}: no answer");
+            pump(cx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let id = serde_json::json!({ "id": "web" });
+    let shot = dir.join("page.png");
+    let shot_r = run(&mut cx, "browser.screenshot", serde_json::json!({ "id": "web", "path": shot }));
+    if real {
+        // Type through the page's input (a click to focus the textarea, then text as the
+        // platform's text input delivers it) and read it back from the page.
+        let at = point(px(200.), px(60.));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1, first_mouse: false }), cx);
+            window.dispatch_event(PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1 }), cx);
+        })
+        .unwrap();
+        pump(&mut cx);
+        cx.update_window(window.into(), |_, window, cx| {
+            let input = browser.read(cx).input().clone();
+            input.update(cx, |i, cx| i.replace_text_in_range(None, "typed in herdr", window, cx));
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let value = loop {
+            let v = run(&mut cx, "browser.eval", serde_json::json!({ "id": "web", "expr": "document.querySelector('textarea').value" })).unwrap();
+            if v["value"] == "typed in herdr" || Instant::now() > deadline {
+                break v;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(value["value"], "typed in herdr", "the page's textarea got the typed text: {value}");
+        let shot_r = shot_r.unwrap();
+        let png = std::fs::read(&shot).expect("the screenshot was written");
+        assert!(png.starts_with(b"\x89PNG"), "a PNG at {}", shot.display());
+        println!("agent passed (real CEF): typed text read back by browser.eval; browser.screenshot wrote {} ({} bytes) {shot_r}", shot.display(), png.len());
+    } else {
+        let v = run(&mut cx, "browser.eval", serde_json::json!({ "id": "web", "expr": "1+1" })).unwrap();
+        assert_eq!(v["value"]["expr"], "1+1", "{v}");
+        assert!(shot_r.unwrap_err().contains("no screenshots"), "the stub's screenshot error comes back");
+        let e = run(&mut cx, "browser.eval", serde_json::json!({ "id": "nope", "expr": "1" })).unwrap_err();
+        assert!(e.contains("no browser"), "{e}");
+        // No id: the focused browser; none focused yet, so the command says so.
+        let e = run(&mut cx, "browser.reload", serde_json::json!({})).unwrap_err();
+        assert!(e.contains("focused"), "{e}");
+        assert!(run(&mut cx, "browser.reload", id.clone()).is_ok());
+        println!("agent passed (stub): eval answered, screenshot error relayed, unknown and unfocused targets refused");
+    }
+    // The block goes: the agent's cdp.json forgets it.
+    window.update(&mut cx, |w, window, cx| w.browsers.sync(vec![], window, cx, |_: &mut Agents, _, _, _| {})).unwrap();
+    drop(browser);
+    cx.update_window(window.into(), |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+}
+
+fn agents() {
+    match std::env::var_os("HERDR_BROWSER_HOST") {
+        Some(p) => agent(p.into(), vec!["--stub".into()], "https://example.com", false),
+        None => println!("HERDR_BROWSER_HOST unset: stub agent test skipped"),
+    }
+    match std::env::var_os("HERDR_BROWSER_CEF_HOST") {
+        Some(p) => agent(p.into(), vec![], "data:text/html,<body style='margin:0'><textarea style='width:300px;height:100px'></textarea></body>", true),
+        None => println!("HERDR_BROWSER_CEF_HOST unset: real CEF agent test skipped"),
+    }
+}
+
 fn main() {
+    agents();
     stub_input();
     stub_frames();
     cef_frames();

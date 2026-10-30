@@ -6,6 +6,7 @@
 //! send, replaying every open browser. Each block gets a `BrowserView` that turns host events into
 //! `BrowserState`, sizes the page to the block, hands frames to a `FrameSink` and shows a reload
 //! card after a crash. `Browsers` keeps one view per browser block in the layouts.
+use super::agent::{Agent, Focus, Reply, Step};
 use super::input::{self, BrowserInput};
 use super::{BrowserRegistry, BrowserState, FrameSink, FrameView, HostLink};
 use crate::layout::BrowserBlock;
@@ -68,6 +69,18 @@ struct Shared {
     subs: HashMap<BrowserId, Subscriber>,
     /// Bumped each time a host connection ends; readers of an older one stay quiet.
     generation: u64,
+    /// Hears every host message (the agent commands, part 5).
+    tap: Option<Tap>,
+}
+
+pub type Tap = Arc<dyn Fn(&HostToApp) + Send + Sync>;
+
+/// Hand `msg` to the tap, outside the lock.
+fn tell_tap(shared: &Mutex<Shared>, msg: &HostToApp) {
+    let tap = shared.lock().unwrap().tap.clone();
+    if let Some(tap) = tap {
+        tap(msg);
+    }
 }
 
 /// The app's one connection to `herdr-browser-host` (the `HostLink` every part sends through).
@@ -110,6 +123,11 @@ impl HostClient {
         if was_open {
             self.send(AppToHost::Close { id: id.to_owned() });
         }
+    }
+
+    /// Every host message also goes to `tap` (after the views get theirs).
+    pub fn set_tap(&self, tap: Tap) {
+        self.shared.lock().unwrap().tap = Some(tap);
     }
 
     /// Browsers the host should have open now.
@@ -293,10 +311,11 @@ impl Writer {
     }
 
     fn broadcast_crash(&self, reason: String) {
-        let s = self.shared.lock().unwrap();
-        for tx in s.subs.values() {
-            let _ = tx.try_send(HostToApp::Crashed { id: None, reason: reason.clone() });
+        let crash = HostToApp::Crashed { id: None, reason };
+        for tx in self.shared.lock().unwrap().subs.values() {
+            let _ = tx.try_send(crash.clone());
         }
+        tell_tap(&self.shared, &crash);
     }
 
     fn shutdown(&mut self) {
@@ -339,7 +358,7 @@ fn read(stream: UnixStream, shared: Arc<Mutex<Shared>>, generation: u64) {
         match target(&msg) {
             Some(id) => {
                 if let Some(tx) = s.subs.get(id) {
-                    let _ = tx.try_send(msg);
+                    let _ = tx.try_send(msg.clone());
                 }
             }
             None => {
@@ -348,13 +367,18 @@ fn read(stream: UnixStream, shared: Arc<Mutex<Shared>>, generation: u64) {
                 }
             }
         }
+        drop(s);
+        tell_tap(&shared, &msg);
     }
     let mut s = shared.lock().unwrap();
     if s.generation == generation {
         s.generation += 1;
+        let crash = HostToApp::Crashed { id: None, reason: "the browser host stopped".into() };
         for tx in s.subs.values() {
-            let _ = tx.try_send(HostToApp::Crashed { id: None, reason: "the browser host stopped".into() });
+            let _ = tx.try_send(crash.clone());
         }
+        drop(s);
+        tell_tap(&shared, &crash);
     }
 }
 
@@ -414,6 +438,8 @@ pub fn address_to_url(typed: &str, engine: crate::settings::SearchEngine) -> Opt
 #[derive(Clone, Debug, PartialEq)]
 pub enum BrowserEvent {
     Url(String),
+    /// The page took the keyboard: it is the browser agent commands act on by default.
+    Focused,
 }
 
 /// One browser block on screen.
@@ -432,6 +458,7 @@ pub struct BrowserView {
     acked: Option<u64>,
     focus: FocusHandle,
     input: Entity<BrowserInput>,
+    was_focused: bool,
     /// The page's newest console lines (at most `CONSOLE_KEEP`), oldest first.
     console: std::collections::VecDeque<String>,
     /// The address bar; shows the page's url unless someone is typing in it.
@@ -458,7 +485,10 @@ impl BrowserView {
         let focus = cx.focus_handle();
         // Part 4: mouse, keys and IME for this page; it tells the host about focus too.
         let input = cx.new(|_| BrowserInput::new(id.to_owned(), link.clone() as Arc<dyn HostLink>));
-        let on = cx.on_focus(&focus, window, |v, _, cx| v.input.update(cx, |i, _| i.set_focused(true)));
+        let on = cx.on_focus(&focus, window, |v, _, cx| {
+            v.input.update(cx, |i, _| i.set_focused(true));
+            cx.emit(BrowserEvent::Focused);
+        });
         let off = cx.on_blur(&focus, window, |v, _, cx| v.input.update(cx, |i, _| i.set_focused(false)));
         bind_keys(cx);
         let address = cx.new(|cx| InputState::new(window, cx).placeholder("Search or enter address"));
@@ -490,6 +520,7 @@ impl BrowserView {
             acked: None,
             focus,
             input,
+            was_focused: false,
             console: Default::default(),
             address,
             address_stale: true,
@@ -698,6 +729,10 @@ impl Render for BrowserView {
         }
         // Also checked here: focus events need an active window, which offscreen ones never are.
         let focused = self.focus.is_focused(window);
+        if focused && !self.was_focused {
+            cx.emit(BrowserEvent::Focused);
+        }
+        self.was_focused = focused;
         self.input.update(cx, |i, _| i.set_focused(focused));
         let me = cx.entity().downgrade();
         let (input_el, focus) = (self.input.clone(), self.focus.clone());
@@ -805,6 +840,10 @@ pub struct Browsers {
     link: Option<Arc<HostClient>>,
     views: HashMap<BrowserId, (Entity<BrowserView>, Subscription)>,
     states: Arc<Mutex<HashMap<BrowserId, BrowserState>>>,
+    /// `herdr-app do browser.*` (part 5); hears every host message.
+    agent: Option<Arc<Mutex<Agent>>>,
+    /// The browser that last took the keyboard: agent commands' default target.
+    pub focused: Option<BrowserId>,
 }
 
 impl Browsers {
@@ -813,7 +852,31 @@ impl Browsers {
     }
 
     pub fn link_arc(&mut self) -> Arc<HostClient> {
-        self.link.get_or_insert_with(|| HostClient::new(HostConfig::from_env())).clone()
+        if self.link.is_none() {
+            let link = HostClient::new(HostConfig::from_env());
+            let agent = Arc::new(Mutex::new(Agent::new(link.config().dir.clone())));
+            let a = agent.clone();
+            link.set_tap(Arc::new(move |msg| a.lock().unwrap().on_host(msg)));
+            (self.link, self.agent) = (Some(link), Some(agent));
+        }
+        self.link.clone().expect("made above")
+    }
+
+    /// For tests: browsers over a given link (its agent is made here too).
+    pub fn with_link(link: Arc<HostClient>) -> Self {
+        let agent = Arc::new(Mutex::new(Agent::new(link.config().dir.clone())));
+        let a = agent.clone();
+        link.set_tap(Arc::new(move |msg| a.lock().unwrap().on_host(msg)));
+        Self { link: Some(link), agent: Some(agent), ..Default::default() }
+    }
+
+    /// `herdr-app do browser.<name>`: answered through `reply` (now, or when the host answers).
+    /// `Open` and `Close` come back for the window, which owns the layout.
+    pub fn run(&mut self, name: &str, args: &serde_json::Value, block_of_pane: &dyn Fn(&str) -> Option<BrowserId>, reply: Reply) -> Step {
+        self.link_arc();
+        let agent = self.agent.clone().expect("made with the link");
+        let focus = Focus { focused: self.focused.clone().filter(|f| self.views.contains_key(f)), block_of_pane };
+        agent.lock().unwrap().run(name, args, self, &focus, reply)
     }
 
     /// Match the views to `blocks` (every browser block in every layout, as id and block):
@@ -826,7 +889,16 @@ impl Browsers {
         on_event: impl Fn(&mut W, &str, &BrowserEvent, &mut Context<W>) + Clone + 'static,
     ) {
         let keep: HashSet<&str> = blocks.iter().map(|(id, _)| id.as_str()).collect();
-        self.views.retain(|id, _| keep.contains(id.as_str()));
+        let gone: Vec<BrowserId> = self.views.keys().filter(|id| !keep.contains(id.as_str())).cloned().collect();
+        for id in gone {
+            self.views.remove(&id);
+            if let Some(agent) = &self.agent {
+                agent.lock().unwrap().closed(&id);
+            }
+            if self.focused.as_ref() == Some(&id) {
+                self.focused = None;
+            }
+        }
         for (id, block) in blocks {
             if let Some((v, _)) = self.views.get(&id) {
                 v.update(cx, |v, cx| v.set_block(block, cx));
