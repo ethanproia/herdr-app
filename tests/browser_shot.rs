@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui_base::input::InputEvent;
+use gpui::EntityInputHandler as _;
 
 struct Scene {
     browser: Entity<BrowserView>,
@@ -174,7 +175,76 @@ fn frames(program: std::path::PathBuf, args: Vec<String>, url: &str, ok: impl Fn
     cx.run_until_parked();
 }
 
+/// Clicks, a key and typed text in the block reach the host as `Input` (the stub echoes each
+/// back as a console line), the click focuses the page, and the pointer follows `Cursor`.
+fn stub_input() {
+    let Some(program) = std::env::var_os("HERDR_BROWSER_HOST") else {
+        println!("HERDR_BROWSER_HOST unset: stub input test skipped");
+        return;
+    };
+    let dir = std::path::PathBuf::from(format!("/tmp/hb-{}-input", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let link = HostClient::new(HostConfig { dir, program: program.into(), args: vec!["--stub".into()] });
+    let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
+    cx.update(gpui_base::init);
+    let block = layout::BrowserBlock { url: "https://example.com".into(), profile: "default".into() };
+    let states = Arc::new(Mutex::new(HashMap::new()));
+    let window = cx
+        .open_window(size(px(480.), px(300.)), |window, cx| {
+            let browser = cx.new(|cx| BrowserView::new("web", block, link.clone(), states.clone(), window, cx));
+            cx.new(|_| Scene { browser, left: 120. })
+        })
+        .unwrap();
+    let browser = window.update(&mut cx, |scene, _, _| scene.browser.clone()).unwrap();
+    let pump = |cx: &mut HeadlessAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            let _ = window.draw(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    let wait = |cx: &mut HeadlessAppContext, what: &str, want: &dyn Fn(&str) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            pump(cx);
+            if cx.update(|cx| browser.read(cx).console().any(|l| want(l))) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "host never saw {what}: {:?}", cx.update(|cx| browser.read(cx).console().map(str::to_owned).collect::<Vec<_>>()));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    while cx.update(|cx| browser.read(cx).frame_seq()).is_none() {
+        pump(&mut cx);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // A click at window (300, 150) is page DIP (180, 122): block x 120, bar 28.
+    let at = point(px(300.), px(150.));
+    cx.update_window(window.into(), |_, window, cx| {
+        window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1, first_mouse: false }), cx);
+        window.dispatch_event(PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::default(), click_count: 1 }), cx);
+    })
+    .unwrap();
+    wait(&mut cx, "focus", &|l| l == "focus true");
+    wait(&mut cx, "the click", &|l| l.contains(r#""kind":"down""#) && l.contains(r#""x":180.0"#) && l.contains(r#""y":122.0"#));
+    // A key, then text as the platform's text input delivers it.
+    cx.update_window(window.into(), |_, window, cx| {
+        window.dispatch_event(PlatformInput::KeyDown(KeyDownEvent { keystroke: Keystroke::parse("enter").unwrap(), is_held: false, prefer_character_input: false }), cx);
+        let input = browser.read(cx).input().clone();
+        input.update(cx, |i, cx| i.replace_text_in_range(None, "hé", window, cx));
+    })
+    .unwrap();
+    wait(&mut cx, "Enter", &|l| l.contains(r#""key":"Enter""#));
+    wait(&mut cx, "the text", &|l| l.contains(r#""type":"text""#) && l.contains("hé"));
+    println!("stub input passed: click at page (180, 122), focus, Enter and text reached the host");
+    drop(browser);
+    cx.update_window(window.into(), |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+}
+
 fn main() {
+    stub_input();
     stub_frames();
     cef_frames();
     let dir = std::path::PathBuf::from(format!("/tmp/hb-{}-shot", std::process::id()));

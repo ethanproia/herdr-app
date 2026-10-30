@@ -6,6 +6,7 @@
 //! send, replaying every open browser. Each block gets a `BrowserView` that turns host events into
 //! `BrowserState`, sizes the page to the block, hands frames to a `FrameSink` and shows a reload
 //! card after a crash. `Browsers` keeps one view per browser block in the layouts.
+use super::input::{self, BrowserInput};
 use super::{BrowserRegistry, BrowserState, FrameSink, FrameView, HostLink};
 use crate::layout::BrowserBlock;
 use gpui::prelude::FluentBuilder as _;
@@ -19,6 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
+
+/// Console lines a block keeps.
+const CONSOLE_KEEP: usize = 200;
 
 /// How long a fresh host gets to open its socket.
 const HOST_START: Duration = Duration::from_secs(10);
@@ -427,6 +431,9 @@ pub struct BrowserView {
     /// The last frame acked (each frame is acked once, however often it's painted).
     acked: Option<u64>,
     focus: FocusHandle,
+    input: Entity<BrowserInput>,
+    /// The page's newest console lines (at most `CONSOLE_KEEP`), oldest first.
+    console: std::collections::VecDeque<String>,
     /// The address bar; shows the page's url unless someone is typing in it.
     address: Entity<InputState>,
     address_stale: bool,
@@ -449,8 +456,10 @@ impl BrowserView {
             }
         });
         let focus = cx.focus_handle();
-        let on = cx.on_focus(&focus, window, |v, _, _| v.link.send(AppToHost::Focus { id: v.id.clone(), focused: true }));
-        let off = cx.on_blur(&focus, window, |v, _, _| v.link.send(AppToHost::Focus { id: v.id.clone(), focused: false }));
+        // Part 4: mouse, keys and IME for this page; it tells the host about focus too.
+        let input = cx.new(|_| BrowserInput::new(id.to_owned(), link.clone() as Arc<dyn HostLink>));
+        let on = cx.on_focus(&focus, window, |v, _, cx| v.input.update(cx, |i, _| i.set_focused(true)));
+        let off = cx.on_blur(&focus, window, |v, _, cx| v.input.update(cx, |i, _| i.set_focused(false)));
         bind_keys(cx);
         let address = cx.new(|cx| InputState::new(window, cx).placeholder("Search or enter address"));
         let typed = cx.subscribe_in(&address, window, |v, input, ev: &InputEvent, window, cx| match ev {
@@ -480,6 +489,8 @@ impl BrowserView {
             frames: FrameView::new(),
             acked: None,
             focus,
+            input,
+            console: Default::default(),
             address,
             address_stale: true,
             states,
@@ -487,6 +498,16 @@ impl BrowserView {
             _focus: [on, off],
             _address: typed,
         }
+    }
+
+    /// The page's input (part 4); the platform's text input reaches it as `EntityInputHandler`.
+    pub fn input(&self) -> &Entity<BrowserInput> {
+        &self.input
+    }
+
+    /// The page's newest console lines, oldest first.
+    pub fn console(&self) -> impl Iterator<Item = &str> {
+        self.console.iter().map(String::as_str)
     }
 
     /// The address bar's text state (tests type into it).
@@ -556,6 +577,17 @@ impl BrowserView {
                     // Unpaintable: ack anyway, or the host waits on it forever.
                     self.link.send(AppToHost::FrameAck { id: self.id.clone(), seq });
                 }
+            }
+            H::Console { message, .. } => {
+                if self.console.len() == CONSOLE_KEEP {
+                    self.console.pop_front();
+                }
+                self.console.push_back(message);
+                return;
+            }
+            H::ImeCaret { x, y, w, h, .. } => {
+                self.input.update(cx, |i, _| i.on_caret(x, y, w, h));
+                return;
             }
             H::Error { message, .. } => tracing::warn!("browser {}: {message}", self.id),
             _ => return,
@@ -664,17 +696,24 @@ impl Render for BrowserView {
             let url = self.state.url.clone();
             self.address.update(cx, |a, cx| a.set_value(url, window, cx));
         }
+        // Also checked here: focus events need an active window, which offscreen ones never are.
+        let focused = self.focus.is_focused(window);
+        self.input.update(cx, |i, _| i.set_focused(focused));
         let me = cx.entity().downgrade();
+        let (input_el, focus) = (self.input.clone(), self.focus.clone());
         let page = div()
             .id("page")
             .relative()
             .flex_1()
             .min_h_0()
             .track_focus(&self.focus)
-            .on_any_mouse_down(cx.listener(|v, _, window, cx| {
+            .cursor(input::cursor_style(&self.state.cursor))
+            // A click focuses the page, in the capture phase: part 4's listeners stop the event.
+            .capture_any_mouse_down(cx.listener(|v, _, window, cx| {
                 window.focus(&v.focus, cx);
             }))
-            .bg(rgb(0xffffff))
+            .bg(rgb(0xffffff));
+        let page = input::listen(page, &self.input)
             // Measures the page area; a new size reaches the host after this frame.
             .child(
                 canvas(
@@ -686,7 +725,8 @@ impl Render for BrowserView {
                             let _ = me.update(cx, |v, _| v.laid_out(size, scale));
                         });
                     },
-                    |_, _, _, _| {},
+                    // Where the page is, and the window's text input (IME) while focused.
+                    move |bounds, _, window, cx| input::paint(&input_el, &focus, bounds, window, cx),
                 )
                 .absolute()
                 .size_full(),
