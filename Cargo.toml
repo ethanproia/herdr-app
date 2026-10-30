@@ -58,6 +58,11 @@ path = "tests/browser_shot.rs"
 harness = false
 
 [[test]]
+name = "browser_perf"
+path = "tests/browser_perf.rs"
+harness = false
+
+[[test]]
 name = "browser_parity_smoke"
 path = "tests/browser_parity_smoke.rs"
 harness = false
