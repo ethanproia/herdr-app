@@ -7,13 +7,14 @@
 //! `BrowserState`, sizes the page to the block, hands frames to a `FrameSink` and shows a reload
 //! card after a crash. `Browsers` keeps one view per browser block in the layouts.
 use super::agent::{Agent, Focus, Reply, Step};
+use super::geometry::{Change, Epoch, Geometry, HoverSend, OverlayAnswer, OverlayState, Pt, Rect, zoom_factor};
 use super::input::{self, BrowserInput};
 use super::{BrowserRegistry, BrowserState, FrameSink, FrameView, HostLink};
 use crate::layout::BrowserBlock;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_base::input::{Input, InputEvent, InputState};
-use herdr_browser_protocol::{self as protocol, AppToHost, BrowserId, HostToApp, PixelSize, Size as Dips};
+use herdr_browser_protocol::{self as protocol, OverlayQuery, AppToHost, BrowserId, HostToApp, PixelSize, Size as Dips};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -398,6 +399,7 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
         H::Crashed { id, .. } | H::Error { id, .. } => id.as_ref(),
         H::Frame { id, .. }
         | H::Title { id, .. }
+        | H::ContextMenu { id, .. }
         | H::Url { id, .. }
         | H::Loading { id, .. }
         | H::Cursor { id, .. }
@@ -483,6 +485,88 @@ pub struct BrowserView {
     _address: Subscription,
     _visibility: Subscription,
     probe: Option<FrameProbe>,
+    /// Page overlays (highlight, pick, find matches): epochs and hover coalescing (geometry.rs).
+    overlay: OverlayState,
+    /// Chrome zoom level the page reported (`Viewport`).
+    zoom_level: f64,
+    /// The open context menu (the host asked; the app draws it).
+    menu: Option<Menu>,
+}
+
+/// App-handled context menu commands (CEF's MENU_ID_USER_FIRST and up): the app does these itself.
+pub const MENU_OPEN_LINK_IN_NEW_TAB: i32 = 26500;
+pub const MENU_COPY_LINK_ADDRESS: i32 = 26501;
+pub const MENU_SAVE_IMAGE_AS: i32 = 26502;
+
+/// Height of one context menu row and the menu's width, in DIPs.
+pub const MENU_ROW: f32 = 24.0;
+pub const MENU_WIDTH: f32 = 220.0;
+
+/// A context menu the host asked for, as the app shows it.
+#[derive(Clone, Debug)]
+pub struct Menu {
+    pub req: u64,
+    /// Where it opens, page DIPs.
+    pub at: (f32, f32),
+    /// Rows, submenus flattened (their labels prefixed); command 0 is a separator.
+    pub rows: Vec<herdr_browser_protocol::MenuItem>,
+    pub link_url: Option<String>,
+    pub src_url: Option<String>,
+}
+
+impl Menu {
+    /// The host's items plus the app's own for a link or an image, in Chrome's order.
+    pub fn build(req: u64, x: f32, y: f32, link_url: Option<String>, src_url: Option<String>, items: Vec<herdr_browser_protocol::MenuItem>) -> Menu {
+        use herdr_browser_protocol::MenuItem;
+        let item = |command, label: &str| MenuItem { command, label: label.into(), enabled: true, checked: false, submenu: vec![] };
+        let sep = || MenuItem { command: 0, label: String::new(), enabled: false, checked: false, submenu: vec![] };
+        let mut rows = Vec::new();
+        if link_url.is_some() {
+            rows.push(item(MENU_OPEN_LINK_IN_NEW_TAB, "Open Link in New Tab"));
+            rows.push(item(MENU_COPY_LINK_ADDRESS, "Copy Link Address"));
+            rows.push(sep());
+        }
+        if src_url.is_some() {
+            rows.push(item(MENU_SAVE_IMAGE_AS, "Save Image As…"));
+            rows.push(sep());
+        }
+        fn flatten(out: &mut Vec<herdr_browser_protocol::MenuItem>, items: Vec<herdr_browser_protocol::MenuItem>, prefix: &str) {
+            for mut i in items {
+                let sub = std::mem::take(&mut i.submenu);
+                if sub.is_empty() {
+                    if !prefix.is_empty() && i.command != 0 {
+                        i.label = format!("{prefix} › {}", i.label);
+                    }
+                    out.push(i);
+                } else {
+                    flatten(out, sub, &i.label);
+                }
+            }
+        }
+        flatten(&mut rows, items, "");
+        // No leading, trailing or doubled separators.
+        let mut clean: Vec<MenuItem> = Vec::new();
+        for r in rows {
+            if r.command == 0 && clean.last().is_none_or(|l| l.command == 0) {
+                continue;
+            }
+            clean.push(r);
+        }
+        while clean.last().is_some_and(|l| l.command == 0) {
+            clean.pop();
+        }
+        Menu { req, at: (x, y), rows: clean, link_url, src_url }
+    }
+
+    /// The row at page point (x, y), if it's a command row.
+    pub fn row_at(&self, x: f32, y: f32) -> Option<usize> {
+        let (mx, my) = self.at;
+        if x < mx || x > mx + MENU_WIDTH || y < my + 4.0 {
+            return None;
+        }
+        let i = ((y - my - 4.0) / MENU_ROW) as usize;
+        self.rows.get(i).filter(|r| r.command != 0).map(|_| i)
+    }
 }
 
 /// What a frame probe hears (`BrowserView::set_frame_probe`). `Painted` comes with every draw
@@ -570,6 +654,9 @@ impl BrowserView {
             _address: typed,
             _visibility: visibility,
             probe: None,
+            overlay: OverlayState::default(),
+            zoom_level: 0.0,
+            menu: None,
         }
     }
 
@@ -623,6 +710,7 @@ impl BrowserView {
         use HostToApp as H;
         match msg {
             H::Url { url, .. } => {
+                self.overlay.changed(Change::Navigate);
                 if url != self.state.url {
                     self.state.url = url.clone();
                     self.block.url = url.clone();
@@ -666,6 +754,29 @@ impl BrowserView {
                 self.console.push_back(message);
                 return;
             }
+            H::Viewport { zoom_level, .. } => {
+                let why = if zoom_level != self.zoom_level { Change::Zoom } else { Change::Scroll };
+                self.zoom_level = zoom_level;
+                self.overlay.changed(why);
+                self.send_waiting_hover();
+            }
+            H::OverlayRects { req, epoch, rects, frames, .. } => {
+                let answer = OverlayAnswer {
+                    req,
+                    epoch: Epoch(epoch),
+                    rects: rects.iter().map(|r| Rect::new(r.x, r.y, r.w, r.h)).collect(),
+                    frames: frames.iter().map(|p| Pt { x: p.x, y: p.y }).collect(),
+                };
+                let geo = self.geometry();
+                self.overlay.answer(&answer, &geo);
+                self.send_waiting_hover();
+            }
+            H::ContextMenu { req, x, y, link_url, src_url, items, .. } => {
+                if let Some(old) = self.menu.take() {
+                    self.link.send(AppToHost::MenuResult { id: self.id.clone(), req: old.req, command: None });
+                }
+                self.menu = Some(Menu::build(req, x, y, link_url, src_url, items));
+            }
             H::NewWindow { url, .. } => {
                 cx.emit(BrowserEvent::NewWindow(url));
                 return;
@@ -696,6 +807,7 @@ impl BrowserView {
             Some((s, k)) if (s.w - size.w).abs() < 0.5 && (s.h - size.h).abs() < 0.5 && k == scale => return,
             Some(_) => {
                 self.frames.on_resize_pending(size);
+                self.overlay.changed(Change::Resize);
                 self.link.send(AppToHost::Resize { id: self.id.clone(), size, scale });
             }
         }
@@ -728,6 +840,129 @@ impl BrowserView {
                 p(&FrameEvent::Acked { seq });
             }
         }
+    }
+
+    /// The page's geometry, with the page area's top-left as the origin (overlays draw inside it).
+    pub fn geometry(&self) -> Geometry {
+        let ((w, h), scale) = self.sized.map_or(((0.0, 0.0), 1.0), |(s, k)| ((s.w, s.h), k));
+        Geometry { zoom: zoom_factor(self.zoom_level), origin: Pt::default(), scale, size: Pt { x: w, y: h } }
+    }
+
+    /// Ask the page for overlay rects (a selector, the selection); they show when the answer is current.
+    /// Returns the request id and epoch it was sent with.
+    pub fn request_overlay(&mut self, query: OverlayQuery) -> (u64, u64) {
+        let (req, epoch) = self.overlay.request();
+        self.link.send(AppToHost::Overlay { id: self.id.clone(), req, epoch: epoch.0, query });
+        (req, epoch.0)
+    }
+
+    /// The pointer is over the page at `at` (page DIPs): a coalesced hit test for a highlight.
+    pub fn hover_overlay(&mut self, at: Pt) {
+        let css = self.geometry().page_to_viewport(at);
+        if let HoverSend::Now { req, epoch, at } = self.overlay.hover(css) {
+            self.link.send(AppToHost::Overlay { id: self.id.clone(), req, epoch: epoch.0, query: OverlayQuery::HitTest { x: at.x, y: at.y } });
+        }
+    }
+
+    fn send_waiting_hover(&mut self) {
+        if let Some(HoverSend::Now { req, epoch, at }) = self.overlay.next_hover() {
+            self.link.send(AppToHost::Overlay { id: self.id.clone(), req, epoch: epoch.0, query: OverlayQuery::HitTest { x: at.x, y: at.y } });
+        }
+    }
+
+    /// Overlay rects to draw now, in page DIPs (empty while stale).
+    pub fn overlay_rects(&self) -> &[Rect] {
+        self.overlay.shown()
+    }
+
+    /// The open context menu, if any.
+    pub fn menu(&self) -> Option<&Menu> {
+        self.menu.as_ref()
+    }
+
+    /// Run menu row `row` (or dismiss with None): app commands here, the rest by the host.
+    pub fn choose_menu(&mut self, row: Option<usize>, cx: &mut Context<Self>) {
+        let Some(menu) = self.menu.take() else { return };
+        let item = row.and_then(|r| menu.rows.get(r)).filter(|i| i.enabled && i.command != 0);
+        let command = match item.map(|i| i.command) {
+            Some(MENU_OPEN_LINK_IN_NEW_TAB) => {
+                if let Some(url) = menu.link_url.clone() {
+                    cx.emit(BrowserEvent::NewWindow(url));
+                }
+                None
+            }
+            Some(MENU_COPY_LINK_ADDRESS) => {
+                if let Some(url) = &menu.link_url {
+                    cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                }
+                None
+            }
+            Some(MENU_SAVE_IMAGE_AS) => {
+                // The page downloads it (the host's download flow saves it and tells the app).
+                if let Some(src) = &menu.src_url {
+                    let expr = format!("(()=>{{const a=document.createElement('a');a.href={};a.download='';document.body.append(a);a.click();a.remove();return true}})()", serde_json::Value::String(src.clone()));
+                    self.link.send(AppToHost::Eval { id: self.id.clone(), req: 0, expr });
+                }
+                None
+            }
+            other => other,
+        };
+        self.link.send(AppToHost::MenuResult { id: self.id.clone(), req: menu.req, command });
+        cx.notify();
+    }
+
+    fn menu_element(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.menu.as_ref()?;
+        let rows = menu.rows.iter().enumerate().map(|(i, r)| {
+            if r.command == 0 {
+                return div().h(px(MENU_ROW)).flex().items_center().child(div().w_full().h(px(1.)).bg(rgb(0xd0d0d0))).into_any_element();
+            }
+            let enabled = r.enabled;
+            div()
+                .id(("menu-row", i))
+                .h(px(MENU_ROW))
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_sm()
+                .text_sm()
+                .when(!enabled, |d| d.text_color(rgb(0xa0a0a0)))
+                .when(enabled, |d| d.hover(|d| d.bg(rgb(0x2563eb)).text_color(rgb(0xffffff))))
+                .child(if r.checked { "✓" } else { " " })
+                .child(r.label.clone())
+                .on_mouse_down(MouseButton::Left, cx.listener(move |v, _, _, cx| {
+                    cx.stop_propagation();
+                    if enabled {
+                        v.choose_menu(Some(i), cx);
+                    }
+                }))
+                .into_any_element()
+        });
+        Some(
+            div()
+                .id("context-menu")
+                .absolute()
+                .left(px(menu.at.0))
+                .top(px(menu.at.1))
+                .w(px(MENU_WIDTH))
+                .py(px(4.))
+                .bg(rgb(0xffffff))
+                .text_color(rgb(0x1a1a1a))
+                .border_1()
+                .border_color(rgb(0xc8c8c8))
+                .rounded_md()
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down_out(cx.listener(|v, _, _, cx| v.choose_menu(None, cx)))
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    /// The page zoom level (Chrome's: 0 is 100 %).
+    pub fn zoom_level(&self) -> f64 {
+        self.zoom_level
     }
 
     /// Tests and the parity harness: hear each frame arrive, paint and get acked.
@@ -888,11 +1123,25 @@ impl Render for BrowserView {
                     ),
             ),
         };
+        // Current overlay rects (stale ones are already gone), outlined over the frame.
+        let page = page.children(self.overlay.shown().iter().map(|r| {
+            div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_2().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.15))
+        }));
+        // The context menu over everything in the page; it takes the mouse first (occlude).
+        let menu = self.menu_element(cx);
+        let page = page.children(menu);
         div()
             .size_full()
             .flex()
             .flex_col()
             .key_context("Browser")
+            // Escape closes an open context menu before the page sees the key.
+            .capture_key_down(cx.listener(|v, ev: &KeyDownEvent, _, cx| {
+                if v.menu.is_some() && ev.keystroke.key == "escape" {
+                    cx.stop_propagation();
+                    v.choose_menu(None, cx);
+                }
+            }))
             .on_action(cx.listener(|v, _: &FocusAddress, window, cx| {
                 v.address.update(cx, |a, cx| {
                     a.focus(window, cx);

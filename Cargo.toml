@@ -63,8 +63,23 @@ path = "tests/browser_perf.rs"
 harness = false
 
 [[test]]
+name = "browser_input"
+path = "tests/browser_input.rs"
+harness = false
+
+[[test]]
 name = "browser_parity_smoke"
 path = "tests/browser_parity_smoke.rs"
+harness = false
+
+[[test]]
+name = "browser_geometry"
+path = "tests/browser_geometry.rs"
+harness = false
+
+[[test]]
+name = "browser_menu"
+path = "tests/browser_menu.rs"
 harness = false
 
 [dev-dependencies]

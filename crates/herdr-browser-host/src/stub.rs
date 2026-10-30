@@ -160,6 +160,7 @@ impl<A: SurfaceAlloc> StubHost<A> {
             // The stub knows no page: an overlay query answers with no rects, echoing req and epoch.
             M::Overlay { req, epoch, .. } => out.push(HostToApp::OverlayRects { id: id.clone(), req, epoch, rects: vec![], frames: vec![] }),
             // The stub paints nothing real; visibility changes are only echoed.
+            M::MenuResult { command, .. } => out.push(echo(&id, format!("menu {command:?}"))),
             M::Edit { command, .. } => out.push(echo(&id, format!("edit {}", encode(&command).trim_matches('"')))),
             M::Eval { req, expr, .. } => {
                 out.push(HostToApp::EvalResult { id, req, ok: true, value: serde_json::json!({ "stub": true, "expr": expr }) })
@@ -215,7 +216,7 @@ fn browser_id(m: &AppToHost) -> &str {
     use AppToHost as M;
     match m {
         M::Create { id, .. } | M::Close { id } | M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. }
-        | M::Stop { id } | M::Resize { id, .. } | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Overlay { id, .. } | M::SetVisible { id, .. } | M::Input { id, .. } | M::Edit { id, .. }
+        | M::Stop { id } | M::Resize { id, .. } | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Overlay { id, .. } | M::SetVisible { id, .. } | M::MenuResult { id, .. } | M::Input { id, .. } | M::Edit { id, .. }
         | M::FrameAck { id, .. } | M::Find { id, .. } | M::StopFind { id, .. } | M::DevTools { id, .. } | M::Eval { id, .. }
         | M::Screenshot { id, .. } | M::FileChooserResult { id, .. } | M::DialogResult { id, .. } => id,
         M::Hello { .. } | M::SetColorScheme { .. } | M::Shutdown => "",
