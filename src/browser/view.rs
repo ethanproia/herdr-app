@@ -8,13 +8,14 @@
 //! card after a crash. `Browsers` keeps one view per browser block in the layouts.
 use super::agent::{Agent, Focus, Reply, Step};
 use super::geometry::{Change, Epoch, Geometry, HoverSend, OverlayAnswer, OverlayState, Pt, Rect, zoom_factor};
-use super::input::{self, BrowserInput};
+use super::input::{self, BrowserInput, OverlayEvent, Owner};
+use super::markup::{self, Markup, Tool};
 use super::{BrowserRegistry, BrowserState, FrameSink, FrameView, HostLink};
 use crate::layout::BrowserBlock;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_base::input::{Input, InputEvent, InputState};
-use herdr_browser_protocol::{self as protocol, OverlayQuery, AppToHost, BrowserId, HostToApp, PixelSize, Size as Dips};
+use herdr_browser_protocol::{self as protocol, MouseKind, OverlayQuery, AppToHost, BrowserId, HostToApp, PixelSize, Size as Dips};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -455,6 +456,8 @@ pub enum BrowserEvent {
     Focused,
     /// A link or script asked for a new window or tab: the window opens a block beside this one.
     NewWindow(String),
+    /// Pick mode: the user clicked an element at (x, y) page DIPs (its highlight is the overlay).
+    Picked { x: f32, y: f32 },
 }
 
 /// One browser block on screen.
@@ -494,6 +497,12 @@ pub struct BrowserView {
     menu: Option<Menu>,
     /// The find bar, when open (I9).
     find: Option<FindBar>,
+    /// Markup drawn over the page (markup.rs); shown while marking up or when shapes exist.
+    markup: Entity<Markup>,
+    /// When the user's input was last refused under an agent lease (the strip flashes).
+    refused_at: Option<std::time::Instant>,
+    /// Whether the mode strip (markup tools, the agent lease) was drawn last render.
+    strip_shown: bool,
 }
 
 /// The find bar: its input, what was last searched and the host's "active of count".
@@ -662,6 +671,9 @@ impl BrowserView {
             scroll: (0.0, 0.0),
             menu: None,
             find: None,
+            markup: cx.new(|_| Markup::default()),
+            refused_at: None,
+            strip_shown: false,
         }
     }
 
@@ -896,9 +908,144 @@ impl BrowserView {
         self.overlay.shown()
     }
 
+    /// Drain what `BrowserInput` routed away from the page (part 4's owners): markup draws,
+    /// pick hovers the highlight, a refusal flashes the lease strip, an owner change re-renders.
+    pub fn drain_overlay(&mut self, cx: &mut Context<Self>) {
+        let events = self.input.update(cx, |i, _| i.take_overlay());
+        if events.is_empty() {
+            return;
+        }
+        for ev in &events {
+            match ev {
+                OverlayEvent::Pointer { owner: Owner::Pick, kind, x, y, .. } => match kind {
+                    MouseKind::Move => self.hover_overlay(Pt { x: *x, y: *y }),
+                    MouseKind::Down => self.hover_overlay(Pt { x: *x, y: *y }),
+                    // The click's release picks what is highlighted and ends pick (after the
+                    // release, so the page never gets a stray button-up).
+                    MouseKind::Up => {
+                        self.hover_overlay(Pt { x: *x, y: *y });
+                        self.input.update(cx, |i, _| {
+                            i.escape();
+                        });
+                        cx.emit(BrowserEvent::Picked { x: *x, y: *y });
+                    }
+                    _ => {}
+                },
+                OverlayEvent::Pointer { owner: Owner::Markup, .. } | OverlayEvent::Edit { owner: Owner::Markup, .. } => {
+                    self.markup.update(cx, |m, _| m.on_event(ev));
+                }
+                OverlayEvent::Refused => self.refused_at = Some(std::time::Instant::now()),
+                _ => {}
+            }
+        }
+        // The input owner may have pushed more while handling (an Owner change after escape).
+        let more = self.input.update(cx, |i, _| i.take_overlay());
+        for ev in &more {
+            if let OverlayEvent::Pointer { owner: Owner::Markup, .. } | OverlayEvent::Edit { owner: Owner::Markup, .. } = ev {
+                self.markup.update(cx, |m, _| m.on_event(ev));
+            }
+        }
+        cx.notify();
+    }
+
+    /// The input owner on top (Browse, Pick, Comment, Markup, Agent).
+    pub fn owner(&self, cx: &App) -> Owner {
+        self.input.read(cx).owner()
+    }
+
+    /// The markup layer (tests and the attach flow read and burn it).
+    pub fn markup(&self) -> &Entity<Markup> {
+        &self.markup
+    }
+
+    /// Toggle a mode (Pick or Markup): enter it, or leave it when it is on top.
+    pub fn toggle_mode(&mut self, owner: Owner, cx: &mut Context<Self>) {
+        self.input.update(cx, |i, _| {
+            if i.owner() == owner {
+                i.escape();
+            } else {
+                i.enter(owner);
+            }
+        });
+        self.drain_overlay(cx);
+        cx.notify();
+    }
+
+    /// "Take Control": the agent's lease ends, the user has the page again.
+    pub fn take_control(&mut self, cx: &mut Context<Self>) {
+        self.input.update(cx, |i, _| i.end_lease());
+        self.drain_overlay(cx);
+        cx.notify();
+    }
+
+    fn mode_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let input = self.input.read(cx);
+        let owner = input.owner();
+        if let Some(agent) = input.lease().map(str::to_owned) {
+            let flash = self.refused_at.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(600));
+            return Some(
+                div()
+                    .id("lease-strip")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .h(px(FIND_HEIGHT))
+                    .px_2()
+                    .text_xs()
+                    .bg(if flash { rgb(0xf59e0b) } else { rgb(0x7c3aed) })
+                    .text_color(rgb(0xffffff))
+                    .child(format!("{agent} is driving"))
+                    .child("·")
+                    .child(div().id("take-control").px_1().rounded_sm().cursor_pointer().bg(hsla(0., 0., 1., 0.2)).child("Take Control").on_click(cx.listener(|v, _, _, cx| v.take_control(cx))))
+                    .into_any_element(),
+            );
+        }
+        if owner != Owner::Markup {
+            return None;
+        }
+        let tool = self.markup.read(cx).tool;
+        let tool_button = |id: &'static str, label: &'static str, t: Tool| {
+            div()
+                .id(id)
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .when(tool == t, |d| d.bg(hsla(0., 0., 0.5, 0.3)))
+                .child(label)
+                .on_click(cx.listener(move |v, _, _, cx| {
+                    v.markup.update(cx, |m, _| m.tool = t);
+                    cx.notify();
+                }))
+        };
+        Some(
+            div()
+                .id("markup-strip")
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .h(px(FIND_HEIGHT))
+                .px_2()
+                .text_xs()
+                .bg(hsla(0.0, 0.9, 0.55, 0.15))
+                .child("Markup")
+                .child(tool_button("tool-pen", "Pen", Tool::Pen))
+                .child(tool_button("tool-rect", "Rect", Tool::Rect))
+                .child(tool_button("tool-ellipse", "Ellipse", Tool::Ellipse))
+                .child(tool_button("tool-arrow", "Arrow", Tool::Arrow))
+                .child(div().id("markup-undo").px_1().cursor_pointer().child("Undo").on_click(cx.listener(|v, _, _, cx| {
+                    v.markup.update(cx, |m, _| m.undo());
+                    cx.notify();
+                })))
+                .child(div().id("markup-done").px_1().cursor_pointer().child("Done").on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Markup, cx))))
+                .into_any_element(),
+        )
+    }
+
     /// Where the page area starts under the bars, in DIPs from the block's top.
     pub fn page_top(&self) -> f32 {
-        CHROME_HEIGHT + if self.find.is_some() { FIND_HEIGHT } else { 0.0 }
+        CHROME_HEIGHT + if self.find.is_some() { FIND_HEIGHT } else { 0.0 } + if self.strip_shown { FIND_HEIGHT } else { 0.0 }
     }
 
     /// The find bar's state: (text, active, count), when open.
@@ -1140,6 +1287,9 @@ impl BrowserView {
             })
             .child(div().flex_1().min_w_0().overflow_hidden().child(Input::new(&self.address)))
             .when(self.state.loading, |d| d.child("loading"))
+            // Modes (part 4's owners): pick an element, mark up the page.
+            .child(button("⌖", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx))))
+            .child(button("✎", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Markup, cx))))
     }
 
     fn shown_url(&self) -> String {
@@ -1247,13 +1397,34 @@ impl Render for BrowserView {
         let page = page.children(self.overlay.shown().iter().map(|r| {
             div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_2().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.15))
         }));
+        // Markup above the frame and the highlights, while marking up or when shapes exist.
+        let marking = self.owner(cx) == Owner::Markup || !self.markup.read(cx).shapes().is_empty();
+        let page = page.when(marking, |p| p.child(markup::element(self.markup.clone())));
         // The context menu over everything in the page; it takes the mouse first (occlude).
         let menu = self.menu_element(cx);
         let page = page.children(menu);
+        let strip = self.mode_strip(cx);
+        self.strip_shown = strip.is_some();
+        // After any input event, drain what BrowserInput routed away from the page (its own
+        // listeners may stop the event, so the drain is deferred to after dispatch).
+        let drain = |cx: &mut Context<Self>, window: &mut Window| {
+            let me = cx.entity().downgrade();
+            window.defer(cx, move |_, cx| {
+                let _ = me.update(cx, |v, cx| v.drain_overlay(cx));
+            });
+        };
         div()
             .size_full()
             .flex()
             .flex_col()
+            .capture_any_mouse_down(cx.listener(move |_, _, window, cx| drain(cx, window)))
+            .capture_any_mouse_up(cx.listener(move |_, _, window, cx| drain(cx, window)))
+            .on_mouse_move(cx.listener(move |v, _, window, cx| {
+                if v.owner(cx) != Owner::Browse {
+                    drain(cx, window);
+                }
+            }))
+            .capture_key_down(cx.listener(move |_, _, window, cx| drain(cx, window)))
             .key_context("Browser")
             // Escape closes an open context menu, else an open find bar, before the page sees it.
             .capture_key_down(cx.listener(|v, ev: &KeyDownEvent, window, cx| {
@@ -1277,6 +1448,7 @@ impl Render for BrowserView {
             }))
             .child(self.chrome(cx))
             .children(self.find_bar(cx))
+            .children(strip)
             .child(page)
     }
 }
