@@ -488,6 +488,8 @@ pub struct BrowserView {
     overlay: OverlayState,
     /// Chrome zoom level the page reported (`Viewport`).
     zoom_level: f64,
+    /// The page's scroll offset the host last reported (CSS px).
+    scroll: (f32, f32),
     /// The open context menu (the host asked; the app draws it).
     menu: Option<Menu>,
     /// The find bar, when open (I9).
@@ -657,6 +659,7 @@ impl BrowserView {
             probe: None,
             overlay: OverlayState::default(),
             zoom_level: 0.0,
+            scroll: (0.0, 0.0),
             menu: None,
             find: None,
         }
@@ -712,7 +715,9 @@ impl BrowserView {
         use HostToApp as H;
         match msg {
             H::Url { url, .. } => {
-                self.overlay.changed(Change::Navigate);
+                if url != self.state.url {
+                    self.overlay.changed(Change::Navigate);
+                }
                 if url != self.state.url {
                     self.state.url = url.clone();
                     self.block.url = url.clone();
@@ -756,10 +761,19 @@ impl BrowserView {
                 self.console.push_back(message);
                 return;
             }
-            H::Viewport { zoom_level, .. } => {
-                let why = if zoom_level != self.zoom_level { Change::Zoom } else { Change::Scroll };
-                self.zoom_level = zoom_level;
-                self.overlay.changed(why);
+            H::Viewport { scroll_x, scroll_y, zoom_level, .. } => {
+                // Only a real move stales the overlays (the host may repeat itself).
+                let why = if zoom_level != self.zoom_level {
+                    Some(Change::Zoom)
+                } else if (scroll_x, scroll_y) != self.scroll {
+                    Some(Change::Scroll)
+                } else {
+                    None
+                };
+                (self.zoom_level, self.scroll) = (zoom_level, (scroll_x, scroll_y));
+                if let Some(why) = why {
+                    self.overlay.changed(why);
+                }
                 self.send_waiting_hover();
             }
             H::OverlayRects { req, epoch, rects, frames, .. } => {
