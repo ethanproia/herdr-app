@@ -70,6 +70,9 @@ async function sync() {
   for (const [id, targetId] of Object.entries(want)) if (!sessions.has(id)) await attach(id, targetId).catch(() => {});
 }
 
+// `herdr-app do <name> <json>` (HERDR_APP_BIN may be a wrapper such as scripts/fork-run.sh <name>); answers its JSON.
+const app = (name, args) => new Promise((ok) => execFile(process.env.HERDR_APP_BIN || "herdr-app", ["do", name, JSON.stringify(args)],
+  { encoding: "utf8" }, (e, out) => { try { ok(JSON.parse(out)); } catch { ok({ error: String(e?.message ?? out) }); } }));
 const targets = async () => (await (await fetch(`http://${endpoint()}/json/list`)).json());
 
 async function openTab(id) {
@@ -77,9 +80,11 @@ async function openTab(id) {
     const t = await (await fetch(`http://${endpoint()}/json/new?about:blank`, { method: "PUT" })).json();
     const c = readCdp(); c.targets = { ...c.targets, [id]: t.id }; writeCdp(c);
   } else {
-    const out = await new Promise((ok, fail) => execFile(process.env.HERDR_APP_BIN || "herdr-app", ["do", "browser.open", "--url", "about:blank"],
-      { encoding: "utf8" }, (e, o) => (e ? fail(e) : ok(o))));
-    id = JSON.parse(out).id ?? id;
+    const r = await app("browser.open", { url: "about:blank" });
+    if (!r.id) throw new Error(`browser.open: ${r.error ?? JSON.stringify(r)}`);
+    id = r.id;
+    // The host makes a page on its first command (an unshown block never paints): poke it until cdp.json lists it.
+    for (let i = 0; i < 100 && !readCdp()?.targets?.[id]; i++) { await app("browser.eval", { id, expr: "1" }); await sleep(100); }
   }
   for (let i = 0; i < 100 && !readCdp()?.targets?.[id]; i++) await sleep(100);
   await sync();
@@ -93,7 +98,10 @@ async function closeTab(id) {
   if (standin) {
     await fetch(`http://${endpoint()}/json/close/${s.targetId}`);
     const c = readCdp(); delete c.targets[id]; writeCdp(c);
-  } else await new Promise((ok, fail) => execFile(process.env.HERDR_APP_BIN || "herdr-app", ["do", "browser.close", "--id", id], (e) => (e ? fail(e) : ok())));
+  } else {
+    const r = await app("browser.close", { id });
+    if (r.error) throw new Error(`browser.close: ${r.error}`);
+  }
   s.ws.close(); sessions.delete(id);
 }
 
@@ -117,4 +125,6 @@ server.listen(0, "127.0.0.1", () => writeFileSync(join(dir, "agent.port"), Strin
 const stop = () => { rmSync(join(dir, "agent.port"), { force: true }); process.exit(0); };
 process.on("SIGTERM", stop); process.on("SIGINT", stop);
 // Leave when the host is gone or nobody has asked for 30 minutes.
-setInterval(() => { if (!readCdp() || Date.now() - last > 30 * 60e3) stop(); }, 5000).unref();
+// (On the app, cdp.json appears with the first browser block, so a host never seen is not a host gone.)
+let seen = false;
+setInterval(() => { const c = readCdp(); seen ||= !!c; if ((seen && !c) || Date.now() - last > 30 * 60e3) stop(); }, 5000).unref();
