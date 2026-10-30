@@ -20,6 +20,8 @@ pub mod geometry;
 pub mod input;
 // HERDR: part 4, design slice S9.
 pub mod markup;
+// HERDR: part 4, design slice S10 (panel model).
+pub mod styles;
 pub mod view;
 
 pub use herdr_browser_protocol as protocol;
