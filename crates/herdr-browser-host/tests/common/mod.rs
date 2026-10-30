@@ -50,8 +50,8 @@ impl Host {
                 c
             }
         };
-        let child = cmd.arg("--socket").arg(&sock).spawn().unwrap();
         let start = Instant::now();
+        let child = cmd.arg("--socket").arg(&sock).spawn().unwrap();
         let out = loop {
             match UnixStream::connect(&sock) {
                 Ok(s) => break s,
@@ -59,6 +59,9 @@ impl Host {
                 Err(e) => panic!("host never listened: {e}"),
             }
         };
+        if std::env::var_os("HERDR_BROWSER_HOST_DEBUG").is_some() {
+            eprintln!("METRIC host_listen_ms={}", start.elapsed().as_millis());
+        }
         let (tx, rx) = mpsc::channel();
         let reader = BufReader::new(out.try_clone().unwrap());
         std::thread::spawn(move || {

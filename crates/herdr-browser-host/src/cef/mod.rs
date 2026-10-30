@@ -47,6 +47,10 @@ pub(crate) struct Entry {
     input_ready: bool,
     /// Counts main-page loads, so a readiness answer from an older load is ignored.
     load_gen: u64,
+    /// While the readiness probe waits: when the last nudge (a mouse move) went out, and where
+    /// the pointer is (the newest held mouse position, else the top-left corner).
+    nudged: Option<std::time::Instant>,
+    pointer: (f32, f32),
     /// Copies of the newest page and popup paints, composed into each frame sent.
     view: Option<Surface>,
     popup: Option<Surface>,
@@ -357,14 +361,41 @@ pub(crate) fn on_loading(id: &str, loading: bool) {
             return None;
         }
         e.loaded = true;
+        if !e.input_ready {
+            // Start nudging (see `nudge_waiting`) once the probe is listening.
+            e.nudged = Some(std::time::Instant::now());
+        }
         (!e.input_ready).then_some(e.load_gen)
     })
     .flatten();
+    debug(format_args!("{id}: loading={loading} -> probe {probe:?}"));
     let Some(generation) = probe else { return };
     let sent = browser(id).and_then(|b| b.host()).is_some_and(|host| host.send_dev_tools_message(Some(&handlers::ready_message(id, generation))) == 1);
+    debug(format_args!("{id}: readiness probe for load {generation} sent={sent}"));
     if !sent {
         handlers::eval_unsent(id);
         input_live(id, generation);
+    }
+}
+
+/// Browsers whose readiness probe is waiting get a mouse move at the pointer's position every
+/// 100 ms until one reaches the page (harmless: a hover where the pointer already is).
+fn nudge_waiting() {
+    let due: Vec<(String, (f32, f32))> = with_host(|h| {
+        h.browsers
+            .iter_mut()
+            .filter(|(_, e)| e.loaded && !e.input_ready && e.nudged.is_some_and(|t| t.elapsed() >= Duration::from_millis(100)))
+            .map(|(id, e)| {
+                e.nudged = Some(std::time::Instant::now());
+                (id.clone(), e.pointer)
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    for (id, (x, y)) in due {
+        if let Some(host) = browser(&id).and_then(|b| b.host()) {
+            host.send_mouse_move_event(Some(&MouseEvent { x: x.round() as i32, y: y.round() as i32, modifiers: 0 }), 0);
+        }
     }
 }
 
@@ -376,9 +407,13 @@ pub(crate) fn input_live(id: &str, generation: u64) {
             return None;
         }
         e.input_ready = true;
+        e.nudged = None;
         Some(std::mem::take(&mut e.queued))
     })
     .flatten();
+    if events.is_none() {
+        debug(format_args!("{id}: readiness answer for load {generation} ignored (stale or already live)"));
+    }
     if let Some(events) = events {
         debug(format_args!("{id}: page live (load {generation}), releasing {} held input events", events.len()));
         replay(id, events);
@@ -559,6 +594,7 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
         if with_host(|h| h.quit).unwrap_or(true) {
             break;
         }
+        nudge_waiting();
         std::thread::sleep(Duration::from_millis(4));
     }
 
@@ -708,7 +744,7 @@ fn handle(m: AppToHost) {
                     return;
                 }
             };
-            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, hidden: false, shots: Vec::new(), resized: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, load_gen: 0, view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new(), scroll: None, viewport: None }));
+            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, hidden: false, shots: Vec::new(), resized: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, load_gen: 0, nudged: None, pointer: (0.0, 0.0), view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new(), scroll: None, viewport: None }));
             let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
             let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
             let mut client = handlers::client(&id);
@@ -914,9 +950,19 @@ fn browser_msg(m: AppToHost) {
         M::SetZoom { level, .. } => host.set_zoom_level(level),
         M::Input { event, .. } => {
             let queued = with_host(|h| {
-                h.browsers.get_mut(&id).filter(|e| !e.input_ready).map(|e| e.queued.push(event.clone())).is_some()
+                h.browsers
+                    .get_mut(&id)
+                    .filter(|e| !e.input_ready)
+                    .map(|e| {
+                        if let InputEvent::Mouse { x, y, .. } | InputEvent::Wheel { x, y, .. } = &event {
+                            e.pointer = (*x, *y);
+                        }
+                        e.queued.push(event.clone())
+                    })
+                    .is_some()
             })
             .unwrap_or(false);
+            debug(format_args!("{id}: input {} {}", if queued { "held" } else { "sent" }, encode(&event).chars().take(60).collect::<String>()));
             if !queued {
                 input(&host, event);
             }
