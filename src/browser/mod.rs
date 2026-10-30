@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod agent;
+pub mod cdp;
 // HERDR: part 4, design slice S7.
 pub mod annotate;
 pub mod dialogs;

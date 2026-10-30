@@ -7,6 +7,17 @@
 //! `BrowserState`, sizes the page to the block, hands frames to a `FrameSink` and shows a reload
 //! card after a crash. `Browsers` keeps one view per browser block in the layouts.
 use super::agent::{Agent, Focus, Reply, Step};
+use super::cdp::CdpPipe;
+
+/// Start the host with CDP on fds 3/4 (macOS; elsewhere no pipe yet).
+#[cfg(target_os = "macos")]
+fn spawn_cdp(cmd: &mut Command) -> std::io::Result<(Child, Arc<CdpPipe>)> {
+    super::cdp::spawn_with_pipe(cmd)
+}
+#[cfg(not(target_os = "macos"))]
+fn spawn_cdp(_: &mut Command) -> std::io::Result<(Child, Arc<CdpPipe>)> {
+    Err(std::io::Error::other("no CDP pipe on this platform"))
+}
 use super::geometry::{Change, Epoch, Geometry, HoverSend, OverlayAnswer, OverlayState, Pt, Rect, zoom_factor};
 use super::input::{self, BrowserInput, OverlayEvent, Owner};
 use super::dialogs::{DialogsEvent, Downloads, PageDialogs};
@@ -97,8 +108,9 @@ pub struct HostConfig {
     pub program: PathBuf,
     /// Extra arguments (`--stub` from `$HERDR_BROWSER_HOST_ARGS`, for tests).
     pub args: Vec<String>,
-    /// The CEF remote debugging port agents use (contract D7): 0 picks a free one (default),
-    /// `$HERDR_BROWSER_CDP_PORT` sets one, `off` turns it off.
+    /// A TCP CDP port: dev-only and unsafe (any local process can attach), so off unless
+    /// `$HERDR_BROWSER_CDP_PORT` asks (0 picks one). Without it the host gets CDP on a pipe only
+    /// the app holds (docs/browser-cdp-pipe.md), when the app starts the host itself.
     pub cdp_port: Option<u16>,
 }
 
@@ -109,9 +121,8 @@ impl HostConfig {
         });
         let args = std::env::var("HERDR_BROWSER_HOST_ARGS").map(|a| a.split_whitespace().map(str::to_owned).collect()).unwrap_or_default();
         let cdp_port = match std::env::var("HERDR_BROWSER_CDP_PORT").ok().as_deref() {
-            Some("off") => None,
+            None | Some("off") | Some("") => None,
             Some(p) => p.parse().ok().or(Some(0)),
-            None => Some(0),
         };
         Self { dir: crate::mods::app_dir().join("browser"), program, args, cdp_port }
     }
@@ -140,6 +151,8 @@ struct Shared {
     generation: u64,
     /// Hears every host message (the agent commands, part 5).
     tap: Option<Tap>,
+    /// The current host's CDP pipe (None: a host the app didn't start, or a port was asked for).
+    cdp: Option<Arc<CdpPipe>>,
 }
 
 pub type Tap = Arc<dyn Fn(&HostToApp) + Send + Sync>;
@@ -192,6 +205,11 @@ impl HostClient {
         if was_open {
             self.send(AppToHost::Close { id: id.to_owned() });
         }
+    }
+
+    /// The current host's CDP pipe, for the broker (fork-agent); None when there is none or it is over.
+    pub fn cdp(&self) -> Option<Arc<CdpPipe>> {
+        self.shared.lock().unwrap().cdp.clone().filter(|p| !p.is_dead())
     }
 
     /// Every host message also goes to `tap` (after the views get theirs).
@@ -318,13 +336,18 @@ impl Writer {
             Ok(s) => (s, None),
             Err(_) => {
                 let _ = std::fs::remove_file(&sock);
-                let mut child = Command::new(&self.config.program)
-                    .arg("--socket")
-                    .arg(&sock)
-                    .args(&self.config.args)
-                    .stdin(Stdio::null())
-                    .spawn()
-                    .map_err(|e| anyhow::anyhow!("can't start {}: {e}", self.config.program.display()))?;
+                let mut cmd = Command::new(&self.config.program);
+                cmd.arg("--socket").arg(&sock).args(&self.config.args).stdin(Stdio::null());
+                let spawned = if self.config.cdp_port.is_none() && cfg!(target_os = "macos") {
+                    spawn_cdp(&mut cmd).map(|(c, p)| (c, Some(p)))
+                } else {
+                    cmd.spawn().map(|c| (c, None))
+                };
+                let (mut child, cdp) = spawned.map_err(|e| anyhow::anyhow!("can't start {}: {e}", self.config.program.display()))?;
+                // A new host, a new pipe: calls on the old one fail now ("restarted").
+                if let Some(old) = std::mem::replace(&mut self.shared.lock().unwrap().cdp, cdp) {
+                    old.fail("the browser host restarted");
+                }
                 let deadline = Instant::now() + HOST_START;
                 loop {
                     if let Ok(s) = UnixStream::connect(&sock) {
@@ -352,7 +375,7 @@ impl Writer {
             // Resolved (/tmp is /private/tmp on macOS): CEF wants its cache under this exact path.
             profile_dir: std::fs::canonicalize(&self.config.dir).unwrap_or_else(|_| self.config.dir.clone()).join("profile").to_string_lossy().into_owned(),
             cdp_port: self.config.cdp_port,
-            cdp_pipe: false, // HERDR: the pipe plumbing (docs/browser-cdp-pipe.md) sets this true
+            cdp_pipe: self.shared.lock().unwrap().cdp.as_ref().is_some_and(|p| !p.is_dead()),
         };
         conn.stream.write_all(format!("{}\n", protocol::encode(&hello)).as_bytes())?;
         Ok(conn)
