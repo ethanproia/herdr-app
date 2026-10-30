@@ -77,7 +77,9 @@ fn flag(a: &Value, k: &str, default: bool) -> bool {
 }
 
 impl Agent {
+    /// A new app has no host yet: a cdp.json left by an earlier run names a dead port, so it goes.
     pub fn new(dir: PathBuf) -> Self {
+        let _ = std::fs::remove_file(dir.join("cdp.json"));
         Self { grants: Grants::new(dir.clone()), cdp: CdpFile::new(dir), ..Default::default() }
     }
 
@@ -662,6 +664,16 @@ mod tests {
         assert_eq!(read(), json!({}), "a closed block keeps no grants");
         // No `herdr-app do` command can grant: the agent surface has none.
         assert!(crate::commands::COMMANDS.iter().all(|c| !c.name.contains("allow") && !c.name.contains("grant")));
+    }
+
+    #[test]
+    fn a_new_app_drops_a_stale_cdp_file() {
+        let (d, _a) = agent();
+        let path = d.path().join("browser/cdp.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"port":55580,"targets":{}}"#).unwrap();
+        let _again = Agent::new(d.path().join("browser"));
+        assert!(!path.exists(), "a port from an earlier run must not be published");
     }
 
     #[test]

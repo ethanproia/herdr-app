@@ -48,21 +48,25 @@ const value = (v) => /^[[{]/.test(v) ? JSON.parse(v) : v === "true" ? true : v =
 // MCP tools use Cursor's browser_* names and argument shapes; tab (or viewId) defaults to the selected tab.
 const S = "string", N = "number", B = "boolean";
 const TOOLS = {
-  tabs: { action: S, index: N, url: S }, navigate: { url: S }, back: {}, forward: {}, reload: {},
-  snapshot: { interactive: B, maxDepth: N, selector: S }, text: {},
-  click: { ref: S, offsetX: N, offsetY: N, doubleClick: B, button: S }, mouse_click_xy: { x: N, y: N, button: S },
-  type: { ref: S, text: S, clear: B, submit: B, slowly: B }, fill: { ref: S, value: S }, select_option: { ref: S, values: "array" },
+  // element (Cursor): a human description of the target, for the person reading the log; refs decide.
+  tabs: { action: S, index: N, url: S, position: S }, navigate: { url: S, position: S }, back: {}, forward: {}, reload: {},
+  snapshot: { interactive: B, maxDepth: N, compact: B, selector: S }, text: {},
+  click: { ref: S, element: S, offsetX: N, offsetY: N, doubleClick: B, button: S }, mouse_click_xy: { x: N, y: N, button: S },
+  hover: { ref: S, element: S },
+  type: { ref: S, element: S, text: S, clear: B, submit: B, slowly: B }, fill: { ref: S, element: S, value: S },
+  fill_form: { fields: "fields" }, select_option: { ref: S, element: S, values: "array" },
   press_key: { key: S }, scroll: { ref: S, direction: S, amount: N, deltaX: N, deltaY: N, scrollIntoView: B },
   drag: { sourceRef: S, targetRef: S, targetX: N, targetY: N }, get_bounding_box: { ref: S }, highlight: { ref: S, durationMs: N },
-  take_screenshot: { type: S, filename: S, ref: S, fullPage: B }, lock: { action: S }, cdp: { method: S, params: "object" },
+  take_screenshot: { type: S, filename: S, element: S, ref: S, fullPage: B }, lock: { action: S }, cdp: { method: S, params: "object" },
   wait: { selector: S, text: S, timeout: N }, console: { clear: B }, network: { clear: B }, eval: { expression: S }, close: {},
 };
 const REQUIRED = { navigate: ["url"], tabs: ["action"], click: ["ref"], mouse_click_xy: ["x", "y"], type: ["ref", "text"], fill: ["ref"],
-  select_option: ["ref", "values"], press_key: ["key"], get_bounding_box: ["ref"], highlight: ["ref"], lock: ["action"], cdp: ["method"], eval: ["expression"] };
+  select_option: ["ref", "values"], hover: ["ref"], fill_form: ["fields"], press_key: ["key"], get_bounding_box: ["ref"], highlight: ["ref"], lock: ["action"], cdp: ["method"], eval: ["expression"] };
 
 async function mcp() {
   const out = (m) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\n");
-  const prop = (t) => t === "array" ? { type: "array", items: { type: "string" } } : { type: t };
+  const prop = (t) => t === "array" ? { type: "array", items: { type: "string" } }
+    : t === "fields" ? { type: "array", items: { type: "object", required: ["ref", "value"], properties: { ref: { type: "string" }, value: { type: "string" } } } } : { type: t };
   const schema = (name) => ({ type: "object", required: REQUIRED[name] ?? [], properties: { ...Object.fromEntries(Object.entries(TOOLS[name]).map(([k, t]) => [k, prop(t)])),
     ...(name === "tabs" ? {} : { viewId: { type: "string" }, take_screenshot_afterwards: { type: "boolean" } }) } });
   for await (const line of createInterface({ input: process.stdin })) {

@@ -129,7 +129,20 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
     forward: async (s) => { await evaluate(s, "history.forward()"); await sleep(300); await waitFor(s, {}); return { url: s.state.url }; },
     reload: async (s) => { await s.call("Page.reload"); await sleep(300); await waitFor(s, {}); return {}; },
     text: async (s) => ({ text: await evaluate(s, "document.body ? document.body.innerText : ''") }),
-    snapshot: async (s, { interactive, maxDepth, selector }) => ({ url: s.state.url, title: s.state.title, snapshot: await evaluate(s, SNAPSHOT({ interactive, maxDepth, selector })) }),
+    // compact (Cursor): interactive elements only, one flat line each, fewest tokens.
+    snapshot: async (s, { interactive, maxDepth, selector, compact }) => {
+      const snap = await evaluate(s, SNAPSHOT({ interactive: interactive || compact, maxDepth, selector }));
+      return { url: s.state.url, title: s.state.title, snapshot: compact ? snap.split("\n").map((l) => l.trim()).join("\n") : snap };
+    },
+    hover: async (s, { ref }) => { const c = await center(s, ref); await s.call("Input.dispatchMouseEvent", { type: "mouseMoved", x: c.x, y: c.y }); return c; },
+    // fields: [{ ref, value }]; a select takes value as an option value or label.
+    fill_form: async (s, { fields = [] }) => {
+      for (const f of [].concat(typeof fields === "string" ? JSON.parse(fields) : fields)) {
+        const isSelect = await onEl(s, f.ref, `return e.tagName === "SELECT";`);
+        if (isSelect) await acts.select_option(s, { ref: f.ref, values: [f.value] }); else await acts.fill(s, f);
+      }
+      return { filled: [].concat(fields).length };
+    },
     click: async (s, { ref, x, y, button = "left", clicks = 1, doubleClick, offsetX, offsetY }) => {
       if (doubleClick) clicks = 2;
       if (ref) { const b = await box(s, ref); x = b.x + (offsetX ?? b.width / 2); y = b.y + (offsetY ?? b.height / 2); }
@@ -216,18 +229,19 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
     if (cmd === "tabs") {
       const list = await tabs(), action = args.action ?? "list", pick = args.index !== undefined ? list[args.index]?.tab : tab;
       if (action === "list") return { tabs: list.map((t, index) => ({ index, ...t, selected: t.tab === selected })) };
-      if (action === "new") { const r = await run({ cmd: "open", url: args.url }); selected = r.tab; return r; }
+      if (action === "new") { const r = await run({ cmd: "open", url: args.url, position: args.position }); selected = r.tab; return r; }
       if (!pick) throw new Error(`no tab at index ${args.index}`);
       if (action === "select") { if (!list.find((t) => t.tab === pick)?.controllable) throw new Error(`tab ${pick} is not agent-controllable`); selected = pick; return { selected }; }
       if (action === "close") { if (selected === pick) selected = null; return run({ cmd: "close", tab: pick }); }
       throw new Error("action is list, new, close or select");
     }
     if (cmd !== "open") tab = tab ?? selected;
-    if (cmd === "navigate" && !tab) { const r = await run({ cmd: "open", url: args.url }); selected = r.tab; return r; }
+    if (cmd === "navigate" && !tab) { const r = await run({ cmd: "open", url: args.url, position: args.position }); selected = r.tab; return r; }
     if (cmd === "open") {
       const id = String(tab || `agent-${Date.now().toString(36)}`).replace(/[^a-z0-9_-]/gi, "");
       opened.add(id);
-      const s = await openTab(id); // a new browser block (or, on the stand-in, a new target); the app may pick its id
+      // position (Cursor): "side" opens beside the focused pane, "active" (default) as a tab.
+      const s = await openTab(id, args.position === "side" ? "right" : "tab"); // a new browser block (or, on the stand-in, a new target); the app may pick its id
       opened.add(s.id);
       s.state.agent = true; s.state.agentOpened = true;
       if (args.url) await acts.navigate(s, args);

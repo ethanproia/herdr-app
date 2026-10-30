@@ -71,17 +71,18 @@ async function sync() {
   for (const [id, targetId] of Object.entries(want)) if (!sessions.has(id)) await attach(id, targetId).catch(() => {});
 }
 
-// `herdr-app do <name> <json>` (HERDR_APP_BIN may be a wrapper such as scripts/fork-run.sh <name>); answers its JSON.
-const app = (name, args) => new Promise((ok) => execFile(process.env.HERDR_APP_BIN || "herdr-app", ["do", name, JSON.stringify(args)],
-  { encoding: "utf8" }, (e, out) => { try { ok(JSON.parse(out)); } catch { ok({ error: String(e?.message ?? out) }); } }));
+// `herdr-app do <name> <json>`; answers its JSON. HERDR_BROWSER_APP may name a wrapper (scripts/fork-run.sh <name>).
+// Not HERDR_APP_BIN: fork-run.sh reads that as the app binary, so a wrapper there runs itself forever.
+const app = (name, args) => new Promise((ok) => execFile(process.env.HERDR_BROWSER_APP || "herdr-app", ["do", name, JSON.stringify(args)],
+  { encoding: "utf8", timeout: 30000 }, (e, out) => { try { ok(JSON.parse(out)); } catch { ok({ error: String(e?.message ?? out) }); } }));
 const targets = async () => (await (await fetch(`http://${endpoint()}/json/list`)).json());
 
-async function openTab(id) {
+async function openTab(id, place = "tab") {
   if (standin) {
     const t = await (await fetch(`http://${endpoint()}/json/new?about:blank`, { method: "PUT" })).json();
     const c = readCdp(); c.targets = { ...c.targets, [id]: t.id }; writeCdp(c);
   } else {
-    const r = await app("browser.open", { url: "about:blank" });
+    const r = await app("browser.open", { url: "about:blank", place });
     if (!r.id) throw new Error(`browser.open: ${r.error ?? JSON.stringify(r)}`);
     id = r.id;
     // The host makes a page on its first command (an unshown block never paints): poke it until cdp.json lists it.
