@@ -64,7 +64,7 @@ const redact = (v, secrets) => {
   return v;
 };
 
-export default function register({ sessions, onEvent, onOpen, route, dir, openTab, closeTab, targets, lease = async () => {} }) {
+export default function register({ sessions, onEvent, onOpen, route, dir, openTab, closeTab, targets, lease = async () => {}, annotations = async () => ({ batch: null }) }) {
   const opened = new Set(); // tab ids an agent opened
   const grants = () => { try { return JSON.parse(readFileSync(join(dir, "grants.json"), "utf8")); } catch { return {}; } };
   const granted = (id, cap) => grants()[id]?.[cap] === true;
@@ -226,6 +226,8 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
   const run = async ({ cmd, tab, viewId, take_screenshot_afterwards, ...args }) => {
     cmd = String(cmd ?? "").replace(/^browser_/, "");
     tab = tab ?? viewId;
+    // Not a page action: what the person sent (the app labels its trusted and untrusted fields).
+    if (cmd === "annotations") return annotations({ ...(tab ? { id: String(tab) } : {}), ...(args.wait ? { wait: true } : {}) });
     if (cmd === "tabs") {
       const list = await tabs(), action = args.action ?? "list", pick = args.index !== undefined ? list[args.index]?.tab : tab;
       if (action === "list") return { tabs: list.map((t, index) => ({ index, ...t, selected: t.tab === selected })) };

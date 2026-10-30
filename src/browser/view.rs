@@ -2150,6 +2150,9 @@ impl Browsers {
     /// Send's batch (S7 attach flow) for the agent side (fork-agent's S8 takes it from here);
     /// the newest 20 are kept for `browser.annotations`.
     pub fn annotations(&mut self, batch: AnnotationBatch) {
+        if let (Some(agent), Ok(v)) = (&self.agent, serde_json::to_value(&batch)) {
+            agent.lock().unwrap().annotated(v);
+        }
         let mut q = self.batches.lock().unwrap();
         q.push_back(batch);
         while q.len() > 20 {

@@ -520,6 +520,16 @@ Ask the person to pick an element in a browser (it enters pick mode); answers wh
 | `x` | no |
 | `y` | no |
 
+## `browser.annotations`
+
+What the person sent from a browser (Send: comments, markup, a picture; default: from any block): the newest batch, or with wait the next one. Page fields are listed as untrusted.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+| `wait` | no |
+
 ## `browser.lock`
 
 An agent takes a browser (on, default true): the person's input there is refused with a visible "<agent> is driving · Take Control" strip until the agent unlocks (on: false) or the person takes control.
