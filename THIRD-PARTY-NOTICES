@@ -2,8 +2,8 @@ Herdr third-party notices
 =========================
 Regenerate with just notices. See licenses/README.md.
 
-Input-SHA256: 6a3b4177337bfb82680d2992e24b5f948c0c4ce524bafa5b1c8cf8090f45adba Cargo.lock
-Input-SHA256: 43fe5e6a5cf3da9d297bb673d221299ea7ca68cda6eb42b9527b7fd5d0f0c795 Cargo.toml
+Input-SHA256: 69249991bae7b8b092a2fe4306d17e82e1a3ca0c8f183ad7a0a7c150f91aaaf7 Cargo.lock
+Input-SHA256: 93a8232cd97de71a531c8f04386aa698151d400556133764e339c5521ce907d7 Cargo.toml
 Input-SHA256: c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4 LICENSE
 Input-SHA256: e58cb0de2dde300bcda769ca993fde2737f42c0274082f038621ab22975a49e2 about.toml
 Input-SHA256: 84a7a98c82140fb12c37fe42b93805baa16024cb3e5acc599b7ffe612c55d847 assets/fonts/LICENSE-SymbolsNerdFont.txt
@@ -11793,6 +11793,8 @@ Apache License 2.0 (Apache-2.0)
   llrt_utils 0.9.0-beta — https://github.com/awslabs/llrt
   llrt_zlib 0.9.0-beta — https://github.com/awslabs/llrt
   ghostty-sys 0.0.0
+  herdr-browser-protocol 0.1.0
+  herdr-browser-surface 0.1.0
   gpui-fps 0.7.1 — https://github.com/longbridge/gpui-kit/tree/main/crates/fps
   gpui-shell 0.7.1 — https://github.com/longbridge/gpui-kit
   accesskit 0.24.1 — https://github.com/AccessKit/accesskit
