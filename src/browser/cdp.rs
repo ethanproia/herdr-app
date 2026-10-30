@@ -170,8 +170,8 @@ pub fn spawn_with_pipe(cmd: &mut Command) -> std::io::Result<(Child, Arc<CdpPipe
         Ok((fds[0], fds[1]))
     }
     // macOS has no pipe2: close-on-exec comes a moment after pipe(). Pipes made here and the
-    // spawn are serialized, and the host closes every fd above 4 before exec, so it never holds
-    // another pipe's end (which would keep a dead host's pipe open).
+    // spawn are serialized, and the host closes every inheritable fd above 4 before exec, so it
+    // never holds another pipe's end (which would keep a dead host's pipe open).
     let _serial = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
     // app -> host: the child reads `a_r` as fd 3; host -> app: the child writes `b_w` as fd 4.
     let (a_r, a_w) = pipe()?;
@@ -186,9 +186,14 @@ pub fn spawn_with_pipe(cmd: &mut Command) -> std::io::Result<(Child, Arc<CdpPipe
             if r < 0 || w < 0 || libc::dup2(r, 3) < 0 || libc::dup2(w, 4) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // Close what would survive exec above fd 4 (inherited strays, the copies just made).
+            // Close-on-exec fds go at exec anyway, and std's own exec-error pipe is one of them.
             let max = libc::getdtablesize().clamp(5, 65536);
             for fd in 5..max {
-                libc::close(fd);
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                    libc::close(fd);
+                }
             }
             Ok(())
         });

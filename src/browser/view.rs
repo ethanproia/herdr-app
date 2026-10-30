@@ -2423,7 +2423,7 @@ mod tests {
         let a = link.subscribe("a");
         link.send(AppToHost::Create { id: "a".into(), url: None, size: size(), scale: 1.0, profile: None });
         let m = recv(&a, |m| matches!(m, HostToApp::Crashed { .. }));
-        assert!(matches!(m, HostToApp::Crashed { reason, .. } if reason.contains("can't start")));
+        assert!(matches!(&m, HostToApp::Crashed { reason, .. } if reason.contains("can't start")), "{m:?}");
     }
 
     /// Against the real stub host binary (part 2), when one is given:
