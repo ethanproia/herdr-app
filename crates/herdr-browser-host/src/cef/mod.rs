@@ -39,6 +39,12 @@ pub(crate) struct Entry {
     queued: Vec<InputEvent>,
     loaded: bool,
     input_ready: bool,
+    /// Copies of the newest page and popup paints, composed into each frame sent.
+    view: Option<Surface>,
+    popup: Option<Surface>,
+    popup_shown: bool,
+    /// The popup's bounds in DIPs (x, y, w, h).
+    popup_rect: Option<(i32, i32, i32, i32)>,
 }
 
 pub(crate) struct Host {
@@ -115,19 +121,69 @@ pub(crate) fn keep_chooser(req: u64, cb: FileDialogCallback) {
 
 /// A painted CEF surface arrived: blit it into a pool surface and send it if nothing is in flight.
 pub(crate) fn on_frame(id: &str, src: *mut std::ffi::c_void, w: u32, h: u32) {
-    let px = PixelSize { w, h };
+    paint(id, Some((false, src, w, h)));
+}
+
+/// A `<select>` list, datalist or other popup widget painted (PET_POPUP).
+pub(crate) fn on_popup_frame(id: &str, src: *mut std::ffi::c_void, w: u32, h: u32) {
+    paint(id, Some((true, src, w, h)));
+}
+
+/// The popup widget opened or closed (`OnPopupShow`). Closing repaints the page without it.
+pub(crate) fn on_popup_show(id: &str, show: bool) {
+    let changed = with_host(|h| {
+        h.browsers.get_mut(id).map(|e| {
+            let was = e.popup_shown;
+            e.popup_shown = show;
+            if !show {
+                e.popup = None;
+                e.popup_rect = None;
+            }
+            was && !show
+        })
+    })
+    .flatten()
+    .unwrap_or(false);
+    if changed {
+        paint(id, None);
+    }
+}
+
+/// Where the popup goes, in DIPs from the view's top-left (`OnPopupSize`).
+pub(crate) fn on_popup_size(id: &str, x: i32, y: i32, w: i32, h: i32) {
+    with_host(|host| host.browsers.get_mut(id).map(|e| e.popup_rect = Some((x, y, w.max(0), h.max(0)))));
+}
+
+/// Keep a copy of a freshly painted layer (CEF's surface dies with the callback), then compose the
+/// page and, if open, its popup at the popup's bounds into a pool surface and send it.
+fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
     let ready = with_host(|host| {
         let entry = host.browsers.get_mut(id)?;
         let blitter = host.blitter.as_ref()?;
-        let dst = match entry.pool.acquire(px) {
-            Ok(s) => s,
-            Err(e) => return Some(Err(format!("surface: {e}"))),
-        };
-        if let Err(e) = blitter.copy(src, dst.as_ptr(), w as usize, h as usize) {
-            return Some(Err(e));
-        }
-        let frame = entry.pool.submit(dst).map(|f| (f.seq, f.surface.clone()));
-        Some(Ok(frame.map(|(seq, s)| (seq, s, entry.scale))))
+        let res = (|| -> Result<_, String> {
+            if let Some((popup, src, w, h)) = layer {
+                let px = PixelSize { w, h };
+                let slot = if popup { &mut entry.popup } else { &mut entry.view };
+                if slot.as_ref().is_none_or(|s| s.size() != px) {
+                    *slot = Some(herdr_browser_surface::create_pixels(px).map_err(|e| format!("surface: {e}"))?);
+                }
+                let copy = slot.as_ref().expect("just made");
+                blitter.copy(src, copy.as_ptr(), w as usize, h as usize)?;
+            }
+            let Some(view) = entry.view.as_ref() else { return Ok(None) };
+            let vs = view.size();
+            let dst = entry.pool.acquire(vs).map_err(|e| format!("surface: {e}"))?;
+            blitter.copy(view.as_ptr(), dst.as_ptr(), vs.w as usize, vs.h as usize)?;
+            if let (true, Some(popup), Some(rect)) = (entry.popup_shown, entry.popup.as_ref(), entry.popup_rect) {
+                let ps = popup.size();
+                let place = popup_place(rect, entry.scale, (ps.w, ps.h), (vs.w, vs.h));
+                if let Some((from, to, w, h)) = place {
+                    blitter.copy_region(popup.as_ptr(), (ps.w as usize, ps.h as usize), from, dst.as_ptr(), (vs.w as usize, vs.h as usize), to, w, h)?;
+                }
+            }
+            Ok(entry.pool.submit(dst).map(|f| (f.seq, f.surface.clone(), entry.scale)))
+        })();
+        Some(res)
     })
     .flatten();
     let woke = with_host(|h| h.browsers.get_mut(id).filter(|e| e.loaded && !e.input_ready).map(|e| {
@@ -142,6 +198,21 @@ pub(crate) fn on_frame(id: &str, src: *mut std::ffi::c_void, w: u32, h: u32) {
         Some(Err(e)) => send(HostToApp::Error { id: Some(id.into()), message: format!("frame: {e}") }),
         _ => {}
     }
+}
+
+/// Where a popup of `ps` pixels lands in a frame of `vs` pixels, from its DIP `rect` at `scale`:
+/// (source origin, destination origin, width, height), clipped to both. None if fully outside.
+pub(crate) fn popup_place(rect: (i32, i32, i32, i32), scale: f32, ps: (u32, u32), vs: (u32, u32)) -> Option<((usize, usize), (usize, usize), usize, usize)> {
+    let (x, y) = ((rect.0 as f32 * scale).round() as i64, (rect.1 as f32 * scale).round() as i64);
+    // Source offset when the popup starts left of / above the frame.
+    let (sx, sy) = ((-x).max(0), (-y).max(0));
+    let (dx, dy) = (x.max(0), y.max(0));
+    let w = (ps.0 as i64 - sx).min(vs.0 as i64 - dx);
+    let h = (ps.1 as i64 - sy).min(vs.1 as i64 - dy);
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    Some(((sx as usize, sy as usize), (dx as usize, dy as usize), w as usize, h as usize))
 }
 
 /// The page finished (or started) loading. Input becomes deliverable on the next frame.
@@ -239,7 +310,7 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
     };
     let cdp = pick_port(cdp)?;
     std::fs::create_dir_all(&profile_dir)?;
-    let downloads = profile_dir.parent().unwrap_or(&profile_dir).join("downloads");
+    let downloads = crate::downloads::dir();
 
     let mut app = handlers::app();
     let settings = Settings {
@@ -381,7 +452,7 @@ fn handle(m: AppToHost) {
                 send(HostToApp::Error { id: Some(id.clone()), message: format!("browser {id} exists") });
                 return;
             }
-            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false }));
+            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, view: None, popup: None, popup_shown: false, popup_rect: None }));
             let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
             let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
             let mut client = handlers::client(&id);
@@ -654,4 +725,21 @@ fn write_png(s: &Surface, path: &Path) -> Result<(), String> {
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header().and_then(|mut w| w.write_image_data(&rgba)).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::popup_place;
+
+    #[test]
+    fn popups_land_at_their_bounds_clipped_to_the_frame() {
+        // A 100x40 DIP list at (10, 20) on a 2x frame of 400x300 px.
+        assert_eq!(popup_place((10, 20, 100, 40), 2.0, (200, 80), (400, 300)), Some(((0, 0), (20, 40), 200, 80)));
+        // Hanging off the right and bottom edges: clipped.
+        assert_eq!(popup_place((150, 120, 100, 40), 2.0, (200, 80), (400, 300)), Some(((0, 0), (300, 240), 100, 60)));
+        // Starting above / left of the frame: the source is offset.
+        assert_eq!(popup_place((-5, -10, 100, 40), 1.0, (100, 40), (400, 300)), Some(((5, 10), (0, 0), 95, 30)));
+        // Entirely outside.
+        assert_eq!(popup_place((500, 0, 10, 10), 1.0, (10, 10), (400, 300)), None);
+    }
 }
