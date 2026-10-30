@@ -550,6 +550,12 @@ The main ones:
   (personal tree edits; on shipped layouts only click/look fields change),
   `layout.reset {name?}` (reset a shipped layout and its clicks),
   `layout.clone {name, as?}` (duplicate, then switch; default `<name>-copy`).
+- Browser blocks (default target: the focused browser; `id` a block id or `pane` the pane showing one):
+  `browser.open {url?, place?}`, `browser.navigate {url}`, `browser.back`, `browser.forward`,
+  `browser.reload {ignore_cache?}`, `browser.stop`, `browser.screenshot {path?}`, `browser.eval {expr}`,
+  `browser.find {text?, forward?, match_case?, next?}`, `browser.devtools {open?}`, `browser.close`. For page work
+  (snapshot, click, type, fill) use `scripts/herdr-browser` (CLI and MCP, Cursor's `browser_*` tool names)
+  on the CDP port in `browser/cdp.json`.
 - App: `mod.clone {name, as?}` (duplicate; default `<name>-copy`), `mod.open {name}`, `overlay.close {id?}`, `app.help`, `app.palette`, `app.settings {section?}`
   (sections: `look`, `machines`, `alerts`, `updates`, `privacy`; Machines lists, updates, renames and removes ssh machines; settings edit the same files you do).
   `app.check_updates`, `app.update_core` (a newer herdr-core of this generation, terminals kept;
