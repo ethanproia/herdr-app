@@ -4,6 +4,15 @@
 //! A `Surface` is a retained BGRA IOSurface. The host creates one per frame slot, CEF paints into
 //! it, and `export` turns it into a `SurfaceRef` the app can `import` in another process. Pixels
 //! never cross the socket and nothing here copies a frame except `read_bgra`, which is for tests.
+//!
+//! Transports (OQ1, measured on macOS 27.0.1, unsandboxed, host spawned by the app):
+//! - `GlobalId` (default): `kIOSurfaceIsGlobal` + `IOSurfaceLookup`. Deprecated by Apple and
+//!   expected to fail under the App Sandbox; any process of the same user can look an id up.
+//! - `MachPort` (fallback): `IOSurfaceCreateMachPort` + `bootstrap_register2`/`bootstrap_look_up`,
+//!   also deprecated. A bootstrap name cannot be cleanly unregistered: each exported surface
+//!   leaves its name behind until the surface is freed, so pool surfaces, never mint per frame.
+//! - Neither is verified in a sandboxed or hardened-runtime (signed, notarized) bundle; part 2 and
+//!   the bundling work must re-run `tests/cross_process.rs` against a signed build.
 
 use herdr_browser_protocol::{PixelSize, SurfaceRef};
 use std::fmt;
