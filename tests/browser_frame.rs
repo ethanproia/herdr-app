@@ -82,8 +82,29 @@ fn main() {
     view(&mut cx, &mut |v| v.on_frame(1, ref_a.clone(), a.size(), 2.0).unwrap());
     shoot(&mut cx, "frame 1", &[(5., 5., BLACK), (15., 20., RED), (45., 20., BLUE), (55., 35., BLACK)]);
     view(&mut cx, &mut |v| {
+        assert_eq!(v.ack(), None, "drawn into a scene is not presented");
+        v.presented(false);
+        assert_eq!(v.ack(), None, "presented while the window is not visible: no ack");
+    });
+    shoot(&mut cx, "frame 1 again", &[(15., 20., RED)]);
+    view(&mut cx, &mut |v| {
+        v.presented(true);
         assert_eq!(v.ack(), Some(1));
         assert_eq!(v.ack(), None, "ack is taken once");
+        // Hidden: undelivered acks are forgotten and nothing acks until visible again.
+        assert!(v.set_visible(false));
+        assert!(!v.set_visible(false), "no change, nothing to send");
+    });
+    shoot(&mut cx, "hidden (last frame kept)", &[(15., 20., RED)]);
+    view(&mut cx, &mut |v| {
+        v.presented(true);
+        assert_eq!(v.ack(), None, "a hidden block never acks");
+        assert!(v.set_visible(true));
+    });
+    shoot(&mut cx, "visible again", &[(15., 20., RED)]);
+    view(&mut cx, &mut |v| {
+        v.presented(true);
+        assert_eq!(v.ack(), Some(1), "acks resume");
     });
     assert!(a.in_use(), "app holds frame 1");
 
@@ -115,7 +136,9 @@ fn main() {
     for seq in [1, 2, 5] {
         v.on_frame(seq, ref_a.clone(), a.size(), 2.0).unwrap();
         assert!(v.element().is_some());
-        assert!(v.element().is_some(), "a repaint of the same frame is not counted");
+        v.presented(true);
+        assert!(v.element().is_some());
+        v.presented(true); // a repaint of the same frame is not counted
     }
     let log = std::fs::read_to_string(home.join("browser/stats.log")).unwrap();
     let paints: Vec<_> = log.lines().filter(|l| l.contains(" paint ")).collect();

@@ -46,6 +46,8 @@ unsafe extern "C" {
     pub fn IOSurfaceLock(s: IOSurfaceRef, opts: u32, seed: *mut u32) -> KernReturn;
     pub fn IOSurfaceUnlock(s: IOSurfaceRef, opts: u32, seed: *mut u32) -> KernReturn;
     pub fn IOSurfaceIsInUse(s: IOSurfaceRef) -> u8;
+    pub fn IOSurfaceIncrementUseCount(s: IOSurfaceRef);
+    pub fn IOSurfaceDecrementUseCount(s: IOSurfaceRef);
     fn IOSurfaceCreateMachPort(s: IOSurfaceRef) -> MachPort;
     fn IOSurfaceLookupFromMachPort(p: MachPort) -> IOSurfaceRef;
 }

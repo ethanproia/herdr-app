@@ -8,6 +8,18 @@
 //! vendor/gpui-pre-apple). No image cache is involved, so herdr issue 22 (image cache leak) does
 //! not apply here.
 //!
+//! Three acknowledgements, kept apart (Astra review C4):
+//! - receipt: `on_frame` imported the surface (local only; nothing is sent).
+//! - presentation: the frame was in a scene GPUI presented while the window was visible.
+//!   `element()` only records that a frame went into the scene; BrowserView calls `presented`
+//!   from `window.on_next_frame` (after the frame is drawn and presented) with
+//!   `window.is_visible()`, and only then does `ack()` yield the seq for `AppToHost::FrameAck`,
+//!   which paces the host (one frame in flight). A hidden or occluded window never acks.
+//! - safe reuse: never signalled by message. The host pool skips any IOSurface whose kernel-wide
+//!   use count is held (our CVPixelBuffer, GPUI's scene, Metal textures until GPU completion).
+//! Hidden: `set_visible(false)` forgets undelivered acks; BrowserView tells the host, which
+//! stops painting. `set_visible(true)` expects a fresh full frame from the host.
+//!
 //! Stats mode (`HERDR_BROWSER_STATS=1`, off by default): every view appends to
 //! `<app home>/browser/stats.log` one `paint` line per paint of a new frame (interval since the
 //! view's previous paint, frame arrival to paint latency, frames the host coalesced away before
@@ -23,7 +35,7 @@ pub trait FrameSink {
     fn on_frame(&mut self, seq: u64, surface: SurfaceRef, size: PixelSize, scale: f32) -> anyhow::Result<()>;
     /// The block was resized to `dips`; keep stretching the last frame until a matching one arrives.
     fn on_resize_pending(&mut self, dips: Size);
-    /// The seq to send as `AppToHost::FrameAck`, once that frame has been painted; taken once.
+    /// The seq to send as `AppToHost::FrameAck`, once that frame was presented visibly; taken once.
     fn ack(&mut self) -> Option<u64>;
 }
 
@@ -61,7 +73,10 @@ struct Frame {
 pub struct FrameView {
     frame: Option<Frame>,
     pending_resize: Option<Size>,
-    painted: Option<u64>,
+    /// Went into the latest scene; becomes `presented` once that scene is shown visibly.
+    drawn: Option<u64>,
+    presented: Option<u64>,
+    hidden: bool,
     stats: Option<Stats>,
 }
 
@@ -71,15 +86,12 @@ impl FrameView {
     }
 
     /// The element to put inside the block's bounds: the newest frame filling them (stretched
-    /// while a resize is pending), or `None` before the first frame. Marks that frame painted.
+    /// while a resize is pending), or `None` before the first frame. Records it as drawn only.
     pub fn element(&mut self) -> Option<AnyElement> {
         #[cfg(target_os = "macos")]
         {
             let frame = self.frame.as_ref()?;
-            if let Some(stats) = &mut self.stats {
-                stats.painted(frame.seq, frame.arrived);
-            }
-            self.painted = Some(frame.seq);
+            self.drawn = Some(frame.seq);
             Some(surface(frame.buffer.clone()).size_full().object_fit(ObjectFit::Fill).into_any_element())
         }
         #[cfg(not(target_os = "macos"))]
@@ -98,6 +110,37 @@ impl FrameView {
         }
     }
 
+    /// After GPUI presented the scene holding the last `element()`: with the window visible,
+    /// that frame counts as presented (stats, and `ack()` yields it).
+    pub fn presented(&mut self, window_visible: bool) {
+        let Some(seq) = self.drawn.take() else { return };
+        if !window_visible || self.hidden {
+            return;
+        }
+        if let (Some(stats), Some(f)) = (&mut self.stats, self.frame.as_ref().filter(|f| f.seq == seq)) {
+            stats.painted(seq, f.arrived);
+        }
+        self.presented = Some(seq);
+    }
+
+    /// The window (or the block's tab) became hidden or visible. Returns true on a change, when
+    /// BrowserView sends `AppToHost::SetVisible`.
+    pub fn set_visible(&mut self, visible: bool) -> bool {
+        if self.hidden != visible {
+            return false;
+        }
+        self.hidden = !visible;
+        if self.hidden {
+            self.drawn = None;
+            self.presented = None;
+        }
+        true
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
     pub fn seq(&self) -> Option<u64> {
         self.frame.as_ref().map(|f| f.seq)
     }
@@ -105,7 +148,8 @@ impl FrameView {
     /// Drop the frame (block closed or host crashed).
     pub fn clear(&mut self) {
         self.frame = None;
-        self.painted = None;
+        self.drawn = None;
+        self.presented = None;
     }
 }
 
@@ -137,7 +181,7 @@ impl FrameSink for FrameView {
     }
 
     fn ack(&mut self) -> Option<u64> {
-        self.painted.take()
+        self.presented.take()
     }
 }
 
