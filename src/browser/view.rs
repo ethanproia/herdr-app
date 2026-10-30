@@ -295,6 +295,7 @@ impl Writer {
             // Resolved (/tmp is /private/tmp on macOS): CEF wants its cache under this exact path.
             profile_dir: std::fs::canonicalize(&self.config.dir).unwrap_or_else(|_| self.config.dir.clone()).join("profile").to_string_lossy().into_owned(),
             cdp_port: self.config.cdp_port,
+            cdp_pipe: false, // HERDR: the pipe plumbing (docs/browser-cdp-pipe.md) sets this true
         };
         conn.stream.write_all(format!("{}\n", protocol::encode(&hello)).as_bytes())?;
         Ok(conn)

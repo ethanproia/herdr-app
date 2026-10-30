@@ -345,7 +345,7 @@ fn serve(socket: &Path, args: &Args) -> io::Result<()> {
     if with_host(|h| h.blitter.is_none()).unwrap_or(true) {
         send(HostToApp::Error { id: None, message: "no Metal device: frames cannot be copied".into() });
     }
-    send(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: cef_version(), cdp_port: cdp });
+    send(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: cef_version(), cdp_port: cdp, cdp_pipe: false });
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {

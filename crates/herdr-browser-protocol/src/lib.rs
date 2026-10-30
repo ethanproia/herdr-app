@@ -175,7 +175,8 @@ pub enum OverlayQuery {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppToHost {
     /// First message. `profile_dir` is the shared CEF root cache (logins live here).
-    Hello { version: u32, profile_dir: String, cdp_port: Option<u16> },
+    /// `cdp_pipe`: start Chromium with remote-debugging-pipe (CDP on fds 3 and 4, no TCP port).
+    Hello { version: u32, profile_dir: String, cdp_port: Option<u16>, #[serde(default)] cdp_pipe: bool },
     /// `profile`: the block's profile name (D4); None or "default" is the shared default profile.
     /// Each name gets its own cookies and storage under `<profile_dir>/<name>`.
     Create { id: BrowserId, url: Option<String>, size: Size, scale: f32, #[serde(default)] profile: Option<String> },
@@ -224,7 +225,8 @@ pub enum AppToHost {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostToApp {
-    Ready { version: u32, cef_version: String, cdp_port: Option<u16> },
+    /// `cdp_pipe`: true once the host started with the pipe switch.
+    Ready { version: u32, cef_version: String, cdp_port: Option<u16>, #[serde(default)] cdp_pipe: bool },
     /// A new frame. At most one frame per browser is unacknowledged at a time: the host holds the
     /// newest pending frame until `FrameAck` and drops older ones.
     Frame { id: BrowserId, seq: u64, surface: SurfaceRef, size: PixelSize, scale: f32 },
@@ -290,7 +292,7 @@ mod tests {
     #[test]
     fn app_messages_roundtrip() {
         let mods = Modifiers { platform: true, ..Default::default() };
-        roundtrip_app(AppToHost::Hello { version: PROTOCOL_VERSION, profile_dir: "/tmp/p".into(), cdp_port: Some(9222) });
+        roundtrip_app(AppToHost::Hello { version: PROTOCOL_VERSION, profile_dir: "/tmp/p".into(), cdp_port: Some(9222), cdp_pipe: true });
         roundtrip_app(AppToHost::Create { id: "b1".into(), url: Some("https://example.com".into()), size: Size { w: 800.0, h: 600.0 }, scale: 2.0, profile: None });
         roundtrip_app(AppToHost::Resize { id: "b1".into(), size: Size { w: 400.0, h: 300.0 }, scale: 2.0 });
         roundtrip_app(AppToHost::FrameAck { id: "b1".into(), seq: 7 });
@@ -316,7 +318,7 @@ mod tests {
 
     #[test]
     fn host_messages_roundtrip() {
-        roundtrip_host(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: "0".into(), cdp_port: None });
+        roundtrip_host(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: "0".into(), cdp_port: None, cdp_pipe: false });
         roundtrip_host(HostToApp::Frame { id: "b1".into(), seq: 1, surface: SurfaceRef::GlobalId { id: 42 }, size: PixelSize { w: 1600, h: 1200 }, scale: 2.0 });
         roundtrip_host(HostToApp::Frame { id: "b1".into(), seq: 2, surface: SurfaceRef::MachPort { name: "com.herdr.s".into() }, size: PixelSize { w: 2, h: 2 }, scale: 1.0 });
         roundtrip_host(HostToApp::Loading { id: "b1".into(), loading: true, can_back: false, can_forward: false });
