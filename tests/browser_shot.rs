@@ -108,7 +108,7 @@ fn frames(program: std::path::PathBuf, args: Vec<String>, url: &str, ok: impl Fn
     let dir = std::path::PathBuf::from(format!("/tmp/hb-{}-frames-{}", std::process::id(), args.len()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let link = HostClient::new(HostConfig { dir, program, args });
+    let link = HostClient::new(HostConfig { dir, program, args, cdp_port: None });
     let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
     cx.update(gpui_base::init);
     let block = layout::BrowserBlock { url: url.into(), profile: "default".into() };
@@ -185,7 +185,7 @@ fn stub_input() {
     let dir = std::path::PathBuf::from(format!("/tmp/hb-{}-input", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let link = HostClient::new(HostConfig { dir, program: program.into(), args: vec!["--stub".into()] });
+    let link = HostClient::new(HostConfig { dir, program: program.into(), args: vec!["--stub".into()], cdp_port: None });
     let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
     cx.update(gpui_base::init);
     let block = layout::BrowserBlock { url: "https://example.com".into(), profile: "default".into() };
@@ -263,7 +263,7 @@ fn agent(program: std::path::PathBuf, args: Vec<String>, url: &str, real: bool) 
     let dir = std::path::PathBuf::from(format!("/tmp/hb-{}-agent-{}", std::process::id(), args.len()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let link = HostClient::new(HostConfig { dir: dir.clone(), program, args });
+    let link = HostClient::new(HostConfig { dir: dir.clone(), program, args, cdp_port: Some(0) });
     let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
     cx.update(gpui_base::init);
     let block = layout::BrowserBlock { url: url.into(), profile: "default".into() };
@@ -292,7 +292,7 @@ fn agent(program: std::path::PathBuf, args: Vec<String>, url: &str, real: bool) 
     }
     let run = |cx: &mut HeadlessAppContext, name: &str, a: serde_json::Value| -> Result<serde_json::Value, String> {
         let (tx, rx) = std::sync::mpsc::channel();
-        let step = window.update(cx, |w, _, _| w.browsers.run(name, &a, &|_| None, Box::new(move |r| { let _ = tx.send(r); }))).unwrap();
+        let step = window.update(cx, |w, _, cx| w.browsers.run(name, &a, &|_| None, Box::new(move |r| { let _ = tx.send(r); }), cx)).unwrap();
         assert!(matches!(step, browser::agent::Step::Done), "{name} is answered by the agent");
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -389,7 +389,7 @@ fn main() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let seen = fake_host(dir.join("host.sock"));
-    let link = HostClient::new(HostConfig { dir, program: "/nonexistent".into(), args: vec![] });
+    let link = HostClient::new(HostConfig { dir, program: "/nonexistent".into(), args: vec![], cdp_port: None });
     let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
     cx.update(gpui_base::init);
     let block = layout::BrowserBlock { url: "https://example.com".into(), profile: "default".into() };

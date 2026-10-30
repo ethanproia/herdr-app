@@ -3850,7 +3850,7 @@ impl AppWindow {
     fn browser_command(&mut self, name: &str, args: Value, reply: crate::browser::agent::Reply, window: &mut Window, cx: &mut Context<Self>) {
         use crate::browser::agent::Step;
         let blocks: HashSet<String> = self.browsers.ids().into_iter().collect();
-        let step = self.browsers.run(name, &args, &|pane| blocks.get(pane).cloned(), reply);
+        let step = self.browsers.run(name, &args, &|pane| blocks.get(pane).cloned(), reply, cx);
         let made = match step {
             Step::Done => return,
             Step::Open { url, place, reply } => {

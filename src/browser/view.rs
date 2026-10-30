@@ -37,6 +37,9 @@ pub struct HostConfig {
     pub program: PathBuf,
     /// Extra arguments (`--stub` from `$HERDR_BROWSER_HOST_ARGS`, for tests).
     pub args: Vec<String>,
+    /// The CEF remote debugging port agents use (contract D7): 0 picks a free one (default),
+    /// `$HERDR_BROWSER_CDP_PORT` sets one, `off` turns it off.
+    pub cdp_port: Option<u16>,
 }
 
 impl HostConfig {
@@ -45,7 +48,12 @@ impl HostConfig {
             std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("herdr-browser-host"))).unwrap_or_else(|| "herdr-browser-host".into())
         });
         let args = std::env::var("HERDR_BROWSER_HOST_ARGS").map(|a| a.split_whitespace().map(str::to_owned).collect()).unwrap_or_default();
-        Self { dir: crate::mods::app_dir().join("browser"), program, args }
+        let cdp_port = match std::env::var("HERDR_BROWSER_CDP_PORT").ok().as_deref() {
+            Some("off") => None,
+            Some(p) => p.parse().ok().or(Some(0)),
+            None => Some(0),
+        };
+        Self { dir: crate::mods::app_dir().join("browser"), program, args, cdp_port }
     }
 
     pub fn socket(&self) -> PathBuf {
@@ -282,7 +290,7 @@ impl Writer {
             version: protocol::PROTOCOL_VERSION,
             // Resolved (/tmp is /private/tmp on macOS): CEF wants its cache under this exact path.
             profile_dir: std::fs::canonicalize(&self.config.dir).unwrap_or_else(|_| self.config.dir.clone()).join("profile").to_string_lossy().into_owned(),
-            cdp_port: None,
+            cdp_port: self.config.cdp_port,
         };
         conn.stream.write_all(format!("{}\n", protocol::encode(&hello)).as_bytes())?;
         Ok(conn)
@@ -652,6 +660,14 @@ impl BrowserView {
         self.sized = Some((size, scale));
     }
 
+    /// An agent drives this page before it was ever shown (a background tab, a headless
+    /// window): make it now at a desktop size; the first layout resizes it.
+    pub fn ensure_page(&mut self) {
+        if self.sized.is_none() && self.crashed.is_none() {
+            self.laid_out(Dips { w: 1280.0, h: 800.0 }, 2.0);
+        }
+    }
+
     /// The reload card's button: a new page at the last url (starting the host again if needed).
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.crashed = None;
@@ -878,9 +894,16 @@ impl Browsers {
 
     /// `herdr-app do browser.<name>`: answered through `reply` (now, or when the host answers).
     /// `Open` and `Close` come back for the window, which owns the layout.
-    pub fn run(&mut self, name: &str, args: &serde_json::Value, block_of_pane: &dyn Fn(&str) -> Option<BrowserId>, reply: Reply) -> Step {
+    pub fn run(&mut self, name: &str, args: &serde_json::Value, block_of_pane: &dyn Fn(&str) -> Option<BrowserId>, reply: Reply, cx: &mut App) -> Step {
         self.link_arc();
         let agent = self.agent.clone().expect("made with the link");
+        // The page the command targets must exist on the host, shown or not.
+        let target = args.get("id").and_then(serde_json::Value::as_str).map(str::to_owned)
+            .or_else(|| args.get("pane").and_then(serde_json::Value::as_str).and_then(block_of_pane))
+            .or_else(|| self.focused.clone());
+        if let Some((view, _)) = target.and_then(|t| self.views.get(&t)) {
+            view.update(cx, |v, _| v.ensure_page());
+        }
         let focus = Focus { focused: self.focused.clone().filter(|f| self.views.contains_key(f)), block_of_pane };
         agent.lock().unwrap().run(name, args, self, &focus, reply)
     }
@@ -1027,7 +1050,7 @@ mod tests {
     fn link_says_hello_first_then_routes_events_by_block() {
         let dir = tmp("route");
         let (seen, _kill) = fake_host(socket_of(&dir));
-        let link = HostClient::new(HostConfig { dir: dir.clone(), program: "/nonexistent".into(), args: vec![] });
+        let link = HostClient::new(HostConfig { dir: dir.clone(), program: "/nonexistent".into(), args: vec![], cdp_port: None });
         let (a, b) = (link.subscribe("a"), link.subscribe("b"));
         link.send(AppToHost::Create { id: "a".into(), url: Some("https://a.test".into()), size: size(), scale: 2.0 });
         link.send(AppToHost::Create { id: "b".into(), url: Some("https://b.test".into()), size: size(), scale: 2.0 });
@@ -1044,7 +1067,7 @@ mod tests {
     fn closing_a_block_closes_its_page_and_forgets_it() {
         let dir = tmp("close");
         let (seen, _kill) = fake_host(socket_of(&dir));
-        let link = HostClient::new(HostConfig { dir, program: "/nonexistent".into(), args: vec![] });
+        let link = HostClient::new(HostConfig { dir, program: "/nonexistent".into(), args: vec![], cdp_port: None });
         let a = link.subscribe("a");
         link.send(AppToHost::Create { id: "a".into(), url: Some("https://a.test".into()), size: size(), scale: 1.0 });
         recv(&a, |m| matches!(m, HostToApp::Url { .. }));
@@ -1064,7 +1087,7 @@ mod tests {
     fn a_dead_host_is_a_crash_and_the_next_send_makes_the_pages_again() {
         let dir = tmp("crash");
         let (_seen, kill) = fake_host(socket_of(&dir));
-        let link = HostClient::new(HostConfig { dir: dir.clone(), program: "/nonexistent".into(), args: vec![] });
+        let link = HostClient::new(HostConfig { dir: dir.clone(), program: "/nonexistent".into(), args: vec![], cdp_port: None });
         let a = link.subscribe("a");
         link.send(AppToHost::Create { id: "a".into(), url: Some("https://a.test".into()), size: size(), scale: 2.0 });
         link.send(AppToHost::Navigate { id: "a".into(), url: "https://a.test/2".into() });
@@ -1085,7 +1108,7 @@ mod tests {
     #[::core::prelude::v1::test]
     fn no_host_program_is_a_crash_not_a_hang() {
         let dir = tmp("nohost");
-        let link = HostClient::new(HostConfig { dir, program: "/nonexistent/herdr-browser-host".into(), args: vec![] });
+        let link = HostClient::new(HostConfig { dir, program: "/nonexistent/herdr-browser-host".into(), args: vec![], cdp_port: None });
         let a = link.subscribe("a");
         link.send(AppToHost::Create { id: "a".into(), url: None, size: size(), scale: 1.0 });
         let m = recv(&a, |m| matches!(m, HostToApp::Crashed { .. }));
@@ -1101,7 +1124,7 @@ mod tests {
             return;
         };
         let dir = tmp("stub");
-        let link = HostClient::new(HostConfig { dir: dir.clone(), program, args: vec!["--stub".into()] });
+        let link = HostClient::new(HostConfig { dir: dir.clone(), program, args: vec!["--stub".into()], cdp_port: None });
         let a = link.subscribe("a");
         assert!(UnixStream::connect(socket_of(&dir)).is_err(), "no host before the first send");
         link.send(AppToHost::Create { id: "a".into(), url: Some("https://example.com".into()), size: size(), scale: 2.0 });
