@@ -137,7 +137,9 @@ pub enum EditCommand {
 pub enum AppToHost {
     /// First message. `profile_dir` is the shared CEF root cache (logins live here).
     Hello { version: u32, profile_dir: String, cdp_port: Option<u16> },
-    Create { id: BrowserId, url: Option<String>, size: Size, scale: f32 },
+    /// `profile`: the block's profile name (D4); None or "default" is the shared default profile.
+    /// Each name gets its own cookies and storage under `<profile_dir>/<name>`.
+    Create { id: BrowserId, url: Option<String>, size: Size, scale: f32, #[serde(default)] profile: Option<String> },
     Close { id: BrowserId },
     Navigate { id: BrowserId, url: String },
     Back { id: BrowserId },
@@ -148,6 +150,9 @@ pub enum AppToHost {
     Focus { id: BrowserId, focused: bool },
     /// Zoom level as Chrome counts it: 0.0 is 100%, each step is about 20%.
     SetZoom { id: BrowserId, level: f64 },
+    /// The app's appearance changed (or Hello was just sent): every page's prefers-color-scheme
+    /// follows it, live. Applies to browsers created later too.
+    SetColorScheme { dark: bool },
     Input { id: BrowserId, event: InputEvent },
     /// Run an editing command (copy, paste, ...) in the focused frame.
     Edit { id: BrowserId, command: EditCommand },
@@ -226,7 +231,7 @@ mod tests {
     fn app_messages_roundtrip() {
         let mods = Modifiers { platform: true, ..Default::default() };
         roundtrip_app(AppToHost::Hello { version: PROTOCOL_VERSION, profile_dir: "/tmp/p".into(), cdp_port: Some(9222) });
-        roundtrip_app(AppToHost::Create { id: "b1".into(), url: Some("https://example.com".into()), size: Size { w: 800.0, h: 600.0 }, scale: 2.0 });
+        roundtrip_app(AppToHost::Create { id: "b1".into(), url: Some("https://example.com".into()), size: Size { w: 800.0, h: 600.0 }, scale: 2.0, profile: None });
         roundtrip_app(AppToHost::Resize { id: "b1".into(), size: Size { w: 400.0, h: 300.0 }, scale: 2.0 });
         roundtrip_app(AppToHost::FrameAck { id: "b1".into(), seq: 7 });
         roundtrip_app(AppToHost::Input { id: "b1".into(), event: InputEvent::Mouse { kind: MouseKind::Down, x: 1.5, y: 2.5, button: MouseButton::Left, clicks: 2, mods } });
@@ -238,6 +243,8 @@ mod tests {
         roundtrip_app(AppToHost::Input { id: "b1".into(), event: InputEvent::Ime(ImeEvent::Cancel) });
         roundtrip_app(AppToHost::Eval { id: "b1".into(), req: 1, expr: "1+1".into() });
         roundtrip_app(AppToHost::Edit { id: "b1".into(), command: EditCommand::SelectAll });
+        roundtrip_app(AppToHost::SetColorScheme { dark: true });
+        roundtrip_app(AppToHost::Create { id: "b2".into(), url: None, size: Size { w: 10.0, h: 10.0 }, scale: 1.0, profile: Some("work".into()) });
         roundtrip_app(AppToHost::Shutdown);
     }
 
@@ -259,6 +266,8 @@ mod tests {
         assert_eq!(line, r#"{"type":"navigate","id":"b1","url":"https://x.test"}"#);
         let line = encode(&AppToHost::Edit { id: "b1".into(), command: EditCommand::SelectAll });
         assert_eq!(line, r#"{"type":"edit","id":"b1","command":"select_all"}"#);
+        let line = encode(&AppToHost::SetColorScheme { dark: true });
+        assert_eq!(line, r#"{"type":"set_color_scheme","dark":true}"#);
         let line = encode(&HostToApp::Cursor { id: "b1".into(), name: "pointer".into() });
         assert_eq!(line, r#"{"type":"cursor","id":"b1","name":"pointer"}"#);
     }
