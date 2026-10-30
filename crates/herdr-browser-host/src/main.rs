@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
 fn main() {
+    if std::env::var_os("HERDR_BROWSER_HOST_DEBUG").is_some() && !std::env::args().any(|a| a.starts_with("--type=")) {
+        eprintln!("herdr-browser-host: process started at {:?}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default());
+    }
     // CEF helper processes are this same binary started with `--type=...`; they take CEF's
     // arguments, so hand them over before parsing ours.
     #[cfg(all(feature = "cef", target_os = "macos"))]
