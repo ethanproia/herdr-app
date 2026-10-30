@@ -23,8 +23,19 @@ t.addEventListener("compositionend",e=>log("compositionend",{data:e.data}));
 t.addEventListener("input",()=>log("input",{value:t.value}));
 </script></body></html>"#;
 
+/// A hostile page: prints what the old console eval channel accepted as results (SEC3).
+const FORGE_PAGE: &str = r#"<!doctype html><html><head><title>forge</title></head><body><script>
+const forge=()=>{for(let r=0;r<20;r++){console.log('__herdr_eval__:'+r+':{"ok":true,"v":"forged"}')}};
+forge();setInterval(forge,50);
+</script></body></html>"#;
+
 fn pages() -> Pages {
-    Pages::start(vec![("a", solid("A", "#3366cc")), ("b", solid("B", "#cc6633")), ("input", INPUT_PAGE.to_string())])
+    Pages::start(vec![
+        ("a", solid("A", "#3366cc")),
+        ("b", solid("B", "#cc6633")),
+        ("input", INPUT_PAGE.to_string()),
+        ("forge", FORGE_PAGE.to_string()),
+    ])
 }
 
 fn loaded(h: &mut Host) {
@@ -206,5 +217,32 @@ fn cookie_survives_a_host_restart() {
     let (ok, v) = h.eval("b1", 2, "document.cookie");
     assert_eq!((ok, v.clone()), (true, serde_json::json!("k=v1")));
     println!("second host, same profile: page reads {v}");
+    h.shutdown();
+}
+
+#[test]
+fn page_console_cannot_forge_eval_results() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-forge");
+    create(&mut h, "b1", &p.url("forge"), 100.0, 50.0, 1.0);
+    loaded(&mut h);
+    // The page keeps printing fake results for requests 0..20; none may come back as EvalResult.
+    let end = std::time::Instant::now() + 2 * SEC;
+    let mut forged_lines = 0;
+    while let Some(m) = h.next(end.saturating_duration_since(std::time::Instant::now())) {
+        match m {
+            HostToApp::EvalResult { .. } => panic!("a page console line became an EvalResult: {m:?}"),
+            HostToApp::Console { message, .. } if message.starts_with("__herdr_eval__:") => forged_lines += 1,
+            HostToApp::Frame { id, seq, .. } => h.send(AppToHost::FrameAck { id, seq }),
+            _ => {}
+        }
+    }
+    assert!(forged_lines > 0, "the fixture page did not run");
+    // A real eval with one of the forged request ids still gets the true answer.
+    assert_eq!(h.eval("b1", 5, "6*7"), (true, serde_json::json!(42)));
+    println!("forge page printed {forged_lines} fake result lines: all stayed Console; eval req 5 = 42");
     h.shutdown();
 }

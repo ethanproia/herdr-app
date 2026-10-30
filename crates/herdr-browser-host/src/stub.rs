@@ -80,7 +80,7 @@ impl<A: SurfaceAlloc> StubHost<A> {
         use AppToHost as M;
         let mut out = Vec::new();
         match msg {
-            M::Hello { .. } => out.push(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: "stub".into(), cdp_port: None }),
+            M::Hello { .. } => out.push(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: "stub".into(), cdp_port: None, cdp_pipe: false }),
             M::Create { id, url, size, scale, .. } => {
                 let url = url.unwrap_or_else(|| "about:blank".into());
                 let b = Browser { px: pixels(size, scale), scale, seq: 0, in_flight: None, pending: false, history: vec![url.clone()], pos: 0 };
