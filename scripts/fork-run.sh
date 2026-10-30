@@ -27,6 +27,8 @@ if [[ $(canon "$home") == "$(canon "$real")" || $(canon "$home") == "$(canon "$H
   exit 1
 fi
 bin=${HERDR_APP_BIN:-$here/target/debug/herdr-app}
+# A build without the headless switch would show a window: refuse it.
+has_headless() { [[ -x $bin ]] && grep -aq HERDR_APP_HEADLESS "$bin"; }
 
 export HERDR_APP_HOME=$home
 export HC_SESSION=herdr-fork-$name
@@ -44,6 +46,10 @@ cmd=${1:-status}
 case $cmd in
   up)
     [[ -x $bin ]] || (cd "$here" && cargo build --locked)
+    if ! has_headless; then
+      echo "fork-run: $bin has no HERDR_APP_HEADLESS switch (old build?); refusing to start it" >&2
+      exit 1
+    fi
     HERDR_APP_HEADLESS=1 nohup "$bin" >"$root/app.log" 2>&1 </dev/null &
     echo $! >"$root/pid"
     for _ in $(seq 100); do "$bin" status >/dev/null 2>&1 && break; sleep 0.2; done

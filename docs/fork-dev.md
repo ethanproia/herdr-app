@@ -32,6 +32,19 @@ raises a running window and quits instead of showing the setup screen.
 `render` work against it. `window` (visible, takes focus) stays behind
 `FORK_RUN_WINDOW=1`.
 
+Why the guard exists: on 2026-10-30 a first probe ran a build from before
+the switch. Its core failed to start, so it showed the setup screen, possibly
+on Ethan's screen, for up to about a minute before it was killed.
+`fork-run.sh up` now refuses a binary that does not contain
+`HERDR_APP_HEADLESS`.
+
+Check it yourself: `scripts/fork-window-probe <pid>` (pid from
+`~/.herdr-fork-home/<name>/pid`) prints the process's windows, how many are
+on screen, its activation policy (2: no Dock icon) and whether it is active,
+from CGWindowList. Expect `windows=1 onscreen=0 activation=2 active=false`. It
+reads the window list only; System Events via osascript can raise a
+permission prompt, so don't use it.
+
 The core's state lives in `/tmp/hf-<name>`: macOS caps socket paths at 103
 bytes, and a path under the home folder is too long.
 
