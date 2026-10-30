@@ -10,6 +10,7 @@ use super::agent::{Agent, Focus, Reply, Step};
 use super::geometry::{Change, Epoch, Geometry, HoverSend, OverlayAnswer, OverlayState, Pt, Rect, zoom_factor};
 use super::input::{self, BrowserInput, OverlayEvent, Owner};
 use super::markup::{self, Markup, Tool};
+use super::zoom;
 use super::{BrowserRegistry, BrowserState, FrameSink, FrameView, HostLink};
 use crate::layout::BrowserBlock;
 use gpui::prelude::FluentBuilder as _;
@@ -421,7 +422,7 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
     }
 }
 
-actions!(browser, [FocusAddress, OpenFind]);
+actions!(browser, [FocusAddress, OpenFind, ZoomIn, ZoomOut, ZoomReset]);
 
 /// What was typed into the address bar, as a page to open: a url as it is, a bare host
 /// (`example.com/x`, `localhost:3000`) over https, anything else searched. None: nothing typed.
@@ -491,8 +492,10 @@ pub struct BrowserView {
     probe: Option<FrameProbe>,
     /// Page overlays (highlight, pick, find matches): epochs and hover coalescing (geometry.rs).
     overlay: OverlayState,
-    /// Chrome zoom level the page reported (`Viewport`).
+    /// Chrome zoom level: the one set here, or the page reported (`Viewport`).
     zoom_level: f64,
+    /// Zoom per host (shared by every block through `Browsers`).
+    zoom_prefs: Arc<Mutex<zoom::ZoomPrefs>>,
     /// The page's scroll offset the host last reported (CSS px).
     scroll: (f32, f32),
     /// The open context menu (the host asked; the app draws it).
@@ -682,6 +685,7 @@ impl BrowserView {
             probe: None,
             overlay: OverlayState::default(),
             zoom_level: 0.0,
+            zoom_prefs: Default::default(),
             scroll: (0.0, 0.0),
             menu: None,
             find: None,
@@ -743,6 +747,13 @@ impl BrowserView {
             H::Url { url, .. } => {
                 if url != self.state.url {
                     self.overlay.changed(Change::Navigate);
+                    // Another host: its remembered zoom (Chrome keeps zoom per host the same way).
+                    if zoom::host_of(&url) != zoom::host_of(&self.state.url) {
+                        let level = self.zoom_prefs.lock().unwrap().level_for(&url);
+                        if (level - self.zoom_level).abs() > 1e-6 {
+                            self.apply_zoom(level);
+                        }
+                    }
                 }
                 if url != self.state.url {
                     self.state.url = url.clone();
@@ -1248,6 +1259,30 @@ impl BrowserView {
         )
     }
 
+    /// Set the page zoom (Chrome level) and remember it for this host.
+    pub fn set_zoom(&mut self, level: f64, cx: &mut Context<Self>) {
+        self.apply_zoom(level);
+        self.zoom_prefs.lock().unwrap().set(&self.state.url, level);
+        cx.notify();
+    }
+
+    fn apply_zoom(&mut self, level: f64) {
+        self.zoom_level = level;
+        self.overlay.changed(Change::Zoom);
+        self.link.send(AppToHost::SetZoom { id: self.id.clone(), level });
+    }
+
+    /// cmd-plus / cmd-minus: Chrome's next preset in or out.
+    pub fn zoom_step(&mut self, zoom_in: bool, cx: &mut Context<Self>) {
+        let level = zoom::step(self.zoom_level, zoom_in);
+        self.set_zoom(level, cx);
+    }
+
+    /// Share the app's per-host zoom levels.
+    pub fn use_zoom_prefs(&mut self, prefs: Arc<Mutex<zoom::ZoomPrefs>>) {
+        self.zoom_prefs = prefs;
+    }
+
     /// The page zoom level (Chrome's: 0 is 100 %).
     pub fn zoom_level(&self) -> f64 {
         self.zoom_level
@@ -1304,6 +1339,10 @@ impl BrowserView {
             // Modes (part 4's owners): pick an element, mark up the page.
             .child(button("⌖", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx))))
             .child(button("✎", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Markup, cx))))
+            // The zoom label shows only off 100 %; a click resets it.
+            .when(self.zoom_level.abs() > 1e-6, |d| {
+                d.child(div().id("zoom-label").px_1().rounded_sm().cursor_pointer().bg(hsla(0., 0., 0.5, 0.15)).child(zoom::percent(self.zoom_level)).on_click(cx.listener(|v, _, _, cx| v.set_zoom(0.0, cx))))
+            })
     }
 
     fn shown_url(&self) -> String {
@@ -1461,6 +1500,9 @@ impl Render for BrowserView {
                 }
             }))
             .on_action(cx.listener(|v, _: &OpenFind, window, cx| v.open_find(window, cx)))
+            .on_action(cx.listener(|v, _: &ZoomIn, _, cx| v.zoom_step(true, cx)))
+            .on_action(cx.listener(|v, _: &ZoomOut, _, cx| v.zoom_step(false, cx)))
+            .on_action(cx.listener(|v, _: &ZoomReset, _, cx| v.set_zoom(0.0, cx)))
             .on_action(cx.listener(|v, _: &FocusAddress, window, cx| {
                 v.address.update(cx, |a, cx| {
                     a.focus(window, cx);
@@ -1486,6 +1528,10 @@ fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new(&format!("{cmd}-l"), FocusAddress, Some("Browser")),
         KeyBinding::new(&format!("{cmd}-f"), OpenFind, Some("Browser")),
+        KeyBinding::new(&format!("{cmd}-="), ZoomIn, Some("Browser")),
+        KeyBinding::new(&format!("{cmd}-+"), ZoomIn, Some("Browser")),
+        KeyBinding::new(&format!("{cmd}--"), ZoomOut, Some("Browser")),
+        KeyBinding::new(&format!("{cmd}-0"), ZoomReset, Some("Browser")),
     ]);
 }
 
@@ -1500,6 +1546,8 @@ pub struct Browsers {
     agent: Option<Arc<Mutex<Agent>>>,
     /// The browser that last took the keyboard: agent commands' default target.
     pub focused: Option<BrowserId>,
+    /// Zoom per host, `$HERDR_APP_HOME/browser/zoom.json`, loaded with the first block.
+    zoom: Option<Arc<Mutex<zoom::ZoomPrefs>>>,
 }
 
 impl Browsers {
@@ -1568,7 +1616,13 @@ impl Browsers {
                 continue;
             }
             let (link, states) = (self.link_arc(), self.states.clone());
-            let view = cx.new(|cx| BrowserView::new(&id, block, link, states, window, cx));
+            let dir = link.config().dir.clone();
+            let prefs = self.zoom.get_or_insert_with(|| Arc::new(Mutex::new(zoom::ZoomPrefs::load(dir.join("zoom.json"))))).clone();
+            let view = cx.new(|cx| {
+                let mut v = BrowserView::new(&id, block, link, states, window, cx);
+                v.use_zoom_prefs(prefs);
+                v
+            });
             let key = id.clone();
             let on = on_event.clone();
             let sub = cx.subscribe_in(&view, window, move |w, _, ev, window, cx| on(w, &key, ev, window, cx));
