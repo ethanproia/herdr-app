@@ -5,7 +5,7 @@
 
 use crate::browser::agent::Step;
 use crate::browser::protocol::PixelSize;
-use crate::browser::view::{BrowserEvent, BrowserView, Browsers, FrameEvent, HostClient, HostConfig, CHROME_HEIGHT};
+use crate::browser::view::{BrowserEvent, BrowserView, Browsers, FrameEvent, HostClient, HostConfig};
 use crate::layout::BrowserBlock;
 use gpui::{prelude::*, *};
 use image::RgbaImage;
@@ -264,8 +264,14 @@ impl Page {
     // ---- input, through the app's real path (window events -> BrowserInput) --------------
     // Coordinates are page DIPs (from the page's top-left, under the address bar).
 
-    fn at(&self, x: f32, y: f32) -> Point<Pixels> {
-        point(px(x), px(y + CHROME_HEIGHT))
+    /// The page's top under the bars (the address bar, and the find bar while open).
+    pub fn page_top(&mut self) -> f32 {
+        self.cx.update(|cx| self.view.read(cx).page_top())
+    }
+
+    fn at(&mut self, x: f32, y: f32) -> Point<Pixels> {
+        let top = self.page_top();
+        point(px(x), px(y + top))
     }
 
     fn dispatch(&mut self, ev: PlatformInput) {
@@ -397,6 +403,11 @@ impl Page {
         self.pump();
     }
 
+    /// The window, for direct updates in tests.
+    pub fn window_handle(&self) -> AnyWindowHandle {
+        self.window.into()
+    }
+
     /// Events the block sent its window (url changes, focus, new-window requests).
     pub fn events(&mut self) -> Vec<BrowserEvent> {
         self.window.update(&mut self.cx, |r, _, _| r.events.clone()).unwrap()
@@ -464,15 +475,17 @@ impl Page {
     /// One pixel of the page, at page DIPs.
     pub fn page_pixel(&mut self, x: f32, y: f32) -> [u8; 4] {
         let img = self.shot();
+        let top = self.page_top();
         let scale = img.width() as f32 / self.size.0;
-        img.get_pixel((x * scale) as u32, ((y + CHROME_HEIGHT) * scale) as u32).0
+        img.get_pixel((x * scale) as u32, ((y + top) * scale) as u32).0
     }
 
     /// The page area (page DIPs `x, y, w, h`) cut from a window shot.
     pub fn page_region(&mut self, x: f32, y: f32, w: f32, h: f32) -> RgbaImage {
         let img = self.shot();
+        let top = self.page_top();
         let scale = img.width() as f32 / self.size.0;
-        let (x, y) = ((x * scale) as u32, ((y + CHROME_HEIGHT) * scale) as u32);
+        let (x, y) = ((x * scale) as u32, ((y + top) * scale) as u32);
         image::imageops::crop_imm(&img, x, y, ((w * scale) as u32).min(img.width() - x), ((h * scale) as u32).min(img.height() - y)).to_image()
     }
 

@@ -82,6 +82,11 @@ name = "browser_menu"
 path = "tests/browser_menu.rs"
 harness = false
 
+[[test]]
+name = "browser_find"
+path = "tests/browser_find.rs"
+harness = false
+
 [dev-dependencies]
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = ["test-support"] }
 gpui = { package = "gpui-pre", version = "=0.3.8", features = ["test-support"] }
