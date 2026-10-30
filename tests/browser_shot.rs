@@ -6,6 +6,24 @@
 mod layout;
 #[path = "../src/browser/mod.rs"]
 mod browser;
+/// The app's settings.rs needs the whole app; the block only reads the search engine.
+mod settings {
+    #[derive(Clone, Copy)]
+    pub enum SearchEngine {
+        Google,
+    }
+    impl SearchEngine {
+        pub fn url(self, q: &str) -> String {
+            format!("https://www.google.com/search?q={q}")
+        }
+    }
+    pub struct Settings {
+        pub search_engine: SearchEngine,
+    }
+    pub fn get() -> Settings {
+        Settings { search_engine: SearchEngine::Google }
+    }
+}
 mod mods {
     pub fn app_dir() -> std::path::PathBuf {
         std::env::temp_dir()
@@ -19,6 +37,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use gpui_base::input::InputEvent;
 
 struct Scene {
     browser: Entity<BrowserView>,
@@ -59,6 +79,7 @@ fn main() {
     let seen = fake_host(dir.join("host.sock"));
     let link = HostClient::new(HostConfig { dir, program: "/nonexistent".into(), args: vec![] });
     let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
+    cx.update(gpui_base::init);
     let block = layout::BrowserBlock { url: "https://example.com".into(), profile: "default".into() };
     let states = Arc::new(Mutex::new(HashMap::new()));
     let window = cx
@@ -94,6 +115,34 @@ fn main() {
     let (size, k, url) = create.expect("Create sent");
     assert_eq!((size.w, size.h, url.as_deref()), (360.0, 272.0, Some("https://example.com")));
     assert_eq!(k, scale);
+    // Words typed into the address bar and Enter: the page goes to a search for them.
+    let browser = window.update(&mut cx, |scene, _, _| scene.browser.clone()).unwrap();
+    cx.update_window(window.into(), |_, window, cx| {
+        let address = browser.read(cx).address().clone();
+        address.update(cx, |a, cx| {
+            a.set_value("cef osr", window, cx);
+            cx.emit(InputEvent::PressEnter { secondary: false, shift: false });
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !seen.lock().unwrap().iter().any(|m| matches!(m, AppToHost::Navigate { id, url } if id == "web" && url == "https://www.google.com/search?q=cef osr")) {
+        assert!(Instant::now() < deadline, "Enter in the address bar didn't navigate: {:?}", seen.lock().unwrap());
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // cmd-L from the page puts the cursor in the address bar.
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| {
+        let _ = window.draw(cx);
+        window.dispatch_action(Box::new(browser::view::FocusAddress), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let focused = cx.update_window(window.into(), |_, window, cx| browser.read(cx).address().read(cx).focus_handle(cx).is_focused(window)).unwrap();
+    assert!(focused, "FocusAddress (cmd-L) focuses the address bar");
+    drop(browser);
     // The block goes: its page is closed on the host and nothing stays open.
     cx.update_window(window.into(), |_, window, _| window.remove_window()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);

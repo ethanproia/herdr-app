@@ -399,6 +399,40 @@ pub struct Person {
     pub theme: Option<crate::layout::ThemeChoice>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub colors: BTreeMap<String, String>,
+    /// Where words typed into a browser block's address bar are searched.
+    #[serde(skip_serializing_if = "SearchEngine::is_google")]
+    pub search_engine: SearchEngine,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchEngine {
+    #[default]
+    Google,
+    Bing,
+}
+
+impl SearchEngine {
+    fn is_google(&self) -> bool {
+        *self == Self::Google
+    }
+
+    /// The results page for `q`.
+    pub fn url(self, q: &str) -> String {
+        let base = match self {
+            Self::Google => "https://www.google.com/search?q=",
+            Self::Bing => "https://www.bing.com/search?q=",
+        };
+        let mut out = String::from(base);
+        for b in q.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+                b' ' => out.push('+'),
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -451,6 +485,7 @@ impl Default for Person {
             appearance: Appearance::System,
             theme: None,
             colors: BTreeMap::new(),
+            search_engine: SearchEngine::Google,
         }
     }
 }
@@ -482,6 +517,7 @@ pub struct Settings {
     pub clipboard_write: bool,
     pub minimum_contrast: f32,
     pub option_as_alt: OptionAsAlt,
+    pub search_engine: SearchEngine,
     pub sounds: Sounds,
 }
 
@@ -522,6 +558,7 @@ impl Default for Settings {
             clipboard_write: true,
             minimum_contrast: 1.0,
             option_as_alt: OptionAsAlt::Auto,
+            search_engine: SearchEngine::Google,
             sounds: Sounds::default(),
         }
     }
@@ -559,6 +596,7 @@ impl Settings {
             clipboard_write: person.clipboard_write,
             minimum_contrast: person.minimum_contrast,
             option_as_alt: person.option_as_alt,
+            search_engine: person.search_engine,
         }
     }
 }
@@ -845,6 +883,17 @@ mod tests {
         assert_eq!((own.font_family.as_str(), own.font_size, own.ui_font_family.as_str(), own.theme.as_str()), ("layout", 14.0, "layout-ui", "ink"));
         assert_eq!(own.colors["accent"], "#abcdef");
         assert_eq!(own.colors["text"], "#ffffff");
+    }
+
+    #[test]
+    fn search_engine_defaults_to_google_and_encodes_words() {
+        assert_eq!(Person::default().search_engine, SearchEngine::Google);
+        assert!(serde_json::to_value(Person::default()).unwrap().get("search_engine").is_none());
+        let person: Person = serde_json::from_value(serde_json::json!({"search_engine": "bing"})).unwrap();
+        let settings = Settings::compose(&person, &crate::layout::Look::default(), false);
+        assert_eq!(settings.search_engine, SearchEngine::Bing);
+        assert_eq!(SearchEngine::Google.url("rust gpui & cef"), "https://www.google.com/search?q=rust+gpui+%26+cef");
+        assert_eq!(SearchEngine::Bing.url("é"), "https://www.bing.com/search?q=%C3%A9");
     }
 
     #[test]
