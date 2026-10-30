@@ -15,6 +15,9 @@ use std::time::Duration;
 
 type Reply = mpsc::Sender<Result<Value, String>>;
 
+/// Why calls fail once the host's end of the pipe is gone (EOF on read or EPIPE on write).
+pub const STOPPED: &str = "the browser host stopped";
+
 /// One host's CDP pipe. Dropped (or failed) with its host: calls in flight get an error.
 pub struct CdpPipe {
     to_host: Mutex<File>,
@@ -41,12 +44,14 @@ impl CdpPipe {
     /// One CDP command (on a page session, or browser-level with None); its `result`, or the
     /// error's message. Fails at once when the pipe is over, or after `timeout`.
     pub fn call(&self, session: Option<&str>, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
-        if let Some(why) = self.dead.lock().unwrap().clone() {
-            return Err(why);
-        }
         let id = self.next.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, tx);
+        // Checked after registering, so a pipe that dies now still fails this call (by `fail`).
+        if let Some(why) = self.dead.lock().unwrap().clone() {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(why);
+        }
         let mut msg = json!({ "id": id, "method": method, "params": params });
         if let Some(s) = session {
             msg["sessionId"] = json!(s);
@@ -54,10 +59,12 @@ impl CdpPipe {
         let mut bytes = serde_json::to_vec(&msg).map_err(|e| e.to_string())?;
         bytes.push(0);
         if let Err(e) = self.to_host.lock().unwrap().write_all(&bytes) {
+            // The host's end is gone (EPIPE): the same as the reader seeing EOF, whichever
+            // noticed first. A restart that already failed the pipe keeps its own reason.
+            tracing::debug!("cdp pipe write: {e}");
+            self.fail(STOPPED);
             self.pending.lock().unwrap().remove(&id);
-            let why = format!("cdp pipe closed: {e}");
-            self.fail(&why);
-            return Err(why);
+            return Err(self.dead.lock().unwrap().clone().unwrap_or_else(|| STOPPED.into()));
         }
         match rx.recv_timeout(timeout) {
             Ok(r) => r,
@@ -65,7 +72,7 @@ impl CdpPipe {
                 self.pending.lock().unwrap().remove(&id);
                 Err(format!("{method}: no answer in {} ms", timeout.as_millis()))
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(self.dead.lock().unwrap().clone().unwrap_or_else(|| "cdp pipe closed".into())),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(self.dead.lock().unwrap().clone().unwrap_or_else(|| STOPPED.into())),
         }
     }
 
@@ -138,9 +145,13 @@ fn read(mut from_host: File, pipe: std::sync::Weak<CdpPipe>) {
         }
     }
     if let Some(p) = pipe.upgrade() {
-        p.fail("the browser host stopped");
+        p.fail(STOPPED);
     }
 }
+
+/// Serializes pipe creation with the spawns that could inherit a pipe end before it is
+/// close-on-exec (`spawn_with_pipe`, and tests' other spawns).
+pub static SPAWN: Mutex<()> = Mutex::new(());
 
 /// Spawn `cmd` with CDP on its fds 3 (it reads) and 4 (it writes); the app's ends are
 /// close-on-exec, so no other child inherits them.
@@ -158,14 +169,26 @@ pub fn spawn_with_pipe(cmd: &mut Command) -> std::io::Result<(Child, Arc<CdpPipe
         }
         Ok((fds[0], fds[1]))
     }
+    // macOS has no pipe2: close-on-exec comes a moment after pipe(). Pipes made here and the
+    // spawn are serialized, and the host closes every fd above 4 before exec, so it never holds
+    // another pipe's end (which would keep a dead host's pipe open).
+    let _serial = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
     // app -> host: the child reads `a_r` as fd 3; host -> app: the child writes `b_w` as fd 4.
     let (a_r, a_w) = pipe()?;
     let (b_r, b_w) = pipe()?;
     unsafe {
         cmd.pre_exec(move || {
-            // dup2 clears close-on-exec on the new fds; the originals close at exec.
-            if libc::dup2(a_r, 3) < 0 || libc::dup2(b_w, 4) < 0 {
+            // The ends may themselves be fd 3 or 4 (a process with few files open): move both above
+            // 9 first, so placing one never closes the other. dup2 clears close-on-exec on 3 and 4;
+            // the loop below closes the copies.
+            let r = libc::fcntl(a_r, libc::F_DUPFD, 10);
+            let w = libc::fcntl(b_w, libc::F_DUPFD, 10);
+            if r < 0 || w < 0 || libc::dup2(r, 3) < 0 || libc::dup2(w, 4) < 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            let max = libc::getdtablesize().clamp(5, 65536);
+            for fd in 5..max {
+                libc::close(fd);
             }
             Ok(())
         });
@@ -266,10 +289,11 @@ while True:
         let p = pipe.clone();
         let waiting = std::thread::spawn(move || p.call(None, "Die", json!({}), Duration::from_secs(30)));
         let r = waiting.join().unwrap();
-        assert_eq!(r.unwrap_err(), "the browser host stopped");
+        assert_eq!(r.unwrap_err(), STOPPED);
         assert!(pipe.is_dead());
         let t = std::time::Instant::now();
-        assert_eq!(pipe.call(None, "Echo", json!({}), T).unwrap_err(), "the browser host stopped");
+        // Whichever side notices first (EPIPE on write, EOF on read): the same answer.
+        assert_eq!(pipe.call(None, "Echo", json!({}), T).unwrap_err(), STOPPED);
         assert!(t.elapsed() < Duration::from_millis(100), "no wait on a dead pipe");
         let _ = child.wait();
     }
@@ -287,7 +311,10 @@ while True:
     fn the_apps_ends_do_not_leak_into_other_children() {
         let (mut child, pipe) = fake();
         // Another child (a second host, a shell) must not inherit any pipe end: no fd above 2 is a pipe.
-        let out = Command::new("sh").arg("-c").arg("for i in 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do [ -p /dev/fd/$i ] && echo $i; done; true").output().unwrap();
+        let out = {
+            let _serial = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+            Command::new("sh").arg("-c").arg("for i in 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do [ -p /dev/fd/$i ] && echo $i; done; true").output().unwrap()
+        };
         let leaked = String::from_utf8_lossy(&out.stdout).trim().to_owned();
         assert!(leaked.is_empty(), "another child holds pipe fds {leaked:?}");
         drop(pipe);

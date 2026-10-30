@@ -9,6 +9,11 @@
 use super::agent::{Agent, Focus, Reply, Step};
 use super::cdp::CdpPipe;
 
+/// `HERDR_BROWSER_CDP_PIPE=1`: CDP on the pipe (opt-in until the broker flips the default).
+fn cdp_pipe_wanted() -> bool {
+    std::env::var("HERDR_BROWSER_CDP_PIPE").is_ok_and(|v| v == "1")
+}
+
 /// Start the host with CDP on fds 3/4 (macOS; elsewhere no pipe yet).
 #[cfg(target_os = "macos")]
 fn spawn_cdp(cmd: &mut Command) -> std::io::Result<(Child, Arc<CdpPipe>)> {
@@ -108,9 +113,9 @@ pub struct HostConfig {
     pub program: PathBuf,
     /// Extra arguments (`--stub` from `$HERDR_BROWSER_HOST_ARGS`, for tests).
     pub args: Vec<String>,
-    /// A TCP CDP port: dev-only and unsafe (any local process can attach), so off unless
-    /// `$HERDR_BROWSER_CDP_PORT` asks (0 picks one). Without it the host gets CDP on a pipe only
-    /// the app holds (docs/browser-cdp-pipe.md), when the app starts the host itself.
+    /// A TCP CDP port (0 picks one; any local process can attach). Today's default until the broker
+    /// lands; `HERDR_BROWSER_CDP_PIPE=1` puts CDP on a pipe only the app holds instead
+    /// (docs/browser-cdp-pipe.md), when the app starts the host itself.
     pub cdp_port: Option<u16>,
 }
 
@@ -120,9 +125,13 @@ impl HostConfig {
             std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("herdr-browser-host"))).unwrap_or_else(|| "herdr-browser-host".into())
         });
         let args = std::env::var("HERDR_BROWSER_HOST_ARGS").map(|a| a.split_whitespace().map(str::to_owned).collect()).unwrap_or_default();
+        // The pipe is opt-in (HERDR_BROWSER_CDP_PIPE=1) until the host side and the broker land;
+        // until then agents use the TCP port, as before.
         let cdp_port = match std::env::var("HERDR_BROWSER_CDP_PORT").ok().as_deref() {
-            None | Some("off") | Some("") => None,
-            Some(p) => p.parse().ok().or(Some(0)),
+            Some("off") => None,
+            Some(p) if !p.is_empty() => p.parse().ok().or(Some(0)),
+            _ if cdp_pipe_wanted() => None,
+            _ => Some(0),
         };
         Self { dir: crate::mods::app_dir().join("browser"), program, args, cdp_port }
     }
@@ -338,7 +347,7 @@ impl Writer {
                 let _ = std::fs::remove_file(&sock);
                 let mut cmd = Command::new(&self.config.program);
                 cmd.arg("--socket").arg(&sock).args(&self.config.args).stdin(Stdio::null());
-                let spawned = if self.config.cdp_port.is_none() && cfg!(target_os = "macos") {
+                let spawned = if self.config.cdp_port.is_none() && cdp_pipe_wanted() && cfg!(target_os = "macos") {
                     spawn_cdp(&mut cmd).map(|(c, p)| (c, Some(p)))
                 } else {
                     cmd.spawn().map(|c| (c, None))
