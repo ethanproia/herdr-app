@@ -62,6 +62,11 @@ name = "browser_input"
 path = "tests/browser_input.rs"
 harness = false
 
+[[test]]
+name = "browser_parity_smoke"
+path = "tests/browser_parity_smoke.rs"
+harness = false
+
 [dev-dependencies]
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = ["test-support"] }
 gpui = { package = "gpui-pre", version = "=0.3.8", features = ["test-support"] }

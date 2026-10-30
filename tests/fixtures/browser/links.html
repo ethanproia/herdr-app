@@ -1,0 +1,7 @@
+<!doctype html><title>links</title>
+<style>body{font:18px sans-serif;margin:20px} a,button{display:block;margin:12px 0}</style>
+<a id=same href="form.html">same tab</a>
+<a id=blank href="form.html#blank" target=_blank>target=_blank</a>
+<button id=open onclick="window.open('form.html#open')">window.open</button>
+<a id=plain href="scroll.html">plain link (cmd-click / middle-click opens a new tab)</a>
+<script>function rect(id){const r=document.getElementById(id).getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}}</script>

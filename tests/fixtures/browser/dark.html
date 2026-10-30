@@ -1,0 +1,9 @@
+<!doctype html><title>dark</title>
+<style>body{margin:0;height:100vh;background:#fff;color:#000} @media (prefers-color-scheme: dark){body{background:#000;color:#fff}}</style>
+<p>scheme: <span id=s></span></p>
+<script>
+// window.scheme(): 'dark' or 'light' as the page sees it; the background is black or white for pixel checks.
+window.scheme=()=>matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+const s=document.getElementById('s');s.textContent=window.scheme();
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>s.textContent=window.scheme());
+</script>
