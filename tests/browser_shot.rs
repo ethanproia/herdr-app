@@ -42,11 +42,13 @@ use gpui_base::input::InputEvent;
 
 struct Scene {
     browser: Entity<BrowserView>,
+    /// Width of the block beside the browser (changing it resizes the browser block).
+    left: f32,
 }
 
 impl Render for Scene {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().flex().bg(rgb(0x123456)).child(div().w(px(120.)).h_full().bg(rgb(0x1e1e1e))).child(div().flex_1().h_full().child(self.browser.clone()))
+        div().size_full().flex().bg(rgb(0x123456)).child(div().w(px(self.left)).h_full().bg(rgb(0x1e1e1e))).child(div().flex_1().h_full().child(self.browser.clone()))
     }
 }
 
@@ -72,7 +74,109 @@ fn fake_host(sock: std::path::PathBuf) -> Arc<Mutex<Vec<AppToHost>>> {
     seen
 }
 
+/// Against the stub host (`HERDR_BROWSER_HOST`): its IOSurface frames are painted in the block
+/// (left half red 0xC0, right half 0x40), acked after paint, and a resize brings a newer frame.
+fn stub_frames() {
+    let Some(program) = std::env::var_os("HERDR_BROWSER_HOST") else {
+        println!("HERDR_BROWSER_HOST unset: stub frame test skipped");
+        return;
+    };
+    frames(program.into(), vec!["--stub".into()], "https://example.com", |l, r| {
+        let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 6;
+        near(l[0], 0xC0) && near(r[0], 0x40)
+    });
+}
+
+/// The real CEF host (`HERDR_BROWSER_CEF_HOST`, the bundle from scripts/fork-host-bundle.sh)
+/// paints an orange page into the block. `HERDR_BROWSER_FRAME_SHOT` keeps the picture.
+fn cef_frames() {
+    let Some(program) = std::env::var_os("HERDR_BROWSER_CEF_HOST") else {
+        println!("HERDR_BROWSER_CEF_HOST unset: real CEF frame test skipped");
+        return;
+    };
+    let page = "data:text/html,<body style='margin:0;background:%23ff8000'><h1 style='font:40px sans-serif;color:%23fff;padding:20px'>CEF in Herdr</h1></body>";
+    frames(program.into(), vec![], page, |l, r| {
+        let orange = |p: [u8; 4]| p[0] > 0xF0 && (0x70..0x90).contains(&p[1]) && p[2] < 0x10;
+        orange(l) && orange(r)
+    });
+}
+
+/// Paints the frames `program` sends for `url` in a block, checks two page pixels with `ok`
+/// (left and right halves, low in the page), and that a resize brings a newer frame.
+fn frames(program: std::path::PathBuf, args: Vec<String>, url: &str, ok: impl Fn([u8; 4], [u8; 4]) -> bool) {
+    let dir = std::path::PathBuf::from(format!("/tmp/hb-{}-frames-{}", std::process::id(), args.len()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let link = HostClient::new(HostConfig { dir, program, args });
+    let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
+    cx.update(gpui_base::init);
+    let block = layout::BrowserBlock { url: url.into(), profile: "default".into() };
+    let states = Arc::new(Mutex::new(HashMap::new()));
+    let window = cx
+        .open_window(size(px(480.), px(300.)), |window, cx| {
+            let browser = cx.new(|cx| BrowserView::new("web", block, link.clone(), states.clone(), window, cx));
+            cx.new(|_| Scene { browser, left: 120. })
+        })
+        .unwrap();
+    let browser = window.update(&mut cx, |scene, _, _| scene.browser.clone()).unwrap();
+    let wait_seq = |cx: &mut HeadlessAppContext, above: u64| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            cx.update_window(window.into(), |_, window, cx| {
+                let _ = window.draw(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            let seq = cx.update(|cx| browser.read(cx).frame_seq());
+            if let Some(seq) = seq.filter(|s| *s > above) {
+                return seq;
+            }
+            assert!(Instant::now() < deadline, "no frame above {above} (last {seq:?})");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    // Real pages paint more than once while loading: wait until the check holds.
+    let mut first = wait_seq(&mut cx, 0);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (image, l, r) = loop {
+        cx.update_window(window.into(), |_, window, cx| {
+            let _ = window.draw(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let image = cx.capture_screenshot(window.into()).unwrap();
+        let scale = image.width() as f32 / 480.0;
+        let at = |x: f32, y: f32| image.get_pixel((x * scale) as u32, (y * scale) as u32).0;
+        // Page area: x 120..480 (DIPs), y 28..300; a pixel low in each half.
+        let (l, r) = (at(180., 250.), at(420., 250.));
+        if ok(l, r) {
+            break (image, l, r);
+        }
+        assert!(Instant::now() < deadline, "frame {first} painted: left {l:?} right {r:?}");
+        first = wait_seq(&mut cx, first);
+    };
+    if let Some(out) = std::env::var_os("HERDR_BROWSER_FRAME_SHOT") {
+        image.save(&out).unwrap();
+    }
+    let scale = image.width() as f32 / 480.0;
+    let at = |x: f32, y: f32| image.get_pixel((x * scale) as u32, (y * scale) as u32).0;
+    assert_eq!(at(60., 150.), [0x1e, 0x1e, 0x1e, 255], "the block beside it");
+    // The painted frame was acked; a resize then brings a newer frame (the stub holds one until acked).
+    window.update(&mut cx, |scene, _, cx| {
+        scene.left = 200.;
+        cx.notify();
+    })
+    .unwrap();
+    let second = wait_seq(&mut cx, first);
+    println!("frames passed ({}):", if url.starts_with("data:") { "real CEF" } else { "stub" }); println!("  frame {first} painted ({l:?} | {r:?}), frame {second} after resize");
+    drop(browser);
+    cx.update_window(window.into(), |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+}
+
 fn main() {
+    stub_frames();
+    cef_frames();
     let dir = std::path::PathBuf::from(format!("/tmp/hb-{}-shot", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -85,7 +189,7 @@ fn main() {
     let window = cx
         .open_window(size(px(480.), px(300.)), |window, cx| {
             let browser = cx.new(|cx| BrowserView::new("web", block, link.clone(), states.clone(), window, cx));
-            cx.new(|_| Scene { browser })
+            cx.new(|_| Scene { browser, left: 120. })
         })
         .unwrap();
     let ready = |s: &Mutex<HashMap<String, browser::BrowserState>>| s.lock().unwrap().get("web").is_some_and(|s| s.title == "Example");

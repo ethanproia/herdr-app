@@ -6,12 +6,12 @@
 //! send, replaying every open browser. Each block gets a `BrowserView` that turns host events into
 //! `BrowserState`, sizes the page to the block, hands frames to a `FrameSink` and shows a reload
 //! card after a crash. `Browsers` keeps one view per browser block in the layouts.
-use super::{BrowserRegistry, BrowserState, FrameSink, HostLink};
+use super::{BrowserRegistry, BrowserState, FrameSink, FrameView, HostLink};
 use crate::layout::BrowserBlock;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_base::input::{Input, InputEvent, InputState};
-use herdr_browser_protocol::{self as protocol, AppToHost, BrowserId, HostToApp, PixelSize, Size as Dips, SurfaceRef};
+use herdr_browser_protocol::{self as protocol, AppToHost, BrowserId, HostToApp, PixelSize, Size as Dips};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -258,7 +258,8 @@ impl Writer {
         let mut conn = Conn { stream, child, generation };
         let hello = AppToHost::Hello {
             version: protocol::PROTOCOL_VERSION,
-            profile_dir: self.config.dir.join("profile").to_string_lossy().into_owned(),
+            // Resolved (/tmp is /private/tmp on macOS): CEF wants its cache under this exact path.
+            profile_dir: std::fs::canonicalize(&self.config.dir).unwrap_or_else(|_| self.config.dir.clone()).join("profile").to_string_lossy().into_owned(),
             cdp_port: None,
         };
         conn.stream.write_all(format!("{}\n", protocol::encode(&hello)).as_bytes())?;
@@ -377,23 +378,6 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
     }
 }
 
-/// Until part 3 paints frames: remembers the newest so the host keeps sending.
-#[derive(Default)]
-pub struct NoFrames {
-    newest: Option<u64>,
-}
-
-impl FrameSink for NoFrames {
-    fn on_frame(&mut self, seq: u64, _: SurfaceRef, _: PixelSize, _: f32) -> anyhow::Result<()> {
-        self.newest = Some(seq);
-        Ok(())
-    }
-    fn on_resize_pending(&mut self, _: Dips) {}
-    fn ack(&mut self) -> Option<u64> {
-        self.newest
-    }
-}
-
 actions!(browser, [FocusAddress]);
 
 /// What was typed into the address bar, as a page to open: a url as it is, a bare host
@@ -438,7 +422,9 @@ pub struct BrowserView {
     crashed: Option<String>,
     /// Size and scale the host was last told; None: no page made yet.
     sized: Option<(Dips, f32)>,
-    sink: Box<dyn FrameSink>,
+    /// The newest frame from the host, painted into the page area (part 3).
+    frames: FrameView,
+    /// The last frame acked (each frame is acked once, however often it's painted).
     acked: Option<u64>,
     focus: FocusHandle,
     /// The address bar; shows the page's url unless someone is typing in it.
@@ -491,7 +477,7 @@ impl BrowserView {
             state,
             crashed: None,
             sized: None,
-            sink: Box::new(NoFrames::default()),
+            frames: FrameView::new(),
             acked: None,
             focus,
             address,
@@ -501,11 +487,6 @@ impl BrowserView {
             _focus: [on, off],
             _address: typed,
         }
-    }
-
-    /// Part 3 hands its painter here.
-    pub fn set_frame_sink(&mut self, sink: Box<dyn FrameSink>) {
-        self.sink = sink;
     }
 
     /// The address bar's text state (tests type into it).
@@ -564,14 +545,15 @@ impl BrowserView {
                 // The host forgets the page; the reload card makes it again.
                 self.crashed = Some(reason);
                 self.sized = None;
+                self.frames.clear();
+                self.acked = None;
                 self.state.loading = false;
             }
             H::Frame { seq, surface, size, scale, .. } => {
-                if let Err(e) = self.sink.on_frame(seq, surface, size, scale) {
+                // Acked once painted (`send_ack` after the draw), so the host sends at most one ahead.
+                if let Err(e) = self.frames.on_frame(seq, surface, size, scale) {
                     tracing::warn!("browser {}: frame {seq}: {e:#}", self.id);
-                }
-                if let Some(seq) = self.sink.ack().filter(|s| Some(*s) != self.acked) {
-                    self.acked = Some(seq);
+                    // Unpaintable: ack anyway, or the host waits on it forever.
                     self.link.send(AppToHost::FrameAck { id: self.id.clone(), seq });
                 }
             }
@@ -594,7 +576,7 @@ impl BrowserView {
             }
             Some((s, k)) if (s.w - size.w).abs() < 0.5 && (s.h - size.h).abs() < 0.5 && k == scale => return,
             Some(_) => {
-                self.sink.on_resize_pending(size);
+                self.frames.on_resize_pending(size);
                 self.link.send(AppToHost::Resize { id: self.id.clone(), size, scale });
             }
         }
@@ -605,8 +587,22 @@ impl BrowserView {
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.crashed = None;
         self.sized = None;
+        self.frames.clear();
         self.acked = None;
         cx.notify();
+    }
+
+    /// After a draw: the frame painted in it may be acked, so the host sends the next.
+    fn send_ack(&mut self) {
+        if let Some(seq) = self.frames.ack().filter(|s| Some(*s) != self.acked) {
+            self.acked = Some(seq);
+            self.link.send(AppToHost::FrameAck { id: self.id.clone(), seq });
+        }
+    }
+
+    /// The newest frame's sequence number, if one is shown.
+    pub fn frame_seq(&self) -> Option<u64> {
+        self.frames.seq()
     }
 
     fn chrome(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -695,12 +691,20 @@ impl Render for BrowserView {
                 .absolute()
                 .size_full(),
             );
-        // Part 3 paints the frame here; until then the page is a white sheet with its url.
-        let page = match &self.crashed {
-            None => page.child(
+        // The page's newest frame; before the first one, a white sheet with its url.
+        let frame = if self.crashed.is_none() { self.frames.element() } else { None };
+        if frame.is_some() {
+            let me = cx.entity().downgrade();
+            window.defer(cx, move |_, cx| {
+                let _ = me.update(cx, |v, _| v.send_ack());
+            });
+        }
+        let page = match (&self.crashed, frame) {
+            (None, Some(frame)) => page.child(div().absolute().size_full().child(frame)),
+            (None, None) => page.child(
                 div().absolute().size_full().flex().items_center().justify_center().text_color(rgb(0x606060)).text_sm().child(self.shown_url()),
             ),
-            Some(reason) => page.child(
+            (Some(reason), _) => page.child(
                 div()
                     .absolute()
                     .size_full()
