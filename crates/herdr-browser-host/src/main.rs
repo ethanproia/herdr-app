@@ -1,6 +1,12 @@
 use std::path::PathBuf;
 
 fn main() {
+    // CEF helper processes are this same binary started with `--type=...`; they take CEF's
+    // arguments, so hand them over before parsing ours.
+    #[cfg(all(feature = "cef", target_os = "macos"))]
+    if std::env::args().any(|a| a.starts_with("--type=")) {
+        std::process::exit(herdr_browser_host::cef::main(None));
+    }
     let mut socket = None;
     let mut stub = false;
     let mut args = std::env::args().skip(1);
@@ -15,15 +21,21 @@ fn main() {
         }
     }
     let Some(socket) = socket else {
-        eprintln!("usage: herdr-browser-host --socket <path> --stub");
+        eprintln!("usage: herdr-browser-host --socket <path> [--stub]");
         std::process::exit(2);
     };
-    if !stub {
-        eprintln!("herdr-browser-host: the CEF host is not built yet; pass --stub");
-        std::process::exit(2);
+    if stub {
+        if let Err(e) = herdr_browser_host::serve(&socket, herdr_browser_host::IoSurfaces) {
+            eprintln!("herdr-browser-host: {e}");
+            std::process::exit(1);
+        }
+        return;
     }
-    if let Err(e) = herdr_browser_host::serve(&socket, herdr_browser_host::IoSurfaces) {
-        eprintln!("herdr-browser-host: {e}");
-        std::process::exit(1);
+    #[cfg(all(feature = "cef", target_os = "macos"))]
+    std::process::exit(herdr_browser_host::cef::main(Some(&socket)));
+    #[cfg(not(all(feature = "cef", target_os = "macos")))]
+    {
+        eprintln!("herdr-browser-host: built without the `cef` feature; pass --stub");
+        std::process::exit(2);
     }
 }
