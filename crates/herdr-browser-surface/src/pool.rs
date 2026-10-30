@@ -1,5 +1,6 @@
 //! Host-side frame pool: one frame in flight per browser, only the newest pending frame kept,
-//! surfaces recycled on `FrameAck` (contract D3).
+//! surfaces recycled on `FrameAck` (contract D3). The app keeps showing the last acked frame
+//! until the next one arrives, so an ack for seq N recycles the frame shown before N, never N.
 
 use crate::{Result, Surface, create_pixels};
 use herdr_browser_protocol::PixelSize;
@@ -14,6 +15,8 @@ pub struct PoolFrame {
 pub struct FramePool {
     free: Vec<Surface>,
     in_flight: Option<PoolFrame>,
+    /// Acked and on screen in the app: not reusable until a newer frame is acked.
+    displayed: Option<PoolFrame>,
     pending: Option<PoolFrame>,
     next_seq: u64,
     created: usize,
@@ -50,20 +53,25 @@ impl FramePool {
         None
     }
 
-    /// The app acked `seq`: recycle the in-flight surface and promote the pending frame, which
-    /// the caller then sends. Acks for anything but the in-flight seq are ignored.
+    /// The app acked `seq`: it is now on screen, the frame it replaced is recycled, and the
+    /// pending frame (if any) is promoted for the caller to send. Other seqs are ignored.
     pub fn ack(&mut self, seq: u64) -> Option<&PoolFrame> {
         if self.in_flight.as_ref().map(|f| f.seq) != Some(seq) {
             return None;
         }
-        let done = self.in_flight.take().expect("checked");
-        self.free.push(done.surface);
+        if let Some(old) = self.displayed.replace(self.in_flight.take().expect("checked")) {
+            self.free.push(old.surface);
+        }
         self.in_flight = self.pending.take();
         self.in_flight.as_ref()
     }
 
     pub fn in_flight_seq(&self) -> Option<u64> {
         self.in_flight.as_ref().map(|f| f.seq)
+    }
+
+    pub fn displayed_seq(&self) -> Option<u64> {
+        self.displayed.as_ref().map(|f| f.seq)
     }
 
     pub fn pending_seq(&self) -> Option<u64> {
@@ -73,5 +81,12 @@ impl FramePool {
     /// Surfaces this pool ever allocated (tests check recycling keeps this small).
     pub fn created(&self) -> usize {
         self.created
+    }
+}
+
+impl FramePool {
+    /// Id of the surface on screen in the app (0 if none). For tests.
+    pub fn displayed_id(&self) -> u32 {
+        self.displayed.as_ref().map_or(0, |f| f.surface.id())
     }
 }
