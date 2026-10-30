@@ -586,12 +586,13 @@ fn input(host: &BrowserHost, ev: InputEvent) {
             let e = MouseEvent { x: x.round() as i32, y: y.round() as i32, modifiers: flags(&mods) };
             host.send_mouse_wheel_event(Some(&e), (dx * k).round() as i32, (dy * k).round() as i32);
         }
-        InputEvent::Key { kind, key, code, native, mods, .. } => {
+        InputEvent::Key { kind, key, code, native, repeat, mods } => {
             use sys::cef_key_event_type_t as K;
             let ch = if key.chars().count() == 1 { key.encode_utf16().next().unwrap_or(0) } else { keys::mac_character(&code) };
             let e = KeyEvent {
                 type_: KeyEventType::from(if kind == KeyKind::Down { K::KEYEVENT_RAWKEYDOWN } else { K::KEYEVENT_KEYUP }),
-                modifiers: flags(&mods),
+                // HERDR: auto-repeat reaches the page as KeyboardEvent.repeat.
+                modifiers: flags(&mods) | if repeat { sys::cef_event_flags_t::EVENTFLAG_IS_REPEAT.0 } else { 0 },
                 windows_key_code: keys::windows_key_code(&code, &key),
                 native_key_code: native as i32,
                 character: ch,

@@ -374,16 +374,16 @@ fn i6(s: &mut S) {
     metric("I6.wheel_3_lines", &v, "px", "120");
     s.check("I6", "a 3-line wheel step", &v, &json!(120));
     let max = s.eval("document.documentElement.scrollHeight-innerHeight").as_f64().unwrap();
-    s.eval(&format!("scrollTo(0,{});1", max - 100.));
-    s.until("scrollY", &json!(max - 100.));
+    s.eval(&format!("scrollTo(0,{});1", max as i64 - 100));
+    s.until("scrollY", &json!(max as i64 - 100));
     wheel(s, 200., 200., ScrollDelta::Pixels(point(px(0.), px(-500.))), TouchPhase::Moved);
-    let (v, _) = s.until("scrollY", &json!(max));
-    s.check("I6", "no overshoot past the page end", &v, &json!(max));
+    let (v, _) = s.until("scrollY", &json!(max as i64));
+    s.check("I6", "no overshoot past the page end", &v, &json!(max as i64));
     let start = Instant::now();
     wheel(s, 200., 200., ScrollDelta::Pixels(point(px(0.), px(50.))), TouchPhase::Moved);
-    let (v, _) = s.until("scrollY", &json!(max - 50.));
+    let (v, _) = s.until("scrollY", &json!(max as i64 - 50));
     metric("I6.reverse_at_end", start.elapsed().as_millis(), "ms", "<= 100, no dead scroll");
-    s.check("I6", "the first reverse scroll at the end moves", &v, &json!(max - 50.));
+    s.check("I6", "the first reverse scroll at the end moves", &v, &json!(max as i64 - 50));
     s.eval("scrollTo(0,0);1");
     s.until("scrollY", &json!(0));
 }
