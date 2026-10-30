@@ -120,3 +120,25 @@ cef-rs examples.
   Spotlight skips): `target/` (the one `CARGO_TARGET_DIR`), `wt/` (worktrees), `cef/`
   (`CEF_PATH`), `scratch/`. New worktrees take ghostty with
   `git submodule update --init --reference ~/code/herdr-app/.git/modules/vendor/ghostty vendor/ghostty`.
+
+## Dynamic-site checks: `scripts/fork-web.ts`
+
+Parity plan section W, against a headless fork, one site at a time:
+
+```sh
+export HERDR_APP_BIN=$HOME/work.noindex/herdr-fork/target/debug/herdr-app
+export HERDR_BROWSER_HOST=$HOME/work.noindex/herdr-fork/host-cef/herdr-browser-host.app/Contents/MacOS/herdr-browser-host
+scripts/fork-run.sh web up
+scripts/fork-run.sh web do space.new
+scripts/fork-run.sh web do browser.open --url about:blank
+scripts/fork-run.sh web shot /tmp/hf-web-start.png   # the first draw starts the host
+bun scripts/fork-web.ts web W1                       # W1..W5; JSON with pass, load_ms, fps, console errors, shots
+scripts/fork-run.sh web down
+```
+
+Input goes through the CDP port (`Input.*`, the agent path); screenshots
+through `browser.screenshot`. Fps is frames the page painted (rAF) while
+wheel-scrolling, or decoded video frames for W3, not frames the app drew.
+A headless window never draws, so until the app acks frames itself when
+headless, the script draws the app before each screenshot
+(`FORK_WEB_NO_DRAW=1` skips that).

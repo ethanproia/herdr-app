@@ -32,7 +32,7 @@ ws.onmessage = e => {
   if (m.id && waiting.has(m.id)) { waiting.get(m.id)!(m); waiting.delete(m.id); return; }
   if (m.method === "Runtime.exceptionThrown") consoleErrors.push(m.params.exceptionDetails?.exception?.description?.split("\n")[0] ?? m.params.exceptionDetails?.text);
   if (m.method === "Runtime.consoleAPICalled" && m.params.type === "error") consoleErrors.push(m.params.args.map((a: any) => a.value ?? a.description).join(" ").slice(0, 200));
-  if (m.method === "Log.entryAdded" && m.params.entry.level === "error") consoleErrors.push(`${m.params.entry.source}: ${m.params.entry.text}`.slice(0, 200));
+  if (m.method === "Log.entryAdded" && m.params.entry.level === "error") consoleErrors.push(`${m.params.entry.source}: ${m.params.entry.text}${m.params.entry.url ? " " + m.params.entry.url : ""}`.slice(0, 240));
   for (const l of listeners) l(m);
 };
 function cdp(method: string, params: any = {}): Promise<any> {
@@ -175,13 +175,14 @@ try {
     }
     result.shot = shot("todos");
   } else if (scenario === "W5") {
-    result.load_ms = await load("https://news.ycombinator.com/news?p=1");
-    // An infinite feed with no login: Hacker News has pages, so use Wikipedia's endless random list.
-    result.load_ms = await load("https://en.wikipedia.org/wiki/Special:AllPages");
+    // The infinite-scroll library's own demo: loads more pages as you near the end.
+    result.load_ms = await load("https://infinite-scroll.com/demo/full-page/");
     const h0 = await evaluate("document.documentElement.scrollHeight");
-    result.scroll = await scrollFps(5000, 600);
-    result.height = [h0, await evaluate("document.documentElement.scrollHeight")];
+    result.scroll = await scrollFps(8000, 600);
+    const h1 = await evaluate("document.documentElement.scrollHeight");
+    result.height = [h0, h1];
     checks.scrolled = result.scroll.scrolled > 0;
+    checks.loaded_more = h1 > h0;
     result.shot = shot("scrolled");
   } else throw new Error(`unknown scenario ${scenario}`);
 } catch (e) {
