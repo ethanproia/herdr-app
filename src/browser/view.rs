@@ -842,10 +842,11 @@ impl Render for BrowserView {
             p(&FrameEvent::Painted { seq });
         }
         if frame.is_some() {
-            // Runs once GPUI has drawn and presented this scene (next vsync): only then, and only
-            // in a visible window, is the frame acked (frame.rs: presentation, not receipt).
+            // After this draw (GPUI presents it in the same tick): acked only if the window is
+            // visible (frame.rs: presentation, not receipt). Reuse is fenced separately by the
+            // IOSurface use count, so acking before the GPU finishes is safe.
             let me = cx.entity().downgrade();
-            window.on_next_frame(move |window, cx| {
+            window.defer(cx, move |window, cx| {
                 let visible = window.is_visible();
                 let _ = me.update(cx, |v, _| {
                     v.frames.presented(visible);

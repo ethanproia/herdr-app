@@ -12,8 +12,8 @@
 //! - receipt: `on_frame` imported the surface (local only; nothing is sent).
 //! - presentation: the frame was in a scene GPUI presented while the window was visible.
 //!   `element()` only records that a frame went into the scene; BrowserView calls `presented`
-//!   from `window.on_next_frame` (after the frame is drawn and presented) with
-//!   `window.is_visible()`, and only then does `ack()` yield the seq for `AppToHost::FrameAck`,
+//!   after the draw (GPUI presents it in the same tick) with `window.is_visible()`, and only then
+//!   does `ack()` yield the seq for `AppToHost::FrameAck`,
 //!   which paces the host (one frame in flight). A hidden or occluded window never acks.
 //! - safe reuse: never signalled by message. The host pool skips any IOSurface whose kernel-wide
 //!   use count is held (our CVPixelBuffer, GPUI's scene, Metal textures until GPU completion).
