@@ -211,5 +211,5 @@ pub fn solid(title: &str, css: &str) -> String {
 }
 
 pub fn create(h: &mut Host, id: &str, url: &str, w: f32, hgt: f32, scale: f32) {
-    h.send(AppToHost::Create { id: id.into(), url: Some(url.into()), size: Size { w, h: hgt }, scale });
+    h.send(AppToHost::Create { id: id.into(), url: Some(url.into()), size: Size { w, h: hgt }, scale, profile: None });
 }

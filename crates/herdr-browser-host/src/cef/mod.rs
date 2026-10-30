@@ -375,7 +375,7 @@ fn handle(m: AppToHost) {
     match m {
         M::Hello { .. } => send(HostToApp::Error { id: None, message: "hello already received".into() }),
         M::Shutdown => {}
-        M::Create { id, url, size, scale } => {
+        M::Create { id, url, size, scale, .. } => {
             let exists = with_host(|h| h.browsers.contains_key(&id)).unwrap_or(false);
             if exists {
                 send(HostToApp::Error { id: Some(id.clone()), message: format!("browser {id} exists") });
