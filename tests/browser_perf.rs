@@ -11,7 +11,6 @@
 include!("common/browser_harness.rs");
 
 use harness::{Host, Page, metric};
-use serde_json::json;
 use std::time::{Duration, Instant};
 
 const TICK: Duration = Duration::from_micros(16_667);
@@ -255,26 +254,28 @@ fn r6(server: &fixtures::Server) {
     report("R6-cpu-idle-1-tab", "host+helpers", "% of a core", "<= 2", |m| m <= 2.0, &idle);
     report("R6-rss-1-tab", "host+helpers", "MB", "", |_| true, &rss);
     report("R6-processes-1-tab", "host+helpers", "count", "", |_| true, &procs);
-    // More tabs: more browsers in the same host, opened the way agents open unshown pages.
+    // 3 and 5 tabs: the harness has one block per window and refuses browser.open from the page
+    // ("the window's job"), so each tab here is its own Page with its own host process. That
+    // overstates memory (one CEF browser process and GPU process per tab instead of shared).
     for tabs in [3usize, 5] {
-        let mut p = Page::open(Host::Cef, &server.url("form.html")).expect("CEF host");
-        let mut opened = 1;
-        for _ in 1..tabs {
-            match p.command("browser.open", json!({ "url": server.url("scroll.html") })) {
-                Ok(_) => opened += 1,
-                Err(e) => {
-                    println!("RESULT R6-{tabs}-tabs not measured: browser.open in the harness: {e}");
-                    break;
-                }
+        let mut pages: Vec<Page> = (0..tabs).map(|i| Page::open(Host::Cef, &server.url(if i % 2 == 0 { "form.html" } else { "scroll.html" })).expect("CEF host")).collect();
+        for p in &mut pages {
+            p.run_for(Duration::from_millis(500));
+        }
+        let t0: f64 = pages.iter().map(cpu_secs).sum();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            for p in &mut pages {
+                p.pump();
             }
+            std::thread::sleep(TICK);
         }
-        if opened < tabs {
-            continue;
-        }
-        p.run_for(Duration::from_secs(3));
-        let u = p.usage_over(Duration::from_secs(5));
-        println!("RESULT R6-{tabs}-tabs [host+helpers] cpu_idle={:.1}% rss={:.0} MB processes={}", u.cpu, u.rss_mb, u.processes);
+        let t1: f64 = pages.iter().map(cpu_secs).sum();
+        let cpu = (t1 - t0) / start.elapsed().as_secs_f64() * 100.0;
+        let (rss, procs) = pages.iter().map(|p| p.usage()).fold((0.0, 0), |(r, n), u| (r + u.rss_mb, n + u.processes));
+        println!("RESULT R6-{tabs}-tabs [{tabs} separate hosts, not one host] cpu_idle_total={cpu:.1}% per_tab={:.1}% rss_total={rss:.0} MB per_tab={:.0} MB processes={procs}", cpu / tabs as f64, rss / tabs as f64);
     }
+    println!("RESULT R5-split-two-blocks not measured: the harness has one block per window (no two-block split yet)");
 }
 
 /// CPU seconds (user + system) so far of the host serving `p` and every process under it.
